@@ -1,35 +1,39 @@
-FROM ubuntu:22.04
+# Use Python 3.9 slim image as base
+FROM python:3.9-slim
 
-# Set environment variables to avoid interactive prompts
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=UTC
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    python3.11 \
-    python3-pip \
-    python3.11-venv \
-    python3.11-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Set working directory
 WORKDIR /app
 
+# Install system dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy requirements file
 COPY requirements.txt .
-
-# Create and activate virtual environment
-RUN python3.11 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY . .
+COPY app/ .
+
+# Set environment variables from base-config
+ENV SERVICE_NAME=${SERVICE_NAME} \
+    STAGE=${STAGE:-dev} \
+    REGION=${REGION:-us-east-1} \
+    LOG_LEVEL=${LOG_LEVEL:-INFO}
 
 # Expose port
-EXPOSE 8000
+EXPOSE 3000
 
-# Command to run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"] 
+# Run the application
+CMD ["python", "main.py"] 

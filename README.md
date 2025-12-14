@@ -1,69 +1,99 @@
-# Financial Transactions GraphQL Service
+# Base ECS Core Service
 
-This service provides a GraphQL API for accessing financial transaction data through Plaid's API.
+This is a base ECS Core service that can be customized for different projects. It provides a foundation for building containerized applications on AWS ECS.
+
+## Project Configuration
+
+The project can be customized for different applications by modifying the configuration in `app/base-config.py`. The main configuration variables are:
+
+- `PROJECT_NAME`: The name of your project (default: "SkyReady")
+- `PROJECT_DESCRIPTION`: Description of your project
+- `SERVICE_NAME`: The name of your ECS service
+- `SERVICE_DESCRIPTION`: Description of your ECS service
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.9 or later
 - Docker
-- Plaid API credentials
+- AWS CLI configured with appropriate credentials
+- AWS CDK CLI installed (`npm install -g aws-cdk`)
 
 ## Setup
 
-1. Clone the repository
-2. Copy `.env.example` to `.env` and fill in your Plaid credentials:
-   ```bash
-   cp .env.example .env
-   ```
-
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Running Locally
-
+1. Create and activate a Python virtual environment:
 ```bash
-uvicorn app.main:app --reload
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
 
-The service will be available at:
-- GraphQL endpoint: http://localhost:8000/graphql
-- Health check: http://localhost:8000/health
-
-## Docker Build and Run
-
+2. Install dependencies:
 ```bash
-docker build -t financial-transactions-service .
-docker run -p 8000:8000 --env-file .env financial-transactions-service
+pip install -r requirements.txt
 ```
 
-## GraphQL Usage
-
-Example query:
-```graphql
-query {
-  transactions(
-    accessToken: "your_access_token"
-    startDate: "2024-01-01"
-    endDate: "2024-01-31"
-  ) {
-    id
-    amount
-    date
-    name
-    category
-    merchantName
-  }
-}
+3. Configure AWS credentials:
+```bash
+aws configure
 ```
 
-## Deployment to ECS
+## Development
 
-1. Push the Docker image to Amazon ECR
-2. Create an ECS task definition with the container image
-3. Configure environment variables in the task definition
-4. Create an ECS service using the task definition
-5. Set up an Application Load Balancer if needed
+1. Build the Docker image:
+```bash
+docker build -t base-ecs-core .
+```
 
-Make sure to configure appropriate security groups and IAM roles for your ECS deployment. 
+2. Run the container locally:
+```bash
+docker run -p 3000:3000 base-ecs-core
+```
+
+The service will be available at `http://localhost:3000`
+
+## Project Structure
+
+- `app/`: Application code directory
+  - `base-config.py`: Project configuration
+  - `main.py`: Main application entry point
+  - `handlers/`: Request handlers
+  - `models/`: Data models
+  - `utils/`: Utility functions
+- `Dockerfile`: Container definition
+- `requirements.txt`: Python dependencies
+
+## Customization
+
+To use this service for a different project:
+
+1. Copy the entire `BaseECSCore` directory to your new project
+2. Update the configuration in `app/base-config.py`
+3. Modify the application code in `app/`
+4. Update the Dockerfile if needed
+5. Deploy using the CDK infrastructure
+
+## Environment Variables
+
+The service uses the following environment variables:
+
+- `SERVICE_NAME`: Name of the service
+- `STAGE`: Deployment stage (dev, gamma, prod)
+- `REGION`: AWS region
+- `LOG_LEVEL`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+
+## Security
+
+- Container security best practices
+- Environment variables for sensitive configuration
+- IAM roles with minimum required permissions
+- Network security through VPC and security groups
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Submit a pull request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details. 

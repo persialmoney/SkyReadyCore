@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Create FastAPI app
-app = FastAPI(title="Financial Transactions API")
+app = FastAPI(title="SkyReady Core API")
 
 # Create GraphQL router
 graphql_app = GraphQLRouter(schema)
