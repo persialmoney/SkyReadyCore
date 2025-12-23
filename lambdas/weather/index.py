@@ -1,6 +1,7 @@
 """
-Lambda function for fetching weather data (METAR, TAF, NOTAMs) from external APIs.
+Lambda function for fetching weather data (METAR, TAF, NOTAMs) from ElastiCache ValKey or external APIs.
 This function is used as an AppSync Lambda resolver.
+Uses cache-first strategy: checks ElastiCache, falls back to API if cache miss.
 """
 import json
 import os
@@ -9,6 +10,12 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 import urllib.request
 import urllib.error
+import redis  # ValKey is Redis-compatible, so we use the redis Python library
+import logging
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # Initialize DynamoDB client
 dynamodb = boto3.resource('dynamodb')
@@ -16,21 +23,70 @@ users_table = dynamodb.Table(os.environ.get('USERS_TABLE', 'sky-ready-users-dev'
 saved_airports_table = dynamodb.Table(os.environ.get('SAVED_AIRPORTS_TABLE', 'sky-ready-saved-airports-dev'))
 alerts_table = dynamodb.Table(os.environ.get('ALERTS_TABLE', 'sky-ready-alerts-dev'))
 
+# ElastiCache configuration
+ELASTICACHE_ENDPOINT = os.environ.get('ELASTICACHE_ENDPOINT')
+ELASTICACHE_PORT = int(os.environ.get('ELASTICACHE_PORT', 6379))
+
 # Weather API endpoints (using public Aviation Weather Center API)
 AWC_BASE_URL = "https://aviationweather.gov/api/data"
 METAR_URL = f"{AWC_BASE_URL}/metar"
 TAF_URL = f"{AWC_BASE_URL}/taf"
 NOTAM_URL = f"{AWC_BASE_URL}/notam"
 
+# Redis client (lazy initialization)
+redis_client = None
+
+
+def get_redis_client() -> Optional[redis.Redis]:
+    """Get or create Redis client connection."""
+    global redis_client
+    if not ELASTICACHE_ENDPOINT:
+        return None
+    
+    if redis_client is None:
+        try:
+            redis_client = redis.Redis(
+                host=ELASTICACHE_ENDPOINT,
+                port=ELASTICACHE_PORT,
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+                retry_on_timeout=False,
+            )
+            redis_client.ping()
+            logger.info(f"Connected to ElastiCache at {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
+        except Exception as e:
+            logger.warning(f"Failed to connect to ElastiCache: {str(e)}, will use API fallback")
+            redis_client = None
+    return redis_client
+
 
 def fetch_metar(airport_code: str) -> Dict[str, Any]:
     """
     Fetch METAR data for an airport.
-    Uses Aviation Weather Center API.
+    Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
     """
+    airport_code = airport_code.upper()
+    
+    # Try to get from cache first
+    redis_client = get_redis_client()
+    if redis_client:
+        try:
+            cache_key = f"metar:{airport_code}"
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                logger.info(f"Cache hit for METAR: {airport_code}")
+                metar_data = json.loads(cached_data)
+                # Transform to expected format
+                return transform_metar_from_cache(metar_data, airport_code)
+        except Exception as e:
+            logger.warning(f"Cache read error for {airport_code}: {str(e)}, falling back to API")
+    
+    # Cache miss or error - fetch from API
+    logger.info(f"Cache miss for METAR: {airport_code}, fetching from API")
     try:
         # Use decoded format to get structured fields like skyc1, skyl1, etc.
-        url = f"{METAR_URL}?ids={airport_code.upper()}&format=json&taf=false&hours=1"
+        url = f"{METAR_URL}?ids={airport_code}&format=json&taf=false&hours=1"
         with urllib.request.urlopen(url, timeout=10) as response:
             data = json.loads(response.read().decode())
             
@@ -119,13 +175,69 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
         }
 
 
+def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) -> Dict[str, Any]:
+    """Transform cached METAR data to expected format."""
+    # Parse altimeter
+    altim_inhg = None
+    if "altim_in_hg" in metar_data:
+        altim_inhg = metar_data.get("altim_in_hg")
+    elif "altimInHg" in metar_data:
+        altim_inhg = metar_data.get("altimInHg")
+    elif "altim" in metar_data:
+        altim_value = metar_data.get("altim")
+        if altim_value is not None:
+            if altim_value >= 28 and altim_value <= 31:
+                altim_inhg = altim_value
+            else:
+                altim_inhg = altim_value / 33.8639
+    
+    # Parse observation time
+    obs_time = metar_data.get("obsTime", datetime.utcnow().isoformat() + 'Z')
+    if isinstance(obs_time, str) and not obs_time.endswith('Z'):
+        obs_time = obs_time + 'Z' if '+' not in obs_time else obs_time
+    
+    return {
+        "airportCode": airport_code,
+        "rawText": metar_data.get("rawOb", ""),
+        "observationTime": obs_time,
+        "temperature": metar_data.get("temp", None),
+        "dewpoint": metar_data.get("dewp", None),
+        "windDirection": metar_data.get("wdir", None),
+        "windSpeed": metar_data.get("wspd", None),
+        "windGust": metar_data.get("wspdGust", metar_data.get("wspd", None)),
+        "visibility": metar_data.get("visib", None),
+        "altimeter": altim_inhg,
+        "skyConditions": parse_sky_conditions(metar_data),
+        "flightCategory": metar_data.get("flightCategory", None),
+        "metarType": metar_data.get("metarType", None),
+        "elevation": metar_data.get("elev", None)
+    }
+
+
 def fetch_taf(airport_code: str) -> Dict[str, Any]:
     """
     Fetch TAF data for an airport.
-    Uses Aviation Weather Center API.
+    Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
     """
+    airport_code = airport_code.upper()
+    
+    # Try to get from cache first
+    redis_client = get_redis_client()
+    if redis_client:
+        try:
+            cache_key = f"taf:{airport_code}"
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                logger.info(f"Cache hit for TAF: {airport_code}")
+                taf_data = json.loads(cached_data)
+                return transform_taf_from_cache(taf_data, airport_code)
+        except Exception as e:
+            logger.warning(f"Cache read error for TAF {airport_code}: {str(e)}, falling back to API")
+    
+    # Cache miss or error - fetch from API
+    logger.info(f"Cache miss for TAF: {airport_code}, fetching from API")
     try:
-        url = f"{TAF_URL}?ids={airport_code.upper()}&format=json"
+        url = f"{TAF_URL}?ids={airport_code}&format=json"
         with urllib.request.urlopen(url, timeout=10) as response:
             data = json.loads(response.read().decode())
             
@@ -138,8 +250,8 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
             
             taf = data[0]
             
-            return {
-                "airportCode": airport_code.upper(),
+            result = {
+                "airportCode": airport_code,
                 "rawText": taf.get("rawTAF", ""),
                 "issueTime": taf.get("issueTime", datetime.utcnow().isoformat()),
                 "validTimeFrom": taf.get("validTimeFrom", ""),
@@ -147,6 +259,29 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
                 "remarks": taf.get("remarks", ""),
                 "forecast": parse_taf_forecast(taf)
             }
+            
+            # Write-through: Store in cache for next request
+            if redis_client:
+                try:
+                    cache_key = f"taf:{airport_code}"
+                    redis_client.setex(cache_key, 900, json.dumps(taf))  # 15 minute TTL
+                except Exception as e:
+                    logger.warning(f"Failed to cache TAF for {airport_code}: {str(e)}")
+            
+            return result
+
+
+def transform_taf_from_cache(taf_data: Dict[str, Any], airport_code: str) -> Dict[str, Any]:
+    """Transform cached TAF data to expected format."""
+    return {
+        "airportCode": airport_code,
+        "rawText": taf_data.get("rawTAF", ""),
+        "issueTime": taf_data.get("issueTime", datetime.utcnow().isoformat()),
+        "validTimeFrom": taf_data.get("validTimeFrom", ""),
+        "validTimeTo": taf_data.get("validTimeTo", ""),
+        "remarks": taf_data.get("remarks", ""),
+        "forecast": parse_taf_forecast(taf_data)
+    }
     except Exception as e:
         return {
             "airportCode": airport_code.upper(),

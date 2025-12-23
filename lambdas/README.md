@@ -18,18 +18,20 @@ Fetches aviation weather data (METAR, TAF, NOTAMs) from external APIs.
 **Runtime**: Python 3.11  
 **Function Name**: `sky-ready-weather-{stage}`
 
-**Usage**: Called by AppSync as a Lambda resolver for weather queries.
+**Usage**: Called by AppSync as a Lambda resolver for weather queries. Uses cache-first strategy with ElastiCache ValKey.
 
-### scheduled-weather
+### weather-cache-ingest
 
-Scheduled function that runs every 15 minutes to fetch and cache weather data for saved airports.
+Scheduled function that downloads bulk cache files from AWC and populates ElastiCache ValKey.
 
 **Handler**: `index.handler`  
 **Runtime**: Python 3.11  
-**Function Name**: `sky-ready-scheduled-weather-{stage}`  
-**Trigger**: EventBridge schedule (every 15 minutes)
+**Function Name**: `sky-ready-weather-cache-ingest-{stage}`  
+**Trigger**: EventBridge schedules (METAR/SIGMET/AIRMET/PIREP: 1 min, TAF: 10 min, Stations: daily)
 
-**Usage**: Background job to keep weather data fresh in cache.
+**Usage**: Background job to keep weather cache populated with latest data from AWC cache API.
+
+**See**: [../WEATHER_CACHE.md](../WEATHER_CACHE.md) for detailed documentation.
 
 ### user-creation
 
@@ -96,6 +98,9 @@ rm function.zip
 All Lambda functions use:
 - `boto3>=1.34.0` for AWS SDK
 
+Weather-related functions also use:
+- `redis>=5.0.0` for ElastiCache ValKey access (ValKey is Redis-compatible)
+
 Add additional dependencies to each function's `requirements.txt` as needed.
 
 ## Environment Variables
@@ -105,6 +110,10 @@ Lambda functions receive environment variables from the CDK stack:
 - `USERS_TABLE`: DynamoDB table name
 - `SAVED_AIRPORTS_TABLE`: DynamoDB table name
 - `ALERTS_TABLE`: DynamoDB table name
-- `APPSYNC_API_ID`: AppSync API ID (for scheduled function)
+
+Weather cache functions also receive:
+- `ELASTICACHE_ENDPOINT`: ElastiCache ValKey cluster endpoint
+- `ELASTICACHE_PORT`: ElastiCache ValKey cluster port (default: 6379)
+- `CACHE_FILES_BUCKET`: S3 bucket for cache file backups (cache-ingest only)
 
 Access via `os.environ.get('VARIABLE_NAME')` in your Lambda code.

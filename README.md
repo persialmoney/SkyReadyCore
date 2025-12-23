@@ -16,47 +16,69 @@ The ECS service has been removed in favor of a fully serverless architecture.
 
 ```
 SkyReadyCore/
-├── lambdas/               # Lambda functions
-│   ├── weather/          # Weather data fetching Lambda
+├── lambdas/                    # Lambda functions
+│   ├── weather/               # Weather data fetching Lambda (AppSync resolver)
 │   │   ├── index.py
 │   │   └── requirements.txt
-│   ├── scheduled-weather/ # Scheduled weather updates Lambda
+│   ├── weather-cache-ingest/  # Cache ingestion Lambda (EventBridge scheduled)
 │   │   ├── index.py
-│   │   └── requirements.txt
-│   ├── user-creation/     # Cognito post-confirmation Lambda
+│   │   ├── requirements.txt
+│   │   └── SCHEMA.md          # ElastiCache ValKey schema documentation
+│   ├── user-creation/          # Cognito post-confirmation Lambda
 │   │   ├── index.py
 │   │   └── requirements.txt
 │   └── README.md
-├── README.md            # This file
-├── MIGRATION_SUMMARY.md # Migration documentation
-└── RENAME_COMPLETE.md   # Rename documentation
+├── README.md                 # This file
+├── WEATHER_CACHE.md          # Weather cache system documentation
+├── MIGRATION_SUMMARY.md      # Migration documentation
+└── RENAME_COMPLETE.md        # Rename documentation
 ```
 
 ## Lambda Functions
 
 ### Weather Lambda (`lambdas/weather/`)
 
-Fetches aviation weather data (METAR, TAF, NOTAMs) from external APIs.
+AppSync resolver that fetches aviation weather data (METAR, TAF, NOTAMs) using cache-first strategy.
 
 - **Handler**: `index.handler`
 - **Runtime**: Python 3.11
 - **Used as**: AppSync Lambda resolver
 - **Function Name**: `sky-ready-weather-{stage}`
+- **Strategy**: Cache-first with API fallback
+  - Checks ElastiCache ValKey first (<1ms latency)
+  - Falls back to AWC API if cache miss
+  - Write-through caching for next request
 
 **Dependencies:**
 - `boto3>=1.34.0`
+- `redis>=5.0.0` (ValKey-compatible Redis client)
 
-### Scheduled Weather Lambda (`lambdas/scheduled-weather/`)
+**See**: [WEATHER_CACHE.md](WEATHER_CACHE.md) for detailed cache system documentation.
 
-Scheduled function that runs every 15 minutes to fetch and cache weather data for saved airports.
+### Weather Cache Ingest Lambda (`lambdas/weather-cache-ingest/`)
+
+Scheduled function that downloads bulk cache files from AWC and populates ElastiCache ValKey.
 
 - **Handler**: `index.handler`
 - **Runtime**: Python 3.11
-- **Trigger**: EventBridge schedule (every 15 minutes)
-- **Function Name**: `sky-ready-scheduled-weather-{stage}`
+- **Trigger**: EventBridge schedules
+  - METAR/SIGMET/AIRMET/PIREP: Every 1 minute
+  - TAF: Every 10 minutes
+  - Stations: Daily at midnight UTC
+- **Function Name**: `sky-ready-weather-cache-ingest-{stage}`
+
+**Process**:
+1. Downloads gzipped cache files from AWC
+2. Decompresses and parses (CSV/XML/JSON)
+3. Stores in ElastiCache ValKey with TTLs
+4. Updates index sets for efficient queries
+5. Backs up raw files to S3
 
 **Dependencies:**
 - `boto3>=1.34.0`
+- `redis>=5.0.0` (ValKey-compatible Redis client)
+
+**See**: [WEATHER_CACHE.md](WEATHER_CACHE.md) for detailed cache system documentation.
 
 ### User Creation Lambda (`lambdas/user-creation/`)
 
@@ -130,11 +152,17 @@ python -c "from index import handler; print(handler({}, {}))"
 ## Environment Variables
 
 Lambda functions receive environment variables from the CDK stack:
+
+**Common Variables**:
 - `STAGE`: Deployment stage (dev, gamma, prod)
 - `USERS_TABLE`: DynamoDB table name for users
 - `SAVED_AIRPORTS_TABLE`: DynamoDB table name for saved airports
 - `ALERTS_TABLE`: DynamoDB table name for alerts
-- `APPSYNC_API_ID`: AppSync API ID (for scheduled function)
+
+**Weather Cache Variables** (for weather and cache-ingest Lambdas):
+- `ELASTICACHE_ENDPOINT`: ElastiCache ValKey cluster endpoint
+- `ELASTICACHE_PORT`: ElastiCache ValKey cluster port (default: 6379)
+- `CACHE_FILES_BUCKET`: S3 bucket name for cache file backups (cache-ingest only)
 
 Access via `os.environ.get('VARIABLE_NAME')` in your Lambda code.
 
@@ -148,8 +176,11 @@ Access via `os.environ.get('VARIABLE_NAME')` in your Lambda code.
 
 ## Dependencies
 
-Each Lambda function has its own `requirements.txt` file. All functions currently use:
-- `boto3>=1.34.0` for AWS SDK
+Each Lambda function has its own `requirements.txt` file:
+
+- **Common**: `boto3>=1.34.0` for AWS SDK
+- **Weather Functions**: `redis>=5.0.0` for ElastiCache ValKey access
+  - Note: ValKey is Redis-compatible, so we use the standard `redis` Python library
 
 Add additional dependencies to each function's `requirements.txt` as needed.
 
