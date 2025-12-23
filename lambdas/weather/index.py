@@ -269,6 +269,27 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
                     logger.warning(f"Failed to cache TAF for {airport_code}: {str(e)}")
             
             return result
+    except urllib.error.URLError as e:
+        logger.error(f"Network error fetching TAF for {airport_code}: {str(e)}")
+        return {
+            "airportCode": airport_code.upper(),
+            "rawText": "Error fetching TAF data",
+            "error": f"Network error: {str(e)}"
+        }
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error for TAF {airport_code}: {str(e)}")
+        return {
+            "airportCode": airport_code.upper(),
+            "rawText": "Error parsing TAF data",
+            "error": f"Parse error: {str(e)}"
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error fetching TAF for {airport_code}: {str(e)}")
+        return {
+            "airportCode": airport_code.upper(),
+            "rawText": "Error fetching TAF data",
+            "error": f"Unexpected error: {str(e)}"
+        }
 
 
 def transform_taf_from_cache(taf_data: Dict[str, Any], airport_code: str) -> Dict[str, Any]:
@@ -282,12 +303,6 @@ def transform_taf_from_cache(taf_data: Dict[str, Any], airport_code: str) -> Dic
         "remarks": taf_data.get("remarks", ""),
         "forecast": parse_taf_forecast(taf_data)
     }
-    except Exception as e:
-        return {
-            "airportCode": airport_code.upper(),
-            "rawText": f"Error fetching TAF: {str(e)}",
-            "error": str(e)
-        }
 
 
 def fetch_notams(airport_code: str) -> list:
