@@ -58,7 +58,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             print(f"Error checking existing user: {str(e)}")
             # Continue with creation even if check fails
         
-        # Create user profile in DynamoDB
+        # Extract pilot-specific attributes from custom attributes
+        # These should be set during sign-up via custom attributes
+        pilot_license = user_attributes.get('custom:pilot_license', '')
+        certificate_type = user_attributes.get('custom:certificate_type', '')
+        aircraft_ratings = user_attributes.get('custom:aircraft_ratings', '')
+        
+        # Create user profile in DynamoDB with pilot information
         user_item = {
             'userId': user_id,
             'id': user_id,  # GraphQL schema expects 'id' field
@@ -66,6 +72,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'email': email,
             'createdAt': datetime.utcnow().isoformat(),
             'updatedAt': datetime.utcnow().isoformat(),
+            'pilotInfo': {
+                'licenseNumber': pilot_license,
+                'certificateType': certificate_type,  # e.g., 'PPL', 'CPL', 'ATP'
+                'aircraftRatings': aircraft_ratings.split(',') if aircraft_ratings else []
+            },
             'preferences': {
                 'defaultUnits': 'imperial',  # Default to imperial for aviation
                 'notificationEnabled': True,

@@ -29,7 +29,8 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
     Uses Aviation Weather Center API.
     """
     try:
-        url = f"{METAR_URL}?ids={airport_code.upper()}&format=json"
+        # Use decoded format to get structured fields like skyc1, skyl1, etc.
+        url = f"{METAR_URL}?ids={airport_code.upper()}&format=json&taf=false&hours=1"
         with urllib.request.urlopen(url, timeout=10) as response:
             data = json.loads(response.read().decode())
             
@@ -44,17 +45,59 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
             # Parse the first METAR (most recent)
             metar = data[0]
             
+            # Parse altimeter - AWC API provides altim_in_hg field for inHg directly
+            # Fallback to altim field (which may be in hPa) if altim_in_hg is not available
+            altim_inhg = None
+            
+            # First, try to get altim_in_hg (directly in inches of mercury)
+            if "altim_in_hg" in metar:
+                altim_inhg = metar.get("altim_in_hg")
+            elif "altimInHg" in metar:
+                # Try camelCase variant
+                altim_inhg = metar.get("altimInHg")
+            else:
+                # Fallback: use altim field and convert if needed
+                altim_value = metar.get("altim", None)
+                if altim_value is not None:
+                    # Check if value is in inHg range (typically 28-31) or hPa range (typically 950-1050)
+                    if altim_value >= 28 and altim_value <= 31:
+                        # Already in inHg range, use as-is
+                        altim_inhg = altim_value
+                    else:
+                        # Assume it's in hPa/millibars, convert to inHg
+                        # Conversion: inHg = hPa / 33.8639
+                        altim_inhg = altim_value / 33.8639
+            
+            # Ensure observationTime is in ISO format with Z suffix
+            obs_time = metar.get("obsTime", None)
+            if obs_time:
+                # AWC API returns ISO 8601 format (e.g., "2025-12-22T11:17:54Z")
+                # Ensure it has Z suffix for UTC
+                obs_time_str = str(obs_time)
+                if not obs_time_str.endswith('Z') and not obs_time_str.endswith('+00:00'):
+                    # Remove timezone offset if present and add Z
+                    obs_time_str = obs_time_str.rstrip('+00:00').rstrip('-00:00')
+                    if '+' in obs_time_str or (len(obs_time_str) > 10 and obs_time_str[10] == 'T'):
+                        # Has time component, ensure Z suffix
+                        obs_time = obs_time_str + 'Z' if not obs_time_str.endswith('Z') else obs_time_str
+                    else:
+                        obs_time = obs_time_str + 'Z'
+                else:
+                    obs_time = obs_time_str
+            else:
+                obs_time = datetime.utcnow().isoformat() + 'Z'
+            
             return {
                 "airportCode": airport_code.upper(),
                 "rawText": metar.get("rawOb", ""),
-                "observationTime": metar.get("obsTime", datetime.utcnow().isoformat()),
+                "observationTime": obs_time,
                 "temperature": metar.get("temp", None),
                 "dewpoint": metar.get("dewp", None),
                 "windDirection": metar.get("wdir", None),
                 "windSpeed": metar.get("wspd", None),
                 "windGust": metar.get("wspd", None),  # AWC doesn't always provide gust separately
                 "visibility": metar.get("visib", None),
-                "altimeter": metar.get("altim", None),
+                "altimeter": altim_inhg,
                 "skyConditions": parse_sky_conditions(metar),
                 "flightCategory": metar.get("flightCategory", None),
                 "metarType": metar.get("metarType", None),
@@ -151,16 +194,106 @@ def parse_sky_conditions(metar: Dict) -> list:
     """Parse sky conditions from METAR data."""
     sky_conditions = []
     
-    # AWC API provides sky conditions in various formats
-    # This is a simplified parser - adjust based on actual API response format
-    if "skyc1" in metar and metar["skyc1"]:
-        sky_conditions.append({
-            "skyCover": metar.get("skyc1", ""),
-            "cloudBase": metar.get("skyl1", None),
-            "cloudType": None
-        })
+    # AWC API provides sky conditions with fields like:
+    # skyc1, skyc2, skyc3, skyc4 (sky cover codes: FEW, SCT, BKN, OVC, CLR, etc.)
+    # skyl1, skyl2, skyl3, skyl4 (cloud base levels in HUNDREDS of feet, e.g., 25 = 2500ft)
+    # skyt1, skyt2, skyt3, skyt4 (cloud types, optional)
     
-    return sky_conditions if sky_conditions else [{"skyCover": "CLR", "cloudBase": None, "cloudType": None}]
+    # Debug: Log available sky condition fields and all metar keys
+    sky_fields = {k: v for k, v in metar.items() if k.startswith('sky')}
+    all_keys = list(metar.keys())
+    print(f"DEBUG: All METAR keys: {all_keys[:20]}...")  # Show first 20 keys
+    if sky_fields:
+        print(f"DEBUG: Sky condition fields found: {sky_fields}")
+    else:
+        print(f"DEBUG: No sky condition fields found. Checking for alternative field names...")
+        # Check for alternative field names
+        alt_fields = {k: v for k, v in metar.items() if 'cloud' in k.lower() or 'sky' in k.lower()}
+        if alt_fields:
+            print(f"DEBUG: Alternative cloud/sky fields: {alt_fields}")
+    
+    # Parse up to 4 cloud layers
+    for i in range(1, 5):
+        skyc_key = f"skyc{i}"
+        skyl_key = f"skyl{i}"
+        skyt_key = f"skyt{i}"
+        
+        sky_cover = metar.get(skyc_key, None)
+        
+        # Handle both string and None values
+        if sky_cover is not None and str(sky_cover).strip():
+            sky_cover_str = str(sky_cover).strip().upper()
+            
+            # Skip empty strings and "///" (missing data indicator)
+            if sky_cover_str and sky_cover_str != "///" and sky_cover_str != "":
+                # Get cloud base - AWC API returns in actual feet (not hundreds)
+                cloud_base_raw = metar.get(skyl_key, None)
+                cloud_base = None
+                if cloud_base_raw is not None:
+                    try:
+                        # API returns in feet directly (e.g., 18000 = 18,000 feet)
+                        cloud_base = int(cloud_base_raw)
+                    except (ValueError, TypeError):
+                        cloud_base = None
+                
+                # Get cloud type (optional)
+                cloud_type = metar.get(skyt_key, None)
+                if cloud_type is not None and str(cloud_type).strip():
+                    cloud_type = str(cloud_type).strip()
+                else:
+                    cloud_type = None
+                
+                # Handle CLR/SKC (clear skies) - only add if it's the first layer
+                if sky_cover_str in ["CLR", "SKC"]:
+                    if i == 1:
+                        sky_conditions.append({
+                            "skyCover": "CLR",
+                            "cloudBase": None,
+                            "cloudType": None
+                        })
+                        break  # CLR means no other layers
+                else:
+                    # Add cloud layer
+                    sky_conditions.append({
+                        "skyCover": sky_cover_str,
+                        "cloudBase": cloud_base,
+                        "cloudType": cloud_type
+                    })
+    
+    # If no cloud layers found, try parsing from raw METAR text as fallback
+    if not sky_conditions:
+        raw_text = metar.get("rawOb", metar.get("rawText", ""))
+        if raw_text:
+            # Parse cloud layers from raw METAR (format: FEW025, SCT040, BKN200, etc.)
+            import re
+            # Pattern matches: FEW/SCT/BKN/OVC followed by 3 digits (cloud base in hundreds of feet)
+            cloud_pattern = r'\b(FEW|SCT|BKN|OVC|CLR|SKC)(\d{3})?\b'
+            matches = re.findall(cloud_pattern, raw_text)
+            
+            for cover, base_str in matches:
+                if cover.upper() in ["CLR", "SKC"]:
+                    # Clear skies - return immediately
+                    return [{"skyCover": "CLR", "cloudBase": None, "cloudType": None}]
+                elif cover.upper() in ["FEW", "SCT", "BKN", "OVC"]:
+                    cloud_base = None
+                    if base_str:
+                        try:
+                            # Raw METAR uses hundreds of feet (e.g., 025 = 2,500 feet)
+                            cloud_base = int(base_str) * 100
+                        except ValueError:
+                            cloud_base = None
+                    
+                    sky_conditions.append({
+                        "skyCover": cover.upper(),
+                        "cloudBase": cloud_base,
+                        "cloudType": None
+                    })
+        
+        # If still no cloud layers found, return clear skies
+        if not sky_conditions:
+            return [{"skyCover": "CLR", "cloudBase": None, "cloudType": None}]
+    
+    return sky_conditions
 
 
 def parse_taf_forecast(taf: Dict) -> list:

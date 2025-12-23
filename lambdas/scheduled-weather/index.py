@@ -20,6 +20,8 @@ appsync_api_id = os.environ.get('APPSYNC_API_ID')
 
 AWC_BASE_URL = "https://aviationweather.gov/api/data"
 METAR_URL = f"{AWC_BASE_URL}/metar"
+TAF_URL = f"{AWC_BASE_URL}/taf"
+NOTAM_URL = f"{AWC_BASE_URL}/notam"
 
 
 def fetch_metar_for_airport(airport_code: str) -> Dict[str, Any]:
@@ -32,6 +34,54 @@ def fetch_metar_for_airport(airport_code: str) -> Dict[str, Any]:
     except Exception as e:
         print(f"Error fetching METAR for {airport_code}: {str(e)}")
         return None
+
+
+def fetch_taf_for_airport(airport_code: str) -> Dict[str, Any]:
+    """Fetch TAF for a single airport."""
+    try:
+        url = f"{TAF_URL}?ids={airport_code.upper()}&format=json"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            return data[0] if data else None
+    except Exception as e:
+        print(f"Error fetching TAF for {airport_code}: {str(e)}")
+        return None
+
+
+def fetch_notams_for_airport(airport_code: str) -> List[Dict[str, Any]]:
+    """
+    Fetch NOTAMs for an airport.
+    Note: Public NOTAM APIs are limited. This is a placeholder implementation.
+    """
+    try:
+        # NOTE: Public NOTAM APIs require authentication or have rate limits
+        # This is a simplified implementation
+        # In production, you'd use FAA NOTAM API or a commercial service
+        
+        # For now, return empty list with a note
+        return [{
+            "id": "placeholder",
+            "airportCode": airport_code.upper(),
+            "notamNumber": "N/A",
+            "issueDate": datetime.utcnow().isoformat(),
+            "effectiveDate": datetime.utcnow().isoformat(),
+            "expirationDate": None,
+            "message": "NOTAM API integration required. Please configure FAA NOTAM API or commercial service.",
+            "category": "INFO",
+            "severity": "INFO"
+        }]
+    except Exception as e:
+        print(f"Error fetching NOTAMs for {airport_code}: {str(e)}")
+        return [{
+            "id": "error",
+            "airportCode": airport_code.upper(),
+            "notamNumber": "ERROR",
+            "issueDate": datetime.utcnow().isoformat(),
+            "effectiveDate": datetime.utcnow().isoformat(),
+            "message": f"Error fetching NOTAMs: {str(e)}",
+            "category": "ERROR",
+            "severity": "ERROR"
+        }]
 
 
 def check_alert_conditions(airport_code: str, metar_data: Dict[str, Any], user_id: str) -> List[Dict[str, Any]]:
@@ -99,20 +149,40 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         results = {
             "processed_airports": 0,
             "triggered_alerts": 0,
+            "metar_fetched": 0,
+            "taf_fetched": 0,
+            "notams_fetched": 0,
             "errors": []
         }
         
-        # Fetch weather for each airport
+        # Fetch weather data for each airport
         for airport_code in airports_to_check:
             try:
+                # Fetch METAR
                 metar_data = fetch_metar_for_airport(airport_code)
-                
                 if metar_data:
+                    results["metar_fetched"] += 1
+                
+                # Fetch TAF
+                taf_data = fetch_taf_for_airport(airport_code)
+                if taf_data:
+                    results["taf_fetched"] += 1
+                
+                # Fetch NOTAMs
+                notams_data = fetch_notams_for_airport(airport_code)
+                if notams_data:
+                    results["notams_fetched"] += 1
+                
+                # If we got at least one data type, count as processed
+                if metar_data or taf_data or notams_data:
                     results["processed_airports"] += 1
                     
-                    # Check for alerts (would need to iterate through users)
+                    # Check for alerts using METAR data (would need to iterate through users)
                     # For now, this is a simplified version
                     # In production, you'd query by airport code using GSI
+                    if metar_data:
+                        # Alert checking logic would go here
+                        pass
                     
             except Exception as e:
                 results["errors"].append({
@@ -121,6 +191,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 })
         
         print(f"Processed {results['processed_airports']} airports")
+        print(f"  - METAR: {results['metar_fetched']}")
+        print(f"  - TAF: {results['taf_fetched']}")
+        print(f"  - NOTAMs: {results['notams_fetched']}")
+        if results['errors']:
+            print(f"  - Errors: {len(results['errors'])}")
         return results
         
     except Exception as e:
