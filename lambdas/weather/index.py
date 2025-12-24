@@ -250,6 +250,8 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
 
 def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) -> Dict[str, Any]:
     """Transform cached METAR data to expected format."""
+    logger.info(f"Transforming METAR for {airport_code}, keys: {list(metar_data.keys())[:10]}")
+    
     # Parse altimeter
     altim_inhg = None
     if "altim_in_hg" in metar_data:
@@ -270,8 +272,10 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
         # Try alternative field name
         obs_time = metar_data.get("observation_time", None)
     
+    logger.info(f"Raw obs_time: {obs_time}, type: {type(obs_time)}")
+    
     if obs_time:
-        obs_time_str = str(obs_time)
+        obs_time_str = str(obs_time).strip()
         # Ensure it has Z suffix for UTC
         if not obs_time_str.endswith('Z') and not obs_time_str.endswith('+00:00'):
             # Remove timezone offset if present and add Z
@@ -284,23 +288,29 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
         else:
             obs_time = obs_time_str
     else:
+        logger.warning(f"No observation time found for {airport_code}, using current time")
         obs_time = datetime.utcnow().isoformat() + 'Z'
+    
+    logger.info(f"Final obs_time: {obs_time}")
     
     # Parse visibility - handle both old and new field names
     visibility = metar_data.get("visib", None)
     if visibility is None:
         visibility = metar_data.get("visibility_statute_mi", None)
     
+    logger.info(f"Raw visibility: {visibility}, type: {type(visibility)}")
+    
     # If visibility is a string with "+" suffix, convert it
     if isinstance(visibility, str):
-        if visibility.endswith('+'):
+        vis_str = visibility.strip()
+        if vis_str.endswith('+'):
             try:
-                visibility = float(visibility[:-1]) + 0.5
+                visibility = float(vis_str[:-1]) + 0.5
             except ValueError:
                 visibility = None
-        elif '/' in visibility:
+        elif '/' in vis_str:
             # Handle fractions like "3/4", "1 3/4"
-            parts = visibility.split()
+            parts = vis_str.split()
             if len(parts) == 2:  # "1 3/4" format
                 try:
                     whole = float(parts[0])
@@ -313,7 +323,7 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
                 except ValueError:
                     visibility = None
             else:  # "3/4" format
-                frac_parts = visibility.split('/')
+                frac_parts = vis_str.split('/')
                 if len(frac_parts) == 2:
                     try:
                         visibility = float(frac_parts[0]) / float(frac_parts[1])
@@ -323,9 +333,17 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
                     visibility = None
         else:
             try:
-                visibility = float(visibility)
+                visibility = float(vis_str)
             except (ValueError, TypeError):
                 visibility = None
+    elif visibility is not None:
+        # Already a number, ensure it's a float
+        try:
+            visibility = float(visibility)
+        except (ValueError, TypeError):
+            visibility = None
+    
+    logger.info(f"Final visibility: {visibility}")
     
     # Parse wind gust - only include if different from wind speed
     wind_gust = metar_data.get("wspdGust", None)
@@ -338,7 +356,7 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
         if wind_gust == wind_speed:
             wind_gust = None  # Don't show gusts if they're the same as wind speed
     
-    return {
+    result = {
         "airportCode": airport_code,
         "rawText": metar_data.get("rawOb", metar_data.get("raw_text", "")),
         "observationTime": obs_time,
@@ -354,6 +372,10 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
         "metarType": metar_data.get("metarType", None),
         "elevation": metar_data.get("elev", None)
     }
+    
+    logger.info(f"Transformed METAR result - visibility: {result.get('visibility')}, obsTime: {result.get('observationTime')}")
+    
+    return result
 
 
 def fetch_taf(airport_code: str) -> Dict[str, Any]:
