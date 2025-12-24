@@ -124,22 +124,32 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
                         # Conversion: inHg = hPa / 33.8639
                         altim_inhg = altim_value / 33.8639
             
-            # Ensure observationTime is in ISO format with Z suffix
+            # Parse observation time - API returns obsTime as Unix timestamp (integer)
+            # Per OpenAPI spec: obsTime is integer (UNIX timestamp)
             obs_time = metar.get("obsTime", None)
             if obs_time:
-                # AWC API returns ISO 8601 format (e.g., "2025-12-22T11:17:54Z")
-                # Ensure it has Z suffix for UTC
-                obs_time_str = str(obs_time)
-                if not obs_time_str.endswith('Z') and not obs_time_str.endswith('+00:00'):
-                    # Remove timezone offset if present and add Z
-                    obs_time_str = obs_time_str.rstrip('+00:00').rstrip('-00:00')
-                    if '+' in obs_time_str or (len(obs_time_str) > 10 and obs_time_str[10] == 'T'):
-                        # Has time component, ensure Z suffix
-                        obs_time = obs_time_str + 'Z' if not obs_time_str.endswith('Z') else obs_time_str
+                # Check if it's a Unix timestamp (integer) from API
+                if isinstance(obs_time, int):
+                    # Convert Unix timestamp to ISO format
+                    obs_time = datetime.utcfromtimestamp(obs_time).isoformat() + 'Z'
+                elif isinstance(obs_time, (float, str)):
+                    # Handle as string or float - might be ISO string or timestamp
+                    obs_time_str = str(obs_time).strip()
+                    if 'T' in obs_time_str:
+                        # ISO format string
+                        if not obs_time_str.endswith('Z') and not obs_time_str.endswith('+00:00'):
+                            obs_time = obs_time_str + 'Z'
+                        else:
+                            obs_time = obs_time_str
                     else:
-                        obs_time = obs_time_str + 'Z'
+                        # Try parsing as timestamp
+                        try:
+                            ts = float(obs_time_str)
+                            obs_time = datetime.utcfromtimestamp(ts).isoformat() + 'Z'
+                        except (ValueError, OSError):
+                            obs_time = datetime.utcnow().isoformat() + 'Z'
                 else:
-                    obs_time = obs_time_str
+                    obs_time = datetime.utcnow().isoformat() + 'Z'
             else:
                 obs_time = datetime.utcnow().isoformat() + 'Z'
             
@@ -250,8 +260,6 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
 
 def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) -> Dict[str, Any]:
     """Transform cached METAR data to expected format."""
-    logger.info(f"Transforming METAR for {airport_code}, keys: {list(metar_data.keys())[:10]}")
-    
     # Parse altimeter
     altim_inhg = None
     if "altim_in_hg" in metar_data:
@@ -266,27 +274,40 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
             else:
                 altim_inhg = altim_value / 33.8639
     
-    # Parse observation time - ensure it's in ISO format with Z suffix
+    # Parse observation time - handle both formats:
+    # 1. CSV cache: "observation_time" as ISO string "2025-12-24T06:56:00.000Z"
+    # 2. API JSON: "obsTime" as Unix timestamp integer
     obs_time = metar_data.get("obsTime", None)
     if not obs_time:
-        # Try alternative field name
+        # Try alternative field name from CSV
         obs_time = metar_data.get("observation_time", None)
     
     logger.info(f"Raw obs_time: {obs_time}, type: {type(obs_time)}")
     
     if obs_time:
-        obs_time_str = str(obs_time).strip()
-        # Ensure it has Z suffix for UTC
-        if not obs_time_str.endswith('Z') and not obs_time_str.endswith('+00:00'):
-            # Remove timezone offset if present and add Z
-            obs_time_str = obs_time_str.rstrip('+00:00').rstrip('-00:00')
-            if '+' in obs_time_str or (len(obs_time_str) > 10 and obs_time_str[10] == 'T'):
-                # Has time component, ensure Z suffix
-                obs_time = obs_time_str + 'Z' if not obs_time_str.endswith('Z') else obs_time_str
+        # Check if it's a Unix timestamp (integer) from API
+        if isinstance(obs_time, int):
+            # Convert Unix timestamp to ISO format
+            obs_time = datetime.utcfromtimestamp(obs_time).isoformat() + 'Z'
+        elif isinstance(obs_time, (float, str)):
+            # It's a string or float - handle as ISO string
+            obs_time_str = str(obs_time).strip()
+            # CSV format is already "2025-12-24T06:56:00.000Z" - ensure it has Z
+            if not obs_time_str.endswith('Z') and not obs_time_str.endswith('+00:00'):
+                # Try to add Z if it looks like an ISO date
+                if 'T' in obs_time_str:
+                    obs_time = obs_time_str + 'Z'
+                else:
+                    # Might be a timestamp string, try to parse
+                    try:
+                        ts = float(obs_time_str)
+                        obs_time = datetime.utcfromtimestamp(ts).isoformat() + 'Z'
+                    except (ValueError, OSError):
+                        obs_time = obs_time_str + 'Z'
             else:
-                obs_time = obs_time_str + 'Z'
+                obs_time = obs_time_str
         else:
-            obs_time = obs_time_str
+            obs_time = str(obs_time).strip()
     else:
         logger.warning(f"No observation time found for {airport_code}, using current time")
         obs_time = datetime.utcnow().isoformat() + 'Z'
@@ -298,19 +319,16 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
     if visibility is None:
         visibility = metar_data.get("visibility_statute_mi", None)
     
-    logger.info(f"Raw visibility: {visibility}, type: {type(visibility)}")
-    
     # If visibility is a string with "+" suffix, convert it
     if isinstance(visibility, str):
-        vis_str = visibility.strip()
-        if vis_str.endswith('+'):
+        if visibility.endswith('+'):
             try:
-                visibility = float(vis_str[:-1]) + 0.5
+                visibility = float(visibility[:-1]) + 0.5
             except ValueError:
                 visibility = None
-        elif '/' in vis_str:
+        elif '/' in visibility:
             # Handle fractions like "3/4", "1 3/4"
-            parts = vis_str.split()
+            parts = visibility.split()
             if len(parts) == 2:  # "1 3/4" format
                 try:
                     whole = float(parts[0])
@@ -323,7 +341,7 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
                 except ValueError:
                     visibility = None
             else:  # "3/4" format
-                frac_parts = vis_str.split('/')
+                frac_parts = visibility.split('/')
                 if len(frac_parts) == 2:
                     try:
                         visibility = float(frac_parts[0]) / float(frac_parts[1])
@@ -333,17 +351,9 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
                     visibility = None
         else:
             try:
-                visibility = float(vis_str)
+                visibility = float(visibility)
             except (ValueError, TypeError):
                 visibility = None
-    elif visibility is not None:
-        # Already a number, ensure it's a float
-        try:
-            visibility = float(visibility)
-        except (ValueError, TypeError):
-            visibility = None
-    
-    logger.info(f"Final visibility: {visibility}")
     
     # Parse wind gust - only include if different from wind speed
     wind_gust = metar_data.get("wspdGust", None)
@@ -356,10 +366,15 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
         if wind_gust == wind_speed:
             wind_gust = None  # Don't show gusts if they're the same as wind speed
     
+    # Ensure observationTime is always a non-empty string
+    if not obs_time or not str(obs_time).strip():
+        logger.warning(f"Invalid observation time for {airport_code}, using current time")
+        obs_time = datetime.utcnow().isoformat() + 'Z'
+    
     result = {
         "airportCode": airport_code,
         "rawText": metar_data.get("rawOb", metar_data.get("raw_text", "")),
-        "observationTime": obs_time,
+        "observationTime": str(obs_time).strip(),  # Ensure it's always a string
         "temperature": metar_data.get("temp", None),
         "dewpoint": metar_data.get("dewp", None),
         "windDirection": metar_data.get("wdir", None),

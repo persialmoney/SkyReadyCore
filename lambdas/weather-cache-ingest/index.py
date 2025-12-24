@@ -138,26 +138,21 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
             # Map raw text
             record['rawOb'] = get_col('raw_text', '')
             
-            # Map station ID - store in multiple formats for compatibility
+            # Map station ID
             station_id = get_col('station_id', '')
             if not station_id:
                 continue  # Skip records without station ID
             
-            station_id = station_id.upper()
-            record['stationId'] = station_id
-            record['icaoId'] = station_id  # For compatibility with store_metar
-            
-            # Map observation time
+            # Map observation time - CSV already has it in ISO format with Z
             obs_time = get_col('observation_time', '')
-            if obs_time:
-                # Ensure it ends with Z
-                if not obs_time.endswith('Z') and not obs_time.endswith('+00:00'):
-                    obs_time = obs_time.rstrip('+00:00').rstrip('-00:00')
-                    if '+' in obs_time or (len(obs_time) > 10 and obs_time[10] == 'T'):
-                        obs_time = obs_time + 'Z' if not obs_time.endswith('Z') else obs_time
-                    else:
-                        obs_time = obs_time + 'Z'
-            record['obsTime'] = obs_time
+            if obs_time and obs_time.strip():
+                # CSV format is already "2025-12-24T06:56:00.000Z" - use as-is
+                obs_time_clean = obs_time.strip()
+                record['obsTime'] = obs_time_clean
+                record['observation_time'] = obs_time_clean  # Store both for compatibility
+            else:
+                record['obsTime'] = None
+                record['observation_time'] = None
             
             # Map temperature and dewpoint
             temp_c = get_col('temp_c', '')
@@ -315,6 +310,24 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
                                         pass
                                 
                                 sky_conditions.append(cloud_layer)
+                
+                # Check if we have a cloud layer
+                if sky_cover and sky_cover.strip() and sky_cover.upper() not in ['', 'NIL', 'NCD']:
+                    sky_cover_upper = sky_cover.strip().upper()
+                    if sky_cover_upper in ['CLR', 'SKC', 'FEW', 'SCT', 'BKN', 'OVC', 'OVX', 'VV']:
+                        cloud_layer = {
+                            'skyCover': sky_cover_upper,
+                            'cloudBase': None,
+                            'cloudType': None
+                        }
+                        
+                        if cloud_base and cloud_base.strip():
+                            try:
+                                cloud_layer['cloudBase'] = int(float(cloud_base))
+                            except ValueError:
+                                pass
+                        
+                        sky_conditions.append(cloud_layer)
             
             # Store sky conditions in the format expected by parse_sky_conditions
             # Also store individual skyc1, skyl1, etc. fields for compatibility
@@ -325,18 +338,9 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
                     record[f'skyl{i}'] = layer.get('cloudBase')
             else:
                 record['clouds'] = []
-                # If no clouds, mark as clear
-                record['skyc1'] = 'CLR'
-                record['skyl1'] = None
             
             # Map weather string
-            record['wxString'] = get_col('wx_string', '')
-            
-            # Ensure all critical fields are present (for debugging and compatibility)
-            if not record.get('obsTime'):
-                logger.warning(f"Missing obsTime for station {station_id}")
-            if record.get('visib') is None:
-                logger.warning(f"Missing visib for station {station_id}, raw: {get_col('visibility_statute_mi', '')}")
+            record['wxString'] = row.get('wx_string', '')
             
             records.append(record)
         logger.info(f"Parsed {len(records)} METAR records from CSV")
@@ -480,8 +484,7 @@ def store_metar(redis_client: redis.Redis, records: List[Dict[str, Any]]):
     current_time = int(datetime.utcnow().timestamp())
     
     for record in records:
-        # Try multiple field names for station ID
-        station_id = record.get('icaoId') or record.get('stationId') or record.get('station_id')
+        station_id = record.get('icaoId') or record.get('stationId')
         if not station_id:
             continue
         
