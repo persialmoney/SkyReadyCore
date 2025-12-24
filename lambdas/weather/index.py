@@ -143,6 +143,40 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
             else:
                 obs_time = datetime.utcnow().isoformat() + 'Z'
             
+            # Parse wind gust - check for wspdGust field, or parse from raw METAR if not available
+            wind_gust = metar.get("wspdGust", None)
+            if wind_gust is None:
+                # Try alternative field names
+                wind_gust = metar.get("gust", None)
+            
+            # Parse visibility - check for visib field, or parse from raw METAR if not available
+            visibility = metar.get("visib", None)
+            if visibility is None:
+                # Try to parse from raw METAR text (format: 10SM, 1/2SM, M1/4SM, etc.)
+                raw_text = metar.get("rawOb", "")
+                if raw_text:
+                    import re
+                    # Pattern matches visibility: 10SM, 1/2SM, M1/4SM, etc.
+                    vis_match = re.search(r'(\d+(?:/\d+)?|M?\d+/\d+)\s*SM', raw_text)
+                    if vis_match:
+                        vis_str = vis_match.group(1)
+                        # Handle fractions like 1/2, M1/4
+                        if '/' in vis_str:
+                            if vis_str.startswith('M'):
+                                # M1/4 means less than 1/4
+                                parts = vis_str[1:].split('/')
+                                if len(parts) == 2:
+                                    visibility = float(parts[0]) / float(parts[1]) * 0.9  # Slightly less than the fraction
+                            else:
+                                parts = vis_str.split('/')
+                                if len(parts) == 2:
+                                    visibility = float(parts[0]) / float(parts[1])
+                        else:
+                            try:
+                                visibility = float(vis_str)
+                            except ValueError:
+                                pass
+            
             return {
                 "airportCode": airport_code.upper(),
                 "rawText": metar.get("rawOb", ""),
@@ -151,8 +185,8 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
                 "dewpoint": metar.get("dewp", None),
                 "windDirection": metar.get("wdir", None),
                 "windSpeed": metar.get("wspd", None),
-                "windGust": metar.get("wspd", None),  # AWC doesn't always provide gust separately
-                "visibility": metar.get("visib", None),
+                "windGust": wind_gust,
+                "visibility": visibility,
                 "altimeter": altim_inhg,
                 "skyConditions": parse_sky_conditions(metar),
                 "flightCategory": metar.get("flightCategory", None),
@@ -191,10 +225,23 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
             else:
                 altim_inhg = altim_value / 33.8639
     
-    # Parse observation time
-    obs_time = metar_data.get("obsTime", datetime.utcnow().isoformat() + 'Z')
-    if isinstance(obs_time, str) and not obs_time.endswith('Z'):
-        obs_time = obs_time + 'Z' if '+' not in obs_time else obs_time
+    # Parse observation time - ensure it's in ISO format with Z suffix
+    obs_time = metar_data.get("obsTime", None)
+    if obs_time:
+        obs_time_str = str(obs_time)
+        # Ensure it has Z suffix for UTC
+        if not obs_time_str.endswith('Z') and not obs_time_str.endswith('+00:00'):
+            # Remove timezone offset if present and add Z
+            obs_time_str = obs_time_str.rstrip('+00:00').rstrip('-00:00')
+            if '+' in obs_time_str or (len(obs_time_str) > 10 and obs_time_str[10] == 'T'):
+                # Has time component, ensure Z suffix
+                obs_time = obs_time_str + 'Z' if not obs_time_str.endswith('Z') else obs_time_str
+            else:
+                obs_time = obs_time_str + 'Z'
+        else:
+            obs_time = obs_time_str
+    else:
+        obs_time = datetime.utcnow().isoformat() + 'Z'
     
     return {
         "airportCode": airport_code,
