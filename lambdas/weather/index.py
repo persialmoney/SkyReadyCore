@@ -151,6 +151,45 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
             
             # Parse visibility - check for visib field, or parse from raw METAR if not available
             visibility = metar.get("visib", None)
+            
+            # If visibility is a string, try to parse it
+            if isinstance(visibility, str):
+                vis_str = visibility.strip()
+                # Handle "+" suffix (means 10+ or 6+)
+                if vis_str.endswith('+'):
+                    try:
+                        visibility = float(vis_str[:-1]) + 0.5
+                    except ValueError:
+                        visibility = None
+                # Handle fractions like "3/4", "1 3/4"
+                elif '/' in vis_str:
+                    parts = vis_str.split()
+                    if len(parts) == 2:  # "1 3/4" format
+                        try:
+                            whole = float(parts[0])
+                            frac_parts = parts[1].split('/')
+                            if len(frac_parts) == 2:
+                                fraction = float(frac_parts[0]) / float(frac_parts[1])
+                                visibility = whole + fraction
+                            else:
+                                visibility = None
+                        except ValueError:
+                            visibility = None
+                    else:  # "3/4" format
+                        frac_parts = vis_str.split('/')
+                        if len(frac_parts) == 2:
+                            try:
+                                visibility = float(frac_parts[0]) / float(frac_parts[1])
+                            except ValueError:
+                                visibility = None
+                        else:
+                            visibility = None
+                else:
+                    try:
+                        visibility = float(vis_str)
+                    except (ValueError, TypeError):
+                        visibility = None
+            
             if visibility is None:
                 # Try to parse from raw METAR text (format: 10SM, 1/2SM, M1/4SM, etc.)
                 raw_text = metar.get("rawOb", "")
@@ -227,6 +266,10 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
     
     # Parse observation time - ensure it's in ISO format with Z suffix
     obs_time = metar_data.get("obsTime", None)
+    if not obs_time:
+        # Try alternative field name
+        obs_time = metar_data.get("observation_time", None)
+    
     if obs_time:
         obs_time_str = str(obs_time)
         # Ensure it has Z suffix for UTC
@@ -243,16 +286,68 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
     else:
         obs_time = datetime.utcnow().isoformat() + 'Z'
     
+    # Parse visibility - handle both old and new field names
+    visibility = metar_data.get("visib", None)
+    if visibility is None:
+        visibility = metar_data.get("visibility_statute_mi", None)
+    
+    # If visibility is a string with "+" suffix, convert it
+    if isinstance(visibility, str):
+        if visibility.endswith('+'):
+            try:
+                visibility = float(visibility[:-1]) + 0.5
+            except ValueError:
+                visibility = None
+        elif '/' in visibility:
+            # Handle fractions like "3/4", "1 3/4"
+            parts = visibility.split()
+            if len(parts) == 2:  # "1 3/4" format
+                try:
+                    whole = float(parts[0])
+                    frac_parts = parts[1].split('/')
+                    if len(frac_parts) == 2:
+                        fraction = float(frac_parts[0]) / float(frac_parts[1])
+                        visibility = whole + fraction
+                    else:
+                        visibility = None
+                except ValueError:
+                    visibility = None
+            else:  # "3/4" format
+                frac_parts = visibility.split('/')
+                if len(frac_parts) == 2:
+                    try:
+                        visibility = float(frac_parts[0]) / float(frac_parts[1])
+                    except ValueError:
+                        visibility = None
+                else:
+                    visibility = None
+        else:
+            try:
+                visibility = float(visibility)
+            except (ValueError, TypeError):
+                visibility = None
+    
+    # Parse wind gust - only include if different from wind speed
+    wind_gust = metar_data.get("wspdGust", None)
+    if wind_gust is None:
+        wind_gust = metar_data.get("wind_gust_kt", None)
+    
+    # Only set wind gust if it's different from wind speed
+    wind_speed = metar_data.get("wspd", None)
+    if wind_gust is not None and wind_speed is not None:
+        if wind_gust == wind_speed:
+            wind_gust = None  # Don't show gusts if they're the same as wind speed
+    
     return {
         "airportCode": airport_code,
-        "rawText": metar_data.get("rawOb", ""),
+        "rawText": metar_data.get("rawOb", metar_data.get("raw_text", "")),
         "observationTime": obs_time,
         "temperature": metar_data.get("temp", None),
         "dewpoint": metar_data.get("dewp", None),
         "windDirection": metar_data.get("wdir", None),
         "windSpeed": metar_data.get("wspd", None),
-        "windGust": metar_data.get("wspdGust", metar_data.get("wspd", None)),
-        "visibility": metar_data.get("visib", None),
+        "windGust": wind_gust,
+        "visibility": visibility,
         "altimeter": altim_inhg,
         "skyConditions": parse_sky_conditions(metar_data),
         "flightCategory": metar_data.get("flightCategory", None),

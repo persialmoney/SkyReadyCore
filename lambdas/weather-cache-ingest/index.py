@@ -106,29 +106,242 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
     records = []
     try:
         text = data.decode('utf-8')
-        reader = csv.DictReader(text.splitlines())
+        lines = text.splitlines()
+        if not lines:
+            return records
+        
+        # Parse header to get column indices (handles duplicate column names)
+        header_reader = csv.reader([lines[0]])
+        header = next(header_reader)
+        column_indices = {}
+        for i, col in enumerate(header):
+            col = col.strip('"')
+            if col not in column_indices:
+                column_indices[col] = []
+            column_indices[col].append(i)
+        
+        # Parse data rows
+        reader = csv.reader(lines[1:])
         for row in reader:
-            # Normalize field names and convert types
+            # Map new CSV field names to expected format
             record = {}
-            for key, value in row.items():
-                if value and value.strip():
-                    # Try to convert numeric fields
-                    if key in ['temp', 'dewp', 'wdir', 'wspd', 'visib', 'altim', 'altimInHg', 'slp', 'elev']:
-                        try:
-                            record[key] = float(value) if '.' in value else int(value)
-                        except ValueError:
-                            record[key] = value
-                    else:
-                        record[key] = value
-                else:
-                    record[key] = None
             
-            # Parse clouds array if present
-            if 'clouds' in record and record['clouds']:
+            # Helper function to get value by column name
+            def get_col(name, default=''):
+                if name in column_indices and column_indices[name]:
+                    idx = column_indices[name][0]
+                    if idx < len(row):
+                        val = row[idx].strip('"')
+                        return val if val else default
+                return default
+            
+            # Map raw text
+            record['rawOb'] = get_col('raw_text', '')
+            
+            # Map station ID
+            station_id = get_col('station_id', '')
+            if not station_id:
+                continue  # Skip records without station ID
+            
+            # Map observation time
+            obs_time = get_col('observation_time', '')
+            if obs_time:
+                # Ensure it ends with Z
+                if not obs_time.endswith('Z') and not obs_time.endswith('+00:00'):
+                    obs_time = obs_time.rstrip('+00:00').rstrip('-00:00')
+                    if '+' in obs_time or (len(obs_time) > 10 and obs_time[10] == 'T'):
+                        obs_time = obs_time + 'Z' if not obs_time.endswith('Z') else obs_time
+                    else:
+                        obs_time = obs_time + 'Z'
+            record['obsTime'] = obs_time
+            
+            # Map temperature and dewpoint
+            temp_c = get_col('temp_c', '')
+            if temp_c and temp_c.strip():
                 try:
-                    record['clouds'] = json.loads(record['clouds'])
-                except:
-                    record['clouds'] = []
+                    record['temp'] = float(temp_c)
+                except ValueError:
+                    record['temp'] = None
+            else:
+                record['temp'] = None
+            
+            dewpoint_c = get_col('dewpoint_c', '')
+            if dewpoint_c and dewpoint_c.strip():
+                try:
+                    record['dewp'] = float(dewpoint_c)
+                except ValueError:
+                    record['dewp'] = None
+            else:
+                record['dewp'] = None
+            
+            # Map wind data
+            wind_dir = get_col('wind_dir_degrees', '')
+            if wind_dir and wind_dir.strip():
+                try:
+                    record['wdir'] = int(float(wind_dir))
+                except ValueError:
+                    record['wdir'] = None
+            else:
+                record['wdir'] = None
+            
+            wind_speed = get_col('wind_speed_kt', '')
+            if wind_speed and wind_speed.strip():
+                try:
+                    record['wspd'] = int(float(wind_speed))
+                except ValueError:
+                    record['wspd'] = None
+            else:
+                record['wspd'] = None
+            
+            wind_gust = get_col('wind_gust_kt', '')
+            if wind_gust and wind_gust.strip():
+                try:
+                    record['wspdGust'] = int(float(wind_gust))
+                except ValueError:
+                    record['wspdGust'] = None
+            else:
+                record['wspdGust'] = None
+            
+            # Map visibility - handle values like "10+", "6+", "2.5", "1 3/4", "3/4", etc.
+            vis_mi = get_col('visibility_statute_mi', '')
+            if vis_mi and vis_mi.strip():
+                vis_str = vis_mi.strip()
+                # Handle "+" suffix (means 10+ or 6+)
+                if vis_str.endswith('+'):
+                    try:
+                        record['visib'] = float(vis_str[:-1]) + 0.5  # Add 0.5 to indicate "or more"
+                    except ValueError:
+                        record['visib'] = None
+                # Handle fractions like "3/4", "1/2", "1 3/4", "2 1/2"
+                elif '/' in vis_str:
+                    parts = vis_str.split()
+                    if len(parts) == 2:  # "1 3/4" format
+                        try:
+                            whole = float(parts[0])
+                            frac_parts = parts[1].split('/')
+                            if len(frac_parts) == 2:
+                                fraction = float(frac_parts[0]) / float(frac_parts[1])
+                                record['visib'] = whole + fraction
+                            else:
+                                record['visib'] = None
+                        except ValueError:
+                            record['visib'] = None
+                    else:  # "3/4" format
+                        frac_parts = vis_str.split('/')
+                        if len(frac_parts) == 2:
+                            try:
+                                record['visib'] = float(frac_parts[0]) / float(frac_parts[1])
+                            except ValueError:
+                                record['visib'] = None
+                        else:
+                            record['visib'] = None
+                else:
+                    try:
+                        record['visib'] = float(vis_str)
+                    except ValueError:
+                        record['visib'] = None
+            else:
+                record['visib'] = None
+            
+            # Map altimeter
+            altim = get_col('altim_in_hg', '')
+            if altim and altim.strip():
+                try:
+                    record['altim_in_hg'] = float(altim)
+                except ValueError:
+                    record['altim_in_hg'] = None
+            else:
+                record['altim_in_hg'] = None
+            
+            # Map sea level pressure
+            slp = get_col('sea_level_pressure_mb', '')
+            if slp and slp.strip():
+                try:
+                    record['slp'] = float(slp)
+                except ValueError:
+                    record['slp'] = None
+            else:
+                record['slp'] = None
+            
+            # Map elevation
+            elev = get_col('elevation_m', '')
+            if elev and elev.strip():
+                try:
+                    # Convert meters to feet
+                    record['elev'] = float(elev) * 3.28084
+                except ValueError:
+                    record['elev'] = None
+            else:
+                record['elev'] = None
+            
+            # Map flight category
+            record['flightCategory'] = get_col('flight_category', '')
+            
+            # Map METAR type
+            record['metarType'] = get_col('metar_type', '')
+            
+            # Parse sky conditions - handle duplicate column names by using all indices
+            sky_conditions = []
+            if 'sky_cover' in column_indices and 'cloud_base_ft_agl' in column_indices:
+                sky_cover_indices = column_indices['sky_cover']
+                cloud_base_indices = column_indices['cloud_base_ft_agl']
+                
+                # Process up to 4 cloud layers
+                for i in range(min(4, len(sky_cover_indices), len(cloud_base_indices))):
+                    sky_idx = sky_cover_indices[i]
+                    base_idx = cloud_base_indices[i]
+                    
+                    if sky_idx < len(row) and base_idx < len(row):
+                        sky_cover = row[sky_idx].strip('"')
+                        cloud_base = row[base_idx].strip('"')
+                        
+                        if sky_cover and sky_cover.strip() and sky_cover.upper() not in ['', 'NIL', 'NCD']:
+                            sky_cover_upper = sky_cover.strip().upper()
+                            if sky_cover_upper in ['CLR', 'SKC', 'FEW', 'SCT', 'BKN', 'OVC', 'OVX', 'VV']:
+                                cloud_layer = {
+                                    'skyCover': sky_cover_upper,
+                                    'cloudBase': None,
+                                    'cloudType': None
+                                }
+                                
+                                if cloud_base and cloud_base.strip():
+                                    try:
+                                        cloud_layer['cloudBase'] = int(float(cloud_base))
+                                    except ValueError:
+                                        pass
+                                
+                                sky_conditions.append(cloud_layer)
+                
+                # Check if we have a cloud layer
+                if sky_cover and sky_cover.strip() and sky_cover.upper() not in ['', 'NIL', 'NCD']:
+                    sky_cover_upper = sky_cover.strip().upper()
+                    if sky_cover_upper in ['CLR', 'SKC', 'FEW', 'SCT', 'BKN', 'OVC', 'OVX', 'VV']:
+                        cloud_layer = {
+                            'skyCover': sky_cover_upper,
+                            'cloudBase': None,
+                            'cloudType': None
+                        }
+                        
+                        if cloud_base and cloud_base.strip():
+                            try:
+                                cloud_layer['cloudBase'] = int(float(cloud_base))
+                            except ValueError:
+                                pass
+                        
+                        sky_conditions.append(cloud_layer)
+            
+            # Store sky conditions in the format expected by parse_sky_conditions
+            # Also store individual skyc1, skyl1, etc. fields for compatibility
+            if sky_conditions:
+                record['clouds'] = sky_conditions
+                for i, layer in enumerate(sky_conditions[:4], 1):
+                    record[f'skyc{i}'] = layer.get('skyCover')
+                    record[f'skyl{i}'] = layer.get('cloudBase')
+            else:
+                record['clouds'] = []
+            
+            # Map weather string
+            record['wxString'] = row.get('wx_string', '')
             
             records.append(record)
         logger.info(f"Parsed {len(records)} METAR records from CSV")
