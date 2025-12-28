@@ -80,7 +80,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'preferences': {
                 'defaultUnits': 'imperial',  # Default to imperial for aviation
                 'notificationEnabled': True,
-                'criticalAlertThreshold': 'moderate'
+                'criticalAlertThreshold': 'moderate',
+                'defaultAirport': 'KSFO'
             }
         }
         

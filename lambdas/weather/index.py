@@ -429,14 +429,22 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
             
             taf = data[0]
             
+            # Log the TAF structure for debugging
+            logger.info(f"TAF data keys: {list(taf.keys())}")
+            if "forecast" in taf:
+                logger.info(f"Forecast type: {type(taf['forecast'])}, length: {len(taf['forecast']) if isinstance(taf['forecast'], list) else 'N/A'}")
+            
+            parsed_forecast = parse_taf_forecast(taf)
+            logger.info(f"Parsed {len(parsed_forecast)} forecast periods")
+            
             result = {
                 "airportCode": airport_code,
-                "rawText": taf.get("rawTAF", ""),
+                "rawText": taf.get("rawTAF", taf.get("rawText", "")),
                 "issueTime": taf.get("issueTime", datetime.utcnow().isoformat()),
                 "validTimeFrom": taf.get("validTimeFrom", ""),
                 "validTimeTo": taf.get("validTimeTo", ""),
                 "remarks": taf.get("remarks", ""),
-                "forecast": parse_taf_forecast(taf)
+                "forecast": parsed_forecast
             }
             
             # Write-through: Store in cache for next request
@@ -626,19 +634,193 @@ def parse_sky_conditions(metar: Dict) -> list:
 
 
 def parse_taf_forecast(taf: Dict) -> list:
-    """Parse TAF forecast periods."""
-    # TAF forecasts are complex - this is a placeholder
-    # Adjust based on actual AWC API response format
+    """Parse TAF forecast periods from AWC API response."""
+    forecasts = []
+    
+    # AWC TAF API can return forecast periods in different formats
+    # Check for structured forecast array first
+    if "forecast" in taf and isinstance(taf["forecast"], list) and len(taf["forecast"]) > 0:
+        logger.info(f"Found {len(taf['forecast'])} forecast periods in structured format")
+        for idx, fcst in enumerate(taf["forecast"]):
+            logger.info(f"Forecast {idx} keys: {list(fcst.keys()) if isinstance(fcst, dict) else 'not a dict'}")
+            forecast_period = {
+                "fcstTimeFrom": _convert_time_to_iso(fcst.get("fcstTimeFrom", fcst.get("validTimeFrom", fcst.get("timeFrom", "")))),
+                "fcstTimeTo": _convert_time_to_iso(fcst.get("fcstTimeTo", fcst.get("validTimeTo", fcst.get("timeTo", "")))),
+                "changeIndicator": fcst.get("changeIndicator", fcst.get("changeind", fcst.get("changeIndicator", None))),
+                "windDirection": fcst.get("wdir", fcst.get("windDirection", None)),
+                "windSpeed": fcst.get("wspd", fcst.get("windSpeed", None)),
+                "windGust": fcst.get("wspdGust", fcst.get("windGust", None)),
+                "visibility": fcst.get("visib", fcst.get("visibility", None)),
+                "skyConditions": _parse_taf_sky_conditions(fcst),
+                "flightCategory": fcst.get("flightCategory", fcst.get("flightcat", None))
+            }
+            forecasts.append(forecast_period)
+    
+    # If no structured forecast, try to parse from raw TAF text
+    if not forecasts:
+        raw_taf = taf.get("rawTAF", taf.get("rawText", ""))
+        if raw_taf:
+            forecasts = _parse_taf_from_raw(raw_taf, taf)
+    
+    # Fallback: create a single forecast period from main TAF data
+    if not forecasts:
+        forecasts = _create_fallback_forecast(taf)
+    
+    return forecasts
+
+
+def _convert_time_to_iso(time_str: Any) -> str:
+    """Convert time string (Unix timestamp or ISO) to ISO format."""
+    if not time_str:
+        return ""
+    
+    # If it's already a string that looks like ISO, return it
+    if isinstance(time_str, str) and ("T" in time_str or "-" in time_str):
+        return time_str
+    
+    # Try to parse as Unix timestamp (seconds or milliseconds)
+    try:
+        if isinstance(time_str, (int, float)):
+            timestamp = float(time_str)
+        else:
+            timestamp = float(str(time_str))
+        
+        # If timestamp is in seconds (less than year 2100 in seconds), convert to milliseconds
+        if timestamp < 4102444800:  # Year 2100 in seconds
+            timestamp = timestamp * 1000
+        
+        dt = datetime.utcfromtimestamp(timestamp / 1000)
+        return dt.isoformat() + "Z"
+    except (ValueError, TypeError, OSError):
+        # If conversion fails, return as string
+        return str(time_str)
+
+
+def _parse_taf_sky_conditions(data: Dict) -> list:
+    """Parse sky conditions from TAF data (similar to METAR parsing)."""
+    sky_conditions = []
+    
+    # Parse up to 4 cloud layers (similar to METAR)
+    for i in range(1, 5):
+        skyc_key = f"skyc{i}"
+        skyl_key = f"skyl{i}"
+        skyt_key = f"skyt{i}"
+        
+        sky_cover = data.get(skyc_key, None)
+        
+        if sky_cover is not None and str(sky_cover).strip():
+            sky_cover_str = str(sky_cover).strip().upper()
+            
+            if sky_cover_str and sky_cover_str != "///" and sky_cover_str != "":
+                cloud_base_raw = data.get(skyl_key, None)
+                cloud_base = None
+                if cloud_base_raw is not None:
+                    try:
+                        cloud_base = int(cloud_base_raw)
+                    except (ValueError, TypeError):
+                        cloud_base = None
+                
+                cloud_type = data.get(skyt_key, None)
+                if cloud_type is not None and str(cloud_type).strip():
+                    cloud_type = str(cloud_type).strip()
+                else:
+                    cloud_type = None
+                
+                if sky_cover_str in ["CLR", "SKC"]:
+                    if i == 1:
+                        sky_conditions.append({
+                            "skyCover": "CLR",
+                            "cloudBase": None,
+                            "cloudType": None
+                        })
+                        break
+                else:
+                    sky_conditions.append({
+                        "skyCover": sky_cover_str,
+                        "cloudBase": cloud_base,
+                        "cloudType": cloud_type
+                    })
+    
+    return sky_conditions if sky_conditions else []
+
+
+def _parse_taf_from_raw(raw_taf: str, taf_data: Dict) -> list:
+    """Parse TAF forecast periods from raw TAF text using AVWX library."""
+    from avwx import Taf
+    
+    forecasts = []
+    try:
+        # Parse raw TAF using AVWX
+        taf_obj = Taf.from_report(raw_taf)
+        
+        if not taf_obj.data or not taf_obj.data.forecast:
+            logger.warning("AVWX parsed TAF but no forecast periods found")
+            return _create_fallback_forecast(taf_data)
+        
+        # Extract values from AVWX objects to create JSON-serializable dicts
+        for line_data in taf_obj.data.forecast:
+            # Extract timestamps (convert to ISO strings)
+            fcst_time_from = ""
+            if line_data.start_time and hasattr(line_data.start_time, 'dt') and line_data.start_time.dt:
+                fcst_time_from = line_data.start_time.dt.isoformat() + "Z"
+            
+            fcst_time_to = ""
+            if line_data.end_time and hasattr(line_data.end_time, 'dt') and line_data.end_time.dt:
+                fcst_time_to = line_data.end_time.dt.isoformat() + "Z"
+            
+            # Extract wind values (Number objects have .value property)
+            wind_dir = line_data.wind_direction.value if (line_data.wind_direction and hasattr(line_data.wind_direction, 'value')) else None
+            wind_speed = line_data.wind_speed.value if (line_data.wind_speed and hasattr(line_data.wind_speed, 'value')) else None
+            wind_gust = line_data.wind_gust.value if (line_data.wind_gust and hasattr(line_data.wind_gust, 'value')) else None
+            
+            # Extract visibility
+            visibility = line_data.visibility.value if (line_data.visibility and hasattr(line_data.visibility, 'value')) else None
+            
+            # Convert clouds to dicts
+            sky_conditions = []
+            if line_data.clouds:
+                for cloud in line_data.clouds:
+                    if cloud:
+                        sky_conditions.append({
+                            "skyCover": str(cloud.repr) if hasattr(cloud, 'repr') and cloud.repr else None,
+                            "cloudBase": int(cloud.base) if hasattr(cloud, 'base') and cloud.base is not None else None,
+                            "cloudType": str(cloud.type) if hasattr(cloud, 'type') and cloud.type else None
+                        })
+            
+            forecast_period = {
+                "fcstTimeFrom": fcst_time_from,
+                "fcstTimeTo": fcst_time_to,
+                "changeIndicator": line_data.type,  # Already a string or None
+                "windDirection": int(wind_dir) if wind_dir is not None else None,
+                "windSpeed": int(wind_speed) if wind_speed is not None else None,
+                "windGust": int(wind_gust) if wind_gust is not None else None,
+                "visibility": float(visibility) if visibility is not None else None,
+                "skyConditions": sky_conditions,
+                "flightCategory": line_data.flight_rules  # Already a string
+            }
+            forecasts.append(forecast_period)
+            
+        logger.info(f"AVWX parsed {len(forecasts)} forecast periods from raw TAF")
+        
+    except Exception as e:
+        logger.error(f"Error parsing TAF with AVWX: {str(e)}", exc_info=True)
+        return _create_fallback_forecast(taf_data)
+    
+    return forecasts if forecasts else _create_fallback_forecast(taf_data)
+
+
+def _create_fallback_forecast(taf_data: Dict) -> list:
+    """Create a single forecast period from main TAF data as fallback."""
     return [{
-        "fcstTimeFrom": taf.get("validTimeFrom", ""),
-        "fcstTimeTo": taf.get("validTimeTo", ""),
+        "fcstTimeFrom": _convert_time_to_iso(taf_data.get("validTimeFrom", "")),
+        "fcstTimeTo": _convert_time_to_iso(taf_data.get("validTimeTo", "")),
         "changeIndicator": None,
-        "windDirection": taf.get("wdir", None),
-        "windSpeed": taf.get("wspd", None),
-        "windGust": None,
-        "visibility": taf.get("visib", None),
-        "skyConditions": [],
-        "flightCategory": taf.get("flightCategory", None)
+        "windDirection": taf_data.get("wdir", None),
+        "windSpeed": taf_data.get("wspd", None),
+        "windGust": taf_data.get("wspdGust", None),
+        "visibility": taf_data.get("visib", None),
+        "skyConditions": _parse_taf_sky_conditions(taf_data),
+        "flightCategory": taf_data.get("flightCategory", taf_data.get("flightcat", None))
     }]
 
 

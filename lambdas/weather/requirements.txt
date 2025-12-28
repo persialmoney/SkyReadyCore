@@ -1,2 +1,3 @@
 boto3>=1.34.0
 redis>=5.0.0
+avwx-engine>=1.0.0
