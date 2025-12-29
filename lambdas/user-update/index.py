@@ -80,8 +80,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         preferences = input_data.get('preferences')
         if preferences is not None:
             if 'defaultAirport' in preferences and preferences['defaultAirport'] is not None:
+                airport_value = preferences['defaultAirport']
+                print(f"[UserUpdate] Updating defaultAirport to: {airport_value}")
                 update_expression_parts.append("preferences.defaultAirport = :defaultAirport")
-                expression_values[":defaultAirport"] = preferences['defaultAirport']
+                expression_values[":defaultAirport"] = airport_value
             
             if 'defaultUnits' in preferences and preferences['defaultUnits'] is not None:
                 update_expression_parts.append("preferences.defaultUnits = :defaultUnits")
@@ -118,6 +120,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         # Get the updated item
         updated_item = response.get('Attributes', {})
+        
+        # Log the updated item to verify the save
+        print(f"[UserUpdate] DynamoDB update response - Attributes: {json.dumps(updated_item, default=str)}")
+        if 'preferences' in updated_item and 'defaultAirport' in updated_item.get('preferences', {}):
+            print(f"[UserUpdate] Verified defaultAirport in DynamoDB: {updated_item['preferences']['defaultAirport']}")
         
         # Convert DynamoDB item to GraphQL format
         # Ensure 'id' field exists (GraphQL schema expects it)
