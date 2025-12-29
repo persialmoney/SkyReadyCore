@@ -6,7 +6,8 @@ Uses cache-first strategy: checks ElastiCache, falls back to API if cache miss.
 import json
 import os
 import boto3
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import urllib.request
 import urllib.error
@@ -758,47 +759,168 @@ def _parse_taf_from_raw(raw_taf: str, taf_data: Dict) -> list:
             return _create_fallback_forecast(taf_data)
         
         # Extract values from AVWX objects to create JSON-serializable dicts
-        for line_data in taf_obj.data.forecast:
+        for idx, line_data in enumerate(taf_obj.data.forecast):
+            # Log the structure for debugging
+            logger.info(f"Forecast period {idx}: type={line_data.type}, has_start_time={line_data.start_time is not None}, has_end_time={line_data.end_time is not None}")
+            logger.info(f"  visibility={line_data.visibility}, clouds={line_data.clouds}, flight_rules={line_data.flight_rules}")
+            
             # Extract timestamps (convert to ISO strings)
             fcst_time_from = ""
-            if line_data.start_time and hasattr(line_data.start_time, 'dt') and line_data.start_time.dt:
-                fcst_time_from = line_data.start_time.dt.isoformat() + "Z"
+            if line_data.start_time:
+                try:
+                    # AVWX Timestamp objects have .dt property that returns datetime
+                    if hasattr(line_data.start_time, 'dt') and line_data.start_time.dt:
+                        dt = line_data.start_time.dt
+                        # Ensure UTC timezone
+                        if dt.tzinfo is None:
+                            # If no timezone, assume UTC
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        elif dt.tzinfo != timezone.utc:
+                            # Convert to UTC if not already
+                            dt = dt.astimezone(timezone.utc)
+                        fcst_time_from = dt.isoformat().replace('+00:00', 'Z')
+                    else:
+                        # Fallback: try other methods
+                        if hasattr(line_data.start_time, 'repr') and line_data.start_time.repr:
+                            fcst_time_from = str(line_data.start_time.repr)
+                        elif hasattr(line_data.start_time, 'value'):
+                            fcst_time_from = _convert_time_to_iso(line_data.start_time.value)
+                except Exception as e:
+                    logger.warning(f"Error extracting start_time: {str(e)}")
             
             fcst_time_to = ""
-            if line_data.end_time and hasattr(line_data.end_time, 'dt') and line_data.end_time.dt:
-                fcst_time_to = line_data.end_time.dt.isoformat() + "Z"
+            if line_data.end_time:
+                try:
+                    if hasattr(line_data.end_time, 'dt') and line_data.end_time.dt:
+                        dt = line_data.end_time.dt
+                        # Ensure UTC timezone
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        elif dt.tzinfo != timezone.utc:
+                            dt = dt.astimezone(timezone.utc)
+                        fcst_time_to = dt.isoformat().replace('+00:00', 'Z')
+                    else:
+                        if hasattr(line_data.end_time, 'repr') and line_data.end_time.repr:
+                            fcst_time_to = str(line_data.end_time.repr)
+                        elif hasattr(line_data.end_time, 'value'):
+                            fcst_time_to = _convert_time_to_iso(line_data.end_time.value)
+                except Exception as e:
+                    logger.warning(f"Error extracting end_time: {str(e)}")
             
             # Extract wind values (Number objects have .value property)
-            wind_dir = line_data.wind_direction.value if (line_data.wind_direction and hasattr(line_data.wind_direction, 'value')) else None
-            wind_speed = line_data.wind_speed.value if (line_data.wind_speed and hasattr(line_data.wind_speed, 'value')) else None
-            wind_gust = line_data.wind_gust.value if (line_data.wind_gust and hasattr(line_data.wind_gust, 'value')) else None
+            wind_dir = None
+            if line_data.wind_direction:
+                try:
+                    if hasattr(line_data.wind_direction, 'value'):
+                        wind_dir = line_data.wind_direction.value
+                    elif isinstance(line_data.wind_direction, (int, float)):
+                        wind_dir = line_data.wind_direction
+                except:
+                    pass
             
-            # Extract visibility
-            visibility = line_data.visibility.value if (line_data.visibility and hasattr(line_data.visibility, 'value')) else None
+            wind_speed = None
+            if line_data.wind_speed:
+                try:
+                    if hasattr(line_data.wind_speed, 'value'):
+                        wind_speed = line_data.wind_speed.value
+                    elif isinstance(line_data.wind_speed, (int, float)):
+                        wind_speed = line_data.wind_speed
+                except:
+                    pass
             
-            # Convert clouds to dicts
+            wind_gust = None
+            if line_data.wind_gust:
+                try:
+                    if hasattr(line_data.wind_gust, 'value'):
+                        wind_gust = line_data.wind_gust.value
+                    elif isinstance(line_data.wind_gust, (int, float)):
+                        wind_gust = line_data.wind_gust
+                except:
+                    pass
+            
+            # Extract visibility - handle different formats
+            visibility = None
+            if line_data.visibility:
+                try:
+                    # Try to get numeric value first
+                    if hasattr(line_data.visibility, 'value'):
+                        vis_value = line_data.visibility.value
+                        if isinstance(vis_value, (int, float)):
+                            visibility = float(vis_value)
+                        elif isinstance(vis_value, str):
+                            # Parse string like "6.0" or "P6SM"
+                            visibility = _parse_visibility_string(vis_value)
+                    elif isinstance(line_data.visibility, (int, float)):
+                        visibility = float(line_data.visibility)
+                    elif hasattr(line_data.visibility, 'repr'):
+                        # Handle special cases like "P6SM" (greater than 6 SM)
+                        vis_repr = str(line_data.visibility.repr)
+                        visibility = _parse_visibility_string(vis_repr)
+                    elif hasattr(line_data.visibility, '__str__'):
+                        # Try string representation
+                        vis_str = str(line_data.visibility)
+                        visibility = _parse_visibility_string(vis_str)
+                except Exception as e:
+                    logger.warning(f"Error extracting visibility: {str(e)}")
+            
+            # Convert clouds to dicts - handle AVWX Cloud objects
             sky_conditions = []
-            if line_data.clouds:
-                for cloud in line_data.clouds:
-                    if cloud:
-                        sky_conditions.append({
-                            "skyCover": str(cloud.repr) if hasattr(cloud, 'repr') and cloud.repr else None,
-                            "cloudBase": int(cloud.base) if hasattr(cloud, 'base') and cloud.base is not None else None,
-                            "cloudType": str(cloud.type) if hasattr(cloud, 'type') and cloud.type else None
-                        })
+            if line_data.clouds and len(line_data.clouds) > 0:
+                try:
+                    for cloud in line_data.clouds:
+                        if cloud:
+                            sky_cover = None
+                            cloud_base = None
+                            cloud_type = None
+                            
+                            # AVWX Cloud objects have repr, base, and type properties
+                            # repr is the string representation (e.g., "FEW", "SCT", "BKN", "OVC")
+                            if hasattr(cloud, 'repr') and cloud.repr:
+                                sky_cover = str(cloud.repr).strip().upper()
+                            elif hasattr(cloud, 'cover') and cloud.cover:
+                                sky_cover = str(cloud.cover).strip().upper()
+                            elif hasattr(cloud, '__str__'):
+                                sky_cover = str(cloud).strip().upper()
+                            
+                            # base is the cloud base altitude in feet
+                            if hasattr(cloud, 'base') and cloud.base is not None:
+                                try:
+                                    if isinstance(cloud.base, (int, float)):
+                                        cloud_base = int(cloud.base)
+                                    else:
+                                        cloud_base = int(cloud.base)
+                                except (ValueError, TypeError):
+                                    pass
+                            
+                            # type is optional cloud type (e.g., "CB", "TCU")
+                            if hasattr(cloud, 'type') and cloud.type:
+                                cloud_type = str(cloud.type).strip()
+                            
+                            # Only add if we have sky cover (skip None/empty)
+                            if sky_cover and sky_cover not in ['', 'NONE', 'NULL']:
+                                sky_conditions.append({
+                                    "skyCover": sky_cover,
+                                    "cloudBase": cloud_base,
+                                    "cloudType": cloud_type
+                                })
+                except Exception as e:
+                    logger.warning(f"Error extracting clouds: {str(e)}", exc_info=True)
             
             forecast_period = {
                 "fcstTimeFrom": fcst_time_from,
                 "fcstTimeTo": fcst_time_to,
-                "changeIndicator": line_data.type,  # Already a string or None
+                "changeIndicator": line_data.type if hasattr(line_data, 'type') else None,
                 "windDirection": int(wind_dir) if wind_dir is not None else None,
                 "windSpeed": int(wind_speed) if wind_speed is not None else None,
                 "windGust": int(wind_gust) if wind_gust is not None else None,
                 "visibility": float(visibility) if visibility is not None else None,
                 "skyConditions": sky_conditions,
-                "flightCategory": line_data.flight_rules  # Already a string
+                "flightCategory": line_data.flight_rules if hasattr(line_data, 'flight_rules') else None
             }
             forecasts.append(forecast_period)
+            
+            # Log what we extracted
+            logger.info(f"Extracted forecast {idx}: time={fcst_time_from} to {fcst_time_to}, vis={visibility}, clouds={len(sky_conditions)}")
             
         logger.info(f"AVWX parsed {len(forecasts)} forecast periods from raw TAF")
         
@@ -807,6 +929,43 @@ def _parse_taf_from_raw(raw_taf: str, taf_data: Dict) -> list:
         return _create_fallback_forecast(taf_data)
     
     return forecasts if forecasts else _create_fallback_forecast(taf_data)
+
+
+def _parse_visibility_string(vis_str: str) -> Optional[float]:
+    """Parse visibility string from AVWX (e.g., 'P6SM', '6SM', '10SM', '1/2SM')."""
+    if not vis_str:
+        return None
+    
+    vis_str = str(vis_str).strip().upper()
+    
+    # Handle "P6SM" or "P10SM" (greater than X SM)
+    if vis_str.startswith('P') and vis_str.endswith('SM'):
+        # P6SM means >6 SM, return 6.1
+        match = re.search(r'P(\d+\.?\d*)SM', vis_str)
+        if match:
+            return float(match.group(1)) + 0.1
+    
+    # Handle regular "6SM" or "10SM"
+    if vis_str.endswith('SM'):
+        match = re.search(r'(\d+\.?\d*)SM', vis_str)
+        if match:
+            return float(match.group(1))
+    
+    # Handle fractions like "1/2SM"
+    if '/' in vis_str and vis_str.endswith('SM'):
+        match = re.search(r'(\d+)/(\d+)SM', vis_str)
+        if match:
+            numerator = float(match.group(1))
+            denominator = float(match.group(2))
+            if denominator > 0:
+                return numerator / denominator
+    
+    # Try to extract any number
+    match = re.search(r'(\d+\.?\d*)', vis_str)
+    if match:
+        return float(match.group(1))
+    
+    return None
 
 
 def _create_fallback_forecast(taf_data: Dict) -> list:
