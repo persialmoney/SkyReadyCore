@@ -76,6 +76,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if field_name == "getUser":
             result = handle_get_user(user_id)
             print(f"[DataOperations] getUser result: {json.dumps(result, default=str) if result else 'None'}")
+            print(f"[DataOperations] getUser result type: {type(result).__name__}")
+            print(f"[DataOperations] getUser result is None: {result is None}")
+            # Ensure we always return a dict or None, never an empty dict or other type
+            if result is None:
+                print(f"[DataOperations] Returning None for getUser (user doesn't exist)")
+                return None
+            # Ensure result is a dict (should always be the case)
+            if not isinstance(result, dict):
+                print(f"[DataOperations] WARNING: getUser result is not a dict: {type(result)}")
+                return None
+            print(f"[DataOperations] Returning user data dict with {len(result)} keys")
             return result
         
         elif field_name == "getSavedAirports":
