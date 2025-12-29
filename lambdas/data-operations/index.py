@@ -146,6 +146,25 @@ def handle_get_user(user_id: str) -> Optional[Dict[str, Any]]:
             print(f"[DataOperations] Added 'id' field: {item['id']}")
         
         converted_item = convert_item(item)
+        
+        # Ensure required GraphQL schema fields are never null
+        # Schema requires: id: ID! and name: String!
+        if not converted_item.get('id'):
+            converted_item['id'] = converted_item.get('userId', user_id)
+            print(f"[DataOperations] Ensured 'id' field is present: {converted_item['id']}")
+        
+        # GraphQL schema requires name: String! (non-nullable)
+        # Provide default value if name is null or empty
+        if not converted_item.get('name'):
+            # Try to use email as fallback, otherwise use empty string
+            default_name = converted_item.get('email', '')
+            if not default_name:
+                default_name = ''  # Empty string is valid for String! (non-nullable)
+            converted_item['name'] = default_name
+            print(f"[DataOperations] Provided default value for 'name' field: '{default_name}' (original was null/empty)")
+        else:
+            print(f"[DataOperations] 'name' field is present: '{converted_item['name']}'")
+        
         print(f"[DataOperations] Converted item: {json.dumps(converted_item, default=str)}")
         return converted_item
     
