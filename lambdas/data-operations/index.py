@@ -58,12 +58,25 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         info = event.get('info', {})
         field_name = info.get('fieldName', '')
         
+        # Comprehensive logging
+        print(f"[DataOperations] Handler called for field: {field_name}")
+        print(f"[DataOperations] Event structure: {json.dumps(event, default=str)}")
+        print(f"[DataOperations] Identity: {json.dumps(identity, default=str)}")
+        print(f"[DataOperations] User ID (identity.sub): {user_id}")
+        print(f"[DataOperations] Arguments: {json.dumps(arguments, default=str)}")
+        print(f"[DataOperations] Info: {json.dumps(info, default=str)}")
+        
         if not user_id:
-            raise ValueError("User ID (identity.sub) is required")
+            error_msg = "User ID (identity.sub) is required but was missing"
+            print(f"[DataOperations] ERROR: {error_msg}")
+            print(f"[DataOperations] Full identity object: {json.dumps(identity, default=str)}")
+            raise ValueError(error_msg)
         
         # Route to appropriate handler based on field name
         if field_name == "getUser":
-            return handle_get_user(user_id)
+            result = handle_get_user(user_id)
+            print(f"[DataOperations] getUser result: {json.dumps(result, default=str) if result else 'None'}")
+            return result
         
         elif field_name == "getSavedAirports":
             return handle_get_saved_airports(user_id)
@@ -91,24 +104,44 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     
     except Exception as e:
         error_message = f"Error in data operation: {str(e)}"
-        print(error_message)
-        print(f"Event: {json.dumps(event, default=str)}")
+        error_type = type(e).__name__
+        print(f"[DataOperations] EXCEPTION: {error_message}")
+        print(f"[DataOperations] Exception type: {error_type}")
+        print(f"[DataOperations] Full event: {json.dumps(event, default=str)}")
+        print(f"[DataOperations] Exception details: {str(e)}")
+        # Re-raise to let AppSync handle it properly
         raise Exception(error_message)
 
 
 def handle_get_user(user_id: str) -> Optional[Dict[str, Any]]:
     """Get user by userId"""
-    response = users_table.get_item(Key={'userId': user_id})
-    item = response.get('Item')
+    print(f"[DataOperations] handle_get_user called for userId: {user_id}")
     
-    if not item:
-        return None
+    try:
+        response = users_table.get_item(Key={'userId': user_id})
+        print(f"[DataOperations] DynamoDB get_item response: {json.dumps(response, default=str)}")
+        
+        item = response.get('Item')
+        
+        if not item:
+            print(f"[DataOperations] User {user_id} not found in DynamoDB - returning None")
+            return None
+        
+        print(f"[DataOperations] User found: {json.dumps(item, default=str)}")
+        
+        # Ensure 'id' field exists (GraphQL schema expects it)
+        if 'id' not in item:
+            item['id'] = item.get('userId', user_id)
+            print(f"[DataOperations] Added 'id' field: {item['id']}")
+        
+        converted_item = convert_item(item)
+        print(f"[DataOperations] Converted item: {json.dumps(converted_item, default=str)}")
+        return converted_item
     
-    # Ensure 'id' field exists (GraphQL schema expects it)
-    if 'id' not in item:
-        item['id'] = item.get('userId', user_id)
-    
-    return convert_item(item)
+    except Exception as e:
+        print(f"[DataOperations] ERROR in handle_get_user: {str(e)}")
+        print(f"[DataOperations] Exception type: {type(e).__name__}")
+        raise
 
 
 def handle_get_saved_airports(user_id: str) -> List[Dict[str, Any]]:
