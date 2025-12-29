@@ -132,7 +132,17 @@ def handle_get_user(user_id: str) -> Optional[Dict[str, Any]]:
         response = users_table.get_item(Key={'userId': user_id})
         print(f"[DataOperations] DynamoDB get_item response: {json.dumps(response, default=str)}")
         
+        # Log the exact defaultAirport value from DynamoDB
         item = response.get('Item')
+        if item:
+            preferences = item.get('preferences', {})
+            default_airport = preferences.get('defaultAirport', 'NOT SET')
+            updated_at = item.get('updatedAt', 'NOT SET')
+            print(f"[DataOperations] DynamoDB item - defaultAirport: {default_airport}")
+            print(f"[DataOperations] DynamoDB item - updatedAt: {updated_at}")
+            print(f"[DataOperations] DynamoDB item - full preferences: {json.dumps(preferences, default=str)}")
+        else:
+            print(f"[DataOperations] No item found in DynamoDB response")
         
         if not item:
             print(f"[DataOperations] User {user_id} not found in DynamoDB - returning None")
@@ -166,6 +176,14 @@ def handle_get_user(user_id: str) -> Optional[Dict[str, Any]]:
             print(f"[DataOperations] 'name' field is present: '{converted_item['name']}'")
         
         print(f"[DataOperations] Converted item: {json.dumps(converted_item, default=str)}")
+        
+        # Log the defaultAirport that will be returned
+        if converted_item and 'preferences' in converted_item:
+            returned_airport = converted_item['preferences'].get('defaultAirport', 'NOT SET')
+            print(f"[DataOperations] Will return defaultAirport: {returned_airport}")
+        else:
+            print(f"[DataOperations] No preferences in converted item")
+        
         return converted_item
     
     except Exception as e:
