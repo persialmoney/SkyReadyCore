@@ -422,10 +422,16 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
             data = json.loads(response.read().decode())
             
             if not data or len(data) == 0:
+                # Return valid TAF structure with all required non-nullable fields
+                current_time = datetime.utcnow().isoformat()
                 return {
                     "airportCode": airport_code.upper(),
                     "rawText": "No data available",
-                    "error": "No TAF data found for this airport"
+                    "issueTime": current_time,
+                    "validTimeFrom": current_time,
+                    "validTimeTo": current_time,
+                    "remarks": "",
+                    "forecast": []  # Empty list is valid for [TAFForecast!]!
                 }
             
             taf = data[0]
@@ -438,14 +444,16 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
             parsed_forecast = parse_taf_forecast(taf)
             logger.info(f"Parsed {len(parsed_forecast)} forecast periods")
             
+            # Ensure all non-nullable fields have values (never None)
+            current_time = datetime.utcnow().isoformat()
             result = {
                 "airportCode": airport_code,
-                "rawText": taf.get("rawTAF", taf.get("rawText", "")),
-                "issueTime": taf.get("issueTime", datetime.utcnow().isoformat()),
-                "validTimeFrom": taf.get("validTimeFrom", ""),
-                "validTimeTo": taf.get("validTimeTo", ""),
-                "remarks": taf.get("remarks", ""),
-                "forecast": parsed_forecast
+                "rawText": taf.get("rawTAF") or taf.get("rawText") or "",
+                "issueTime": taf.get("issueTime") or current_time,
+                "validTimeFrom": taf.get("validTimeFrom") or current_time,
+                "validTimeTo": taf.get("validTimeTo") or current_time,
+                "remarks": taf.get("remarks") or "",
+                "forecast": parsed_forecast if parsed_forecast else []  # Ensure it's always a list
             }
             
             # Write-through: Store in cache for next request
@@ -459,37 +467,55 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
             return result
     except urllib.error.URLError as e:
         logger.error(f"Network error fetching TAF for {airport_code}: {str(e)}")
+        current_time = datetime.utcnow().isoformat()
         return {
             "airportCode": airport_code.upper(),
             "rawText": "Error fetching TAF data",
-            "error": f"Network error: {str(e)}"
+            "issueTime": current_time,
+            "validTimeFrom": current_time,
+            "validTimeTo": current_time,
+            "remarks": "",
+            "forecast": []  # Empty list is valid for [TAFForecast!]!
         }
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error for TAF {airport_code}: {str(e)}")
+        current_time = datetime.utcnow().isoformat()
         return {
             "airportCode": airport_code.upper(),
             "rawText": "Error parsing TAF data",
-            "error": f"Parse error: {str(e)}"
+            "issueTime": current_time,
+            "validTimeFrom": current_time,
+            "validTimeTo": current_time,
+            "remarks": "",
+            "forecast": []  # Empty list is valid for [TAFForecast!]!
         }
     except Exception as e:
         logger.error(f"Unexpected error fetching TAF for {airport_code}: {str(e)}")
+        current_time = datetime.utcnow().isoformat()
         return {
             "airportCode": airport_code.upper(),
             "rawText": "Error fetching TAF data",
-            "error": f"Unexpected error: {str(e)}"
+            "issueTime": current_time,
+            "validTimeFrom": current_time,
+            "validTimeTo": current_time,
+            "remarks": "",
+            "forecast": []  # Empty list is valid for [TAFForecast!]!
         }
 
 
 def transform_taf_from_cache(taf_data: Dict[str, Any], airport_code: str) -> Dict[str, Any]:
     """Transform cached TAF data to expected format."""
+    # Ensure all non-nullable fields have values (never None)
+    current_time = datetime.utcnow().isoformat()
+    parsed_forecast = parse_taf_forecast(taf_data)
     return {
         "airportCode": airport_code,
-        "rawText": taf_data.get("rawTAF", ""),
-        "issueTime": taf_data.get("issueTime", datetime.utcnow().isoformat()),
-        "validTimeFrom": taf_data.get("validTimeFrom", ""),
-        "validTimeTo": taf_data.get("validTimeTo", ""),
-        "remarks": taf_data.get("remarks", ""),
-        "forecast": parse_taf_forecast(taf_data)
+        "rawText": taf_data.get("rawTAF") or taf_data.get("rawText") or "",
+        "issueTime": taf_data.get("issueTime") or current_time,
+        "validTimeFrom": taf_data.get("validTimeFrom") or current_time,
+        "validTimeTo": taf_data.get("validTimeTo") or current_time,
+        "remarks": taf_data.get("remarks") or "",
+        "forecast": parsed_forecast if parsed_forecast else []  # Ensure it's always a list
     }
 
 

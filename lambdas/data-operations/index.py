@@ -58,35 +58,22 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         info = event.get('info', {})
         field_name = info.get('fieldName', '')
         
-        # Comprehensive logging
-        print(f"[DataOperations] Handler called for field: {field_name}")
-        print(f"[DataOperations] Event structure: {json.dumps(event, default=str)}")
-        print(f"[DataOperations] Identity: {json.dumps(identity, default=str)}")
-        print(f"[DataOperations] User ID (identity.sub): {user_id}")
-        print(f"[DataOperations] Arguments: {json.dumps(arguments, default=str)}")
-        print(f"[DataOperations] Info: {json.dumps(info, default=str)}")
-        
         if not user_id:
             error_msg = "User ID (identity.sub) is required but was missing"
             print(f"[DataOperations] ERROR: {error_msg}")
-            print(f"[DataOperations] Full identity object: {json.dumps(identity, default=str)}")
+            print(f"[DataOperations] identity: {json.dumps(identity, default=str)}")
             raise ValueError(error_msg)
         
         # Route to appropriate handler based on field name
         if field_name == "getUser":
             result = handle_get_user(user_id)
-            print(f"[DataOperations] getUser result: {json.dumps(result, default=str) if result else 'None'}")
-            print(f"[DataOperations] getUser result type: {type(result).__name__}")
-            print(f"[DataOperations] getUser result is None: {result is None}")
             # Ensure we always return a dict or None, never an empty dict or other type
             if result is None:
-                print(f"[DataOperations] Returning None for getUser (user doesn't exist)")
                 return None
             # Ensure result is a dict (should always be the case)
             if not isinstance(result, dict):
-                print(f"[DataOperations] WARNING: getUser result is not a dict: {type(result)}")
+                print(f"[DataOperations] ERROR: getUser result is not a dict: {type(result)}")
                 return None
-            print(f"[DataOperations] Returning user data dict with {len(result)} keys")
             return result
         
         elif field_name == "getSavedAirports":
@@ -115,45 +102,28 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     
     except Exception as e:
         error_message = f"Error in data operation: {str(e)}"
-        error_type = type(e).__name__
-        print(f"[DataOperations] EXCEPTION: {error_message}")
-        print(f"[DataOperations] Exception type: {error_type}")
-        print(f"[DataOperations] Full event: {json.dumps(event, default=str)}")
-        print(f"[DataOperations] Exception details: {str(e)}")
+        # Log error with context for root cause analysis
+        print(f"[DataOperations] ERROR: {error_message}")
+        print(f"[DataOperations] fieldName: {event.get('info', {}).get('fieldName', 'UNKNOWN')}")
+        print(f"[DataOperations] userId: {event.get('identity', {}).get('sub', 'UNKNOWN')}")
+        print(f"[DataOperations] exception_type: {type(e).__name__}")
+        print(f"[DataOperations] arguments: {json.dumps(event.get('arguments', {}), default=str)}")
         # Re-raise to let AppSync handle it properly
         raise Exception(error_message)
 
 
 def handle_get_user(user_id: str) -> Optional[Dict[str, Any]]:
     """Get user by userId"""
-    print(f"[DataOperations] handle_get_user called for userId: {user_id}")
-    
     try:
         response = users_table.get_item(Key={'userId': user_id})
-        print(f"[DataOperations] DynamoDB get_item response: {json.dumps(response, default=str)}")
-        
-        # Log the exact defaultAirport value from DynamoDB
         item = response.get('Item')
-        if item:
-            preferences = item.get('preferences', {})
-            default_airport = preferences.get('defaultAirport', 'NOT SET')
-            updated_at = item.get('updatedAt', 'NOT SET')
-            print(f"[DataOperations] DynamoDB item - defaultAirport: {default_airport}")
-            print(f"[DataOperations] DynamoDB item - updatedAt: {updated_at}")
-            print(f"[DataOperations] DynamoDB item - full preferences: {json.dumps(preferences, default=str)}")
-        else:
-            print(f"[DataOperations] No item found in DynamoDB response")
         
         if not item:
-            print(f"[DataOperations] User {user_id} not found in DynamoDB - returning None")
             return None
-        
-        print(f"[DataOperations] User found: {json.dumps(item, default=str)}")
         
         # Ensure 'id' field exists (GraphQL schema expects it)
         if 'id' not in item:
             item['id'] = item.get('userId', user_id)
-            print(f"[DataOperations] Added 'id' field: {item['id']}")
         
         converted_item = convert_item(item)
         
@@ -161,7 +131,6 @@ def handle_get_user(user_id: str) -> Optional[Dict[str, Any]]:
         # Schema requires: id: ID! and name: String!
         if not converted_item.get('id'):
             converted_item['id'] = converted_item.get('userId', user_id)
-            print(f"[DataOperations] Ensured 'id' field is present: {converted_item['id']}")
         
         # GraphQL schema requires name: String! (non-nullable)
         # Provide default value if name is null or empty
@@ -171,24 +140,14 @@ def handle_get_user(user_id: str) -> Optional[Dict[str, Any]]:
             if not default_name:
                 default_name = ''  # Empty string is valid for String! (non-nullable)
             converted_item['name'] = default_name
-            print(f"[DataOperations] Provided default value for 'name' field: '{default_name}' (original was null/empty)")
-        else:
-            print(f"[DataOperations] 'name' field is present: '{converted_item['name']}'")
-        
-        print(f"[DataOperations] Converted item: {json.dumps(converted_item, default=str)}")
-        
-        # Log the defaultAirport that will be returned
-        if converted_item and 'preferences' in converted_item:
-            returned_airport = converted_item['preferences'].get('defaultAirport', 'NOT SET')
-            print(f"[DataOperations] Will return defaultAirport: {returned_airport}")
-        else:
-            print(f"[DataOperations] No preferences in converted item")
         
         return converted_item
     
     except Exception as e:
+        # Log error with context for root cause analysis
         print(f"[DataOperations] ERROR in handle_get_user: {str(e)}")
-        print(f"[DataOperations] Exception type: {type(e).__name__}")
+        print(f"[DataOperations] userId: {user_id}")
+        print(f"[DataOperations] exception_type: {type(e).__name__}")
         raise
 
 
@@ -234,7 +193,6 @@ def handle_save_airport(user_id: str, arguments: Dict[str, Any]) -> Dict[str, An
     
     saved_airports_table.put_item(Item=item)
     
-    print(f"Saved airport {airport_code} for user {user_id}")
     return convert_item(item)
 
 
@@ -251,7 +209,6 @@ def handle_remove_airport(user_id: str, arguments: Dict[str, Any]) -> bool:
         }
     )
     
-    print(f"Removed airport {airport_code} for user {user_id}")
     return True
 
 
@@ -284,7 +241,6 @@ def handle_create_alert(user_id: str, arguments: Dict[str, Any]) -> Dict[str, An
     
     alerts_table.put_item(Item=item)
     
-    print(f"Created alert {alert_id} for user {user_id}")
     return convert_item(item)
 
 
@@ -352,7 +308,6 @@ def handle_update_alert(user_id: str, arguments: Dict[str, Any]) -> Dict[str, An
     if not updated_item:
         raise ValueError(f"Alert {alert_id} not found for user {user_id}")
     
-    print(f"Updated alert {alert_id} for user {user_id}")
     return convert_item(updated_item)
 
 
@@ -369,6 +324,5 @@ def handle_delete_alert(user_id: str, arguments: Dict[str, Any]) -> bool:
         }
     )
     
-    print(f"Deleted alert {alert_id} for user {user_id}")
     return True
 

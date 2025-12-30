@@ -80,10 +80,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         preferences = input_data.get('preferences')
         if preferences is not None:
             if 'defaultAirport' in preferences and preferences['defaultAirport'] is not None:
-                airport_value = preferences['defaultAirport']
-                print(f"[UserUpdate] Updating defaultAirport to: {airport_value}")
                 update_expression_parts.append("preferences.defaultAirport = :defaultAirport")
-                expression_values[":defaultAirport"] = airport_value
+                expression_values[":defaultAirport"] = preferences['defaultAirport']
             
             if 'defaultUnits' in preferences and preferences['defaultUnits'] is not None:
                 update_expression_parts.append("preferences.defaultUnits = :defaultUnits")
@@ -115,60 +113,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if expression_names:
             update_params['ExpressionAttributeNames'] = expression_names
         
-        # Log the user we're updating to verify correct entry
-        print(f"[UserUpdate] Updating user with userId: {user_id}")
-        print(f"[UserUpdate] Update expression: {update_expression}")
-        print(f"[UserUpdate] Expression attribute names: {json.dumps(expression_names, default=str)}")
-        print(f"[UserUpdate] Expression attribute values: {json.dumps(expression_values, default=str)}")
-        print(f"[UserUpdate] Full update params: {json.dumps(update_params, default=str)}")
-
-        # Get existing user data to understand current state
-        try:
-            existing_user = users_table.get_item(Key={'userId': user_id})
-            if 'Item' in existing_user:
-                existing_item = existing_user['Item']
-                existing_prefs = existing_item.get('preferences', {})
-                print(f"[UserUpdate] Existing user - defaultAirport: {existing_prefs.get('defaultAirport', 'NOT SET')}")
-                print(f"[UserUpdate] Existing user - updatedAt: {existing_item.get('updatedAt', 'NOT SET')}")
-            else:
-                print(f"[UserUpdate] WARNING: User {user_id} not found in DynamoDB before update")
-        except Exception as e:
-            print(f"[UserUpdate] Error fetching existing user: {str(e)}")
-        
         # Perform the update
         response = users_table.update_item(**update_params)
         
-        # Log the full DynamoDB response (including metadata)
-        print(f"[UserUpdate] DynamoDB update_item response (full): {json.dumps(response, default=str)}")
-        print(f"[UserUpdate] DynamoDB response metadata: {json.dumps({k: v for k, v in response.items() if k != 'Attributes'}, default=str)}")
-
         # Get the updated item
         updated_item = response.get('Attributes', {})
-
-        # Log the updated item to verify the save
-        print(f"[UserUpdate] DynamoDB update response - Attributes: {json.dumps(updated_item, default=str)}")
-        if 'preferences' in updated_item and 'defaultAirport' in updated_item.get('preferences', {}):
-            print(f"[UserUpdate] Verified defaultAirport in DynamoDB response: {updated_item['preferences']['defaultAirport']}")
-            print(f"[UserUpdate] Verified updatedAt in DynamoDB response: {updated_item.get('updatedAt', 'NOT SET')}")
-        else:
-            print(f"[UserUpdate] WARNING: defaultAirport not found in DynamoDB response Attributes")
-
-        # Verify the update actually persisted by reading it back
-        try:
-            verification_read = users_table.get_item(Key={'userId': user_id})
-            if 'Item' in verification_read:
-                verified_item = verification_read['Item']
-                verified_prefs = verified_item.get('preferences', {})
-                verified_airport = verified_prefs.get('defaultAirport', 'NOT SET')
-                verified_updated = verified_item.get('updatedAt', 'NOT SET')
-                print(f"[UserUpdate] Verification read - defaultAirport: {verified_airport}")
-                print(f"[UserUpdate] Verification read - updatedAt: {verified_updated}")
-                if verified_airport != updated_item.get('preferences', {}).get('defaultAirport'):
-                    print(f"[UserUpdate] ERROR: Verification read shows different value! Expected: {updated_item.get('preferences', {}).get('defaultAirport')}, Got: {verified_airport}")
-            else:
-                print(f"[UserUpdate] WARNING: Verification read found no item")
-        except Exception as e:
-            print(f"[UserUpdate] Error during verification read: {str(e)}")
         
         # Convert DynamoDB item to GraphQL format
         # Ensure 'id' field exists (GraphQL schema expects it)
@@ -194,14 +143,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         user_data = convert_item(updated_item)
         
-        print(f"Successfully updated user {user_id}")
-        print(f"Updated fields: {', '.join(update_expression_parts)}")
-        
         return user_data
         
     except Exception as e:
         error_message = f"Error updating user: {str(e)}"
-        print(error_message)
-        print(f"Event: {json.dumps(event, default=str)}")
+        # Log error with context for root cause analysis
+        print(f"[UserUpdate] ERROR: {error_message}")
+        print(f"[UserUpdate] userId: {event.get('identity', {}).get('sub', 'UNKNOWN')}")
+        print(f"[UserUpdate] input: {json.dumps(event.get('arguments', {}).get('input', {}), default=str)}")
+        print(f"[UserUpdate] exception_type: {type(e).__name__}")
         raise Exception(error_message)
 
