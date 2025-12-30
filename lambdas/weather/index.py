@@ -927,13 +927,15 @@ def _parse_taf_from_raw(raw_taf: str, taf_data: Dict) -> list:
                             elif hasattr(cloud, '__str__'):
                                 sky_cover = str(cloud).strip().upper()
                             
-                            # base is the cloud base altitude in feet
+                            # base is the cloud base altitude in hundreds of feet (AVWX format)
+                            # Need to convert to actual feet by multiplying by 100
                             if hasattr(cloud, 'base') and cloud.base is not None:
                                 try:
                                     if isinstance(cloud.base, (int, float)):
-                                        cloud_base = int(cloud.base)
+                                        # AVWX returns base in hundreds of feet, convert to actual feet
+                                        cloud_base = int(cloud.base * 100)
                                     else:
-                                        cloud_base = int(cloud.base)
+                                        cloud_base = int(float(cloud.base) * 100)
                                 except (ValueError, TypeError):
                                     pass
                             
