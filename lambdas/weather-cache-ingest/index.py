@@ -143,16 +143,17 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
             if not station_id:
                 continue  # Skip records without station ID
             
-            # Map observation time - CSV already has it in ISO format with Z
+            # Map observation time
             obs_time = get_col('observation_time', '')
-            if obs_time and obs_time.strip():
-                # CSV format is already "2025-12-24T06:56:00.000Z" - use as-is
-                obs_time_clean = obs_time.strip()
-                record['obsTime'] = obs_time_clean
-                record['observation_time'] = obs_time_clean  # Store both for compatibility
-            else:
-                record['obsTime'] = None
-                record['observation_time'] = None
+            if obs_time:
+                # Ensure it ends with Z
+                if not obs_time.endswith('Z') and not obs_time.endswith('+00:00'):
+                    obs_time = obs_time.rstrip('+00:00').rstrip('-00:00')
+                    if '+' in obs_time or (len(obs_time) > 10 and obs_time[10] == 'T'):
+                        obs_time = obs_time + 'Z' if not obs_time.endswith('Z') else obs_time
+                    else:
+                        obs_time = obs_time + 'Z'
+            record['obsTime'] = obs_time
             
             # Map temperature and dewpoint
             temp_c = get_col('temp_c', '')
@@ -351,17 +352,24 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
 
 
 def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
-    """Parse TAF XML data and extract both parsed fields and raw XML elements."""
+    """Parse TAF XML data."""
     records = []
     try:
         root = ET.fromstring(data)
         # TAF XML structure: <response><data><TAF>...</TAF></data></response>
         for taf_elem in root.findall('.//TAF'):
             record = {}
-            # Extract fields from XML
+            
+            # Extract top-level TAF fields
             for child in taf_elem:
+                # Skip forecast elements - we'll parse those separately
+                if child.tag == 'forecast':
+                    continue
+                    
                 tag = child.tag
                 text = child.text
+                
+                # Handle CDATA sections (like raw_text)
                 if text:
                     # Convert numeric fields
                     if tag in ['temp', 'dewp', 'wdir', 'wspd', 'visib', 'altim', 'elev']:
@@ -374,22 +382,168 @@ def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
                 else:
                     record[tag] = None
             
-            # Extract raw TAF text
+            # Map station_id to expected field names
+            station_id = record.get('station_id', None)
+            if station_id:
+                record['icaoId'] = station_id.upper()
+                record['stationId'] = station_id.upper()
+            
+            # Extract raw TAF text - handle both raw_text and rawTAF
             if 'rawTAF' not in record:
-                raw_text_elem = taf_elem.find('raw_text')
-                if raw_text_elem is not None and raw_text_elem.text:
-                    record['rawTAF'] = raw_text_elem.text
+                raw_text = record.get('raw_text', '')
+                if raw_text:
+                    record['rawTAF'] = raw_text
                 else:
                     record['rawTAF'] = taf_elem.findtext('rawTAF', '')
             
-            # Extract the entire TAF element as XML string for frontend parsing
-            # Convert element to string while preserving structure
-            try:
-                raw_xml = ET.tostring(taf_elem, encoding='unicode')
-                record['_rawXml'] = raw_xml
-            except Exception as e:
-                logger.warning(f"Failed to extract raw XML for TAF element: {str(e)}")
-                record['_rawXml'] = None
+            # Map time fields to expected names
+            if 'issue_time' in record:
+                record['issueTime'] = record['issue_time']
+            if 'valid_time_from' in record:
+                record['validTimeFrom'] = record['valid_time_from']
+            if 'valid_time_to' in record:
+                record['validTimeTo'] = record['valid_time_to']
+            
+            # Parse nested forecast elements
+            forecasts = []
+            for forecast_elem in taf_elem.findall('forecast'):
+                forecast = {}
+                
+                # Extract time fields
+                fcst_time_from = forecast_elem.findtext('fcst_time_from', '')
+                fcst_time_to = forecast_elem.findtext('fcst_time_to', '')
+                if fcst_time_from:
+                    forecast['fcstTimeFrom'] = fcst_time_from
+                if fcst_time_to:
+                    forecast['fcstTimeTo'] = fcst_time_to
+                
+                # Extract change indicator
+                change_indicator = forecast_elem.findtext('change_indicator', None)
+                if change_indicator:
+                    forecast['changeIndicator'] = change_indicator
+                
+                # Extract wind data
+                wind_dir = forecast_elem.findtext('wind_dir_degrees', None)
+                if wind_dir and wind_dir.strip() and wind_dir.upper() != 'VRB':
+                    try:
+                        forecast['wdir'] = int(float(wind_dir))
+                    except (ValueError, TypeError):
+                        forecast['wdir'] = None
+                else:
+                    forecast['wdir'] = None
+                
+                wind_speed = forecast_elem.findtext('wind_speed_kt', None)
+                if wind_speed:
+                    try:
+                        forecast['wspd'] = int(float(wind_speed))
+                    except (ValueError, TypeError):
+                        forecast['wspd'] = None
+                else:
+                    forecast['wspd'] = None
+                
+                wind_gust = forecast_elem.findtext('wind_gust_kt', None)
+                if wind_gust:
+                    try:
+                        forecast['wspdGust'] = int(float(wind_gust))
+                    except (ValueError, TypeError):
+                        forecast['wspdGust'] = None
+                else:
+                    forecast['wspdGust'] = None
+                
+                # Extract visibility
+                visibility = forecast_elem.findtext('visibility_statute_mi', None)
+                if visibility:
+                    vis_str = visibility.strip()
+                    # Handle "+" suffix (means 10+ or 6+)
+                    if vis_str.endswith('+'):
+                        try:
+                            forecast['visib'] = float(vis_str[:-1]) + 0.5
+                        except ValueError:
+                            forecast['visib'] = None
+                    # Handle fractions like "3/4", "1 3/4"
+                    elif '/' in vis_str:
+                        parts = vis_str.split()
+                        if len(parts) == 2:  # "1 3/4" format
+                            try:
+                                whole = float(parts[0])
+                                frac_parts = parts[1].split('/')
+                                if len(frac_parts) == 2:
+                                    fraction = float(frac_parts[0]) / float(frac_parts[1])
+                                    forecast['visib'] = whole + fraction
+                                else:
+                                    forecast['visib'] = None
+                            except ValueError:
+                                forecast['visib'] = None
+                        else:  # "3/4" format
+                            frac_parts = vis_str.split('/')
+                            if len(frac_parts) == 2:
+                                try:
+                                    forecast['visib'] = float(frac_parts[0]) / float(frac_parts[1])
+                                except ValueError:
+                                    forecast['visib'] = None
+                            else:
+                                forecast['visib'] = None
+                    else:
+                        try:
+                            forecast['visib'] = float(vis_str)
+                        except ValueError:
+                            forecast['visib'] = None
+                else:
+                    forecast['visib'] = None
+                
+                # Extract sky conditions - handle multiple sky_condition elements
+                sky_conditions = forecast_elem.findall('sky_condition')
+                sky_cover_list = []
+                cloud_base_list = []
+                cloud_type_list = []
+                
+                for sky_cond in sky_conditions:
+                    # Extract attributes (sky_cover and cloud_base_ft_agl are attributes)
+                    sky_cover = sky_cond.get('sky_cover', None)
+                    cloud_base_ft_agl = sky_cond.get('cloud_base_ft_agl', None)
+                    cloud_type = sky_cond.get('cloud_type', None)
+                    
+                    if sky_cover:
+                        sky_cover_list.append(sky_cover.strip().upper())
+                        # cloud_base_ft_agl is already in feet (not hundreds)
+                        if cloud_base_ft_agl:
+                            try:
+                                cloud_base_list.append(int(float(cloud_base_ft_agl)))
+                            except (ValueError, TypeError):
+                                cloud_base_list.append(None)
+                        else:
+                            cloud_base_list.append(None)
+                        
+                        if cloud_type:
+                            cloud_type_list.append(cloud_type.strip())
+                        else:
+                            cloud_type_list.append(None)
+                
+                # Map sky conditions to skyc1/skyl1/skyt1 format (for compatibility with weather lambda)
+                # Also store as structured array
+                structured_sky_conditions = []
+                for i, (sky_cover, cloud_base) in enumerate(zip(sky_cover_list[:4], cloud_base_list[:4]), 1):
+                    forecast[f'skyc{i}'] = sky_cover
+                    forecast[f'skyl{i}'] = cloud_base
+                    if i <= len(cloud_type_list):
+                        forecast[f'skyt{i}'] = cloud_type_list[i-1] if cloud_type_list[i-1] else None
+                    
+                    # Also create structured format
+                    structured_sky_conditions.append({
+                        'skyCover': sky_cover,
+                        'cloudBase': cloud_base,
+                        'cloudType': cloud_type_list[i-1] if i <= len(cloud_type_list) and cloud_type_list[i-1] else None
+                    })
+                
+                # Store structured sky conditions
+                if structured_sky_conditions:
+                    forecast['skyConditions'] = structured_sky_conditions
+                
+                forecasts.append(forecast)
+            
+            # Store forecasts array
+            if forecasts:
+                record['forecast'] = forecasts
             
             records.append(record)
         logger.info(f"Parsed {len(records)} TAF records from XML")
@@ -521,30 +675,20 @@ def store_metar(redis_client: redis.Redis, records: List[Dict[str, Any]]):
 
 
 def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
-    """Store TAF records in ValKey, including raw XML elements."""
+    """Store TAF records in ValKey."""
     pipeline = redis_client.pipeline()
     station_ids = set()
     current_time = int(datetime.utcnow().timestamp())
     
     for record in records:
-        station_id = record.get('icaoId') or record.get('stationId') or record.get('station_id')
+        station_id = record.get('icaoId') or record.get('stationId')
         if not station_id:
             continue
         
         station_id = station_id.upper()
         key = f"taf:{station_id}"
         
-        # Extract raw XML before storing (remove from record dict to avoid storing in JSON)
-        raw_xml = record.pop('_rawXml', None)
-        
-        # Store parsed JSON data (backward compatibility)
         pipeline.setex(key, TTL_TAF, json.dumps(record))
-        
-        # Store raw XML element separately for frontend parsing
-        if raw_xml:
-            xml_key = f"taf:{station_id}:xml"
-            pipeline.setex(xml_key, TTL_TAF, raw_xml)
-        
         station_ids.add(station_id)
         pipeline.zadd("taf:updated", {station_id: current_time})
     
@@ -553,7 +697,7 @@ def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
         pipeline.sadd("taf:stations", *station_ids)
     
     pipeline.execute()
-    logger.info(f"Stored {len(station_ids)} TAF records (with raw XML)")
+    logger.info(f"Stored {len(station_ids)} TAF records")
 
 
 def store_sigmet(redis_client: redis.Redis, records: List[Dict[str, Any]]):

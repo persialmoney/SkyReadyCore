@@ -13,7 +13,6 @@ import urllib.request
 import urllib.error
 import redis  # ValKey is Redis-compatible, so we use the redis Python library
 import logging
-import xml.etree.ElementTree as ET
 
 # Configure logging
 logger = logging.getLogger()
@@ -398,26 +397,18 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
 def fetch_taf(airport_code: str) -> Dict[str, Any]:
     """
     Fetch TAF data for an airport.
-    Cache-first strategy: checks ElastiCache for raw XML first, falls back to parsed JSON, then API.
+    Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
     """
     airport_code = airport_code.upper()
     
-    # Try to get from cache first - check for raw XML
+    # Try to get from cache first
     redis_client = get_redis_client()
     if redis_client:
         try:
-            # First, try to get raw XML (preferred for frontend parsing)
-            xml_key = f"taf:{airport_code}:xml"
-            raw_xml = redis_client.get(xml_key)
-            if raw_xml:
-                logger.info(f"Cache hit for TAF XML: {airport_code}")
-                return transform_taf_from_xml(raw_xml, airport_code)
-            
-            # Fall back to parsed JSON (backward compatibility)
             cache_key = f"taf:{airport_code}"
             cached_data = redis_client.get(cache_key)
             if cached_data:
-                logger.info(f"Cache hit for TAF JSON: {airport_code}")
+                logger.info(f"Cache hit for TAF: {airport_code}")
                 taf_data = json.loads(cached_data)
                 return transform_taf_from_cache(taf_data, airport_code)
         except Exception as e:
@@ -436,7 +427,6 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
                 return {
                     "airportCode": airport_code.upper(),
                     "rawText": "No data available",
-                    "rawXml": None,
                     "issueTime": current_time,
                     "validTimeFrom": current_time,
                     "validTimeTo": current_time,
@@ -459,7 +449,6 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
             result = {
                 "airportCode": airport_code,
                 "rawText": taf.get("rawTAF") or taf.get("rawText") or "",
-                "rawXml": None,  # API doesn't provide XML, only JSON
                 "issueTime": taf.get("issueTime") or current_time,
                 "validTimeFrom": taf.get("validTimeFrom") or current_time,
                 "validTimeTo": taf.get("validTimeTo") or current_time,
@@ -482,7 +471,6 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
         return {
             "airportCode": airport_code.upper(),
             "rawText": "Error fetching TAF data",
-            "rawXml": None,
             "issueTime": current_time,
             "validTimeFrom": current_time,
             "validTimeTo": current_time,
@@ -495,7 +483,6 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
         return {
             "airportCode": airport_code.upper(),
             "rawText": "Error parsing TAF data",
-            "rawXml": None,
             "issueTime": current_time,
             "validTimeFrom": current_time,
             "validTimeTo": current_time,
@@ -508,7 +495,6 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
         return {
             "airportCode": airport_code.upper(),
             "rawText": "Error fetching TAF data",
-            "rawXml": None,
             "issueTime": current_time,
             "validTimeFrom": current_time,
             "validTimeTo": current_time,
@@ -517,64 +503,14 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
         }
 
 
-def transform_taf_from_xml(raw_xml: str, airport_code: str) -> Dict[str, Any]:
-    """
-    Transform raw XML TAF data to expected format.
-    Extracts basic fields and returns raw XML for frontend parsing.
-    This avoids expensive backend parsing.
-    """
-    current_time = datetime.utcnow().isoformat()
-    
-    try:
-        # Parse XML to extract basic fields
-        root = ET.fromstring(raw_xml)
-        
-        # Extract raw text
-        raw_text_elem = root.find('raw_text')
-        raw_text = raw_text_elem.text if raw_text_elem is not None and raw_text_elem.text else ""
-        if not raw_text:
-            raw_text = root.findtext('rawTAF', '')
-        
-        # Extract timestamps
-        issue_time = root.findtext('issue_time', current_time)
-        valid_time_from = root.findtext('valid_time_from', current_time)
-        valid_time_to = root.findtext('valid_time_to', current_time)
-        remarks = root.findtext('remarks', '')
-        
-        return {
-            "airportCode": airport_code,
-            "rawText": raw_text,
-            "rawXml": raw_xml,  # Include raw XML for frontend parsing
-            "issueTime": issue_time,
-            "validTimeFrom": valid_time_from,
-            "validTimeTo": valid_time_to,
-            "remarks": remarks,
-            "forecast": []  # Empty - frontend will parse from XML
-        }
-    except Exception as e:
-        logger.error(f"Error parsing TAF XML for {airport_code}: {str(e)}")
-        # Return minimal structure with raw XML
-        return {
-            "airportCode": airport_code,
-            "rawText": "",
-            "rawXml": raw_xml,  # Still return XML for frontend parsing
-            "issueTime": current_time,
-            "validTimeFrom": current_time,
-            "validTimeTo": current_time,
-            "remarks": "",
-            "forecast": []
-        }
-
-
 def transform_taf_from_cache(taf_data: Dict[str, Any], airport_code: str) -> Dict[str, Any]:
-    """Transform cached TAF data to expected format (backward compatibility for JSON cache)."""
+    """Transform cached TAF data to expected format."""
     # Ensure all non-nullable fields have values (never None)
     current_time = datetime.utcnow().isoformat()
     parsed_forecast = parse_taf_forecast(taf_data)
     return {
         "airportCode": airport_code,
         "rawText": taf_data.get("rawTAF") or taf_data.get("rawText") or "",
-        "rawXml": None,  # No XML available from JSON cache
         "issueTime": taf_data.get("issueTime") or current_time,
         "validTimeFrom": taf_data.get("validTimeFrom") or current_time,
         "validTimeTo": taf_data.get("validTimeTo") or current_time,
@@ -725,24 +661,43 @@ def parse_sky_conditions(metar: Dict) -> list:
 
 
 def parse_taf_forecast(taf: Dict) -> list:
-    """Parse TAF forecast periods from AWC API response."""
+    """Parse TAF forecast periods from AWC API response or cached data."""
     forecasts = []
     
-    # AWC TAF API can return forecast periods in different formats
-    # Check for structured forecast array first
+    # Check for structured forecast array first (from cache ingestion)
     if "forecast" in taf and isinstance(taf["forecast"], list) and len(taf["forecast"]) > 0:
         logger.info(f"Found {len(taf['forecast'])} forecast periods in structured format")
         for idx, fcst in enumerate(taf["forecast"]):
             logger.info(f"Forecast {idx} keys: {list(fcst.keys()) if isinstance(fcst, dict) else 'not a dict'}")
+            
+            # Extract sky conditions - check for structured format first, then fall back to parsing
+            sky_conditions = []
+            if "skyConditions" in fcst and isinstance(fcst["skyConditions"], list):
+                # Use structured sky conditions from cache ingestion
+                sky_conditions = fcst["skyConditions"]
+                logger.info(f"Using structured skyConditions for forecast {idx}")
+            else:
+                # Parse from skyc1/skyl1 format or other formats
+                sky_conditions = _parse_taf_sky_conditions(fcst)
+            
+            # Time fields - already in ISO format from cache ingestion, but handle both formats
+            fcst_time_from = fcst.get("fcstTimeFrom", "")
+            if not fcst_time_from:
+                fcst_time_from = _convert_time_to_iso(fcst.get("validTimeFrom", fcst.get("timeFrom", "")))
+            
+            fcst_time_to = fcst.get("fcstTimeTo", "")
+            if not fcst_time_to:
+                fcst_time_to = _convert_time_to_iso(fcst.get("validTimeTo", fcst.get("timeTo", "")))
+            
             forecast_period = {
-                "fcstTimeFrom": _convert_time_to_iso(fcst.get("fcstTimeFrom", fcst.get("validTimeFrom", fcst.get("timeFrom", "")))),
-                "fcstTimeTo": _convert_time_to_iso(fcst.get("fcstTimeTo", fcst.get("validTimeTo", fcst.get("timeTo", "")))),
+                "fcstTimeFrom": fcst_time_from,
+                "fcstTimeTo": fcst_time_to,
                 "changeIndicator": fcst.get("changeIndicator", fcst.get("changeind", fcst.get("changeIndicator", None))),
                 "windDirection": fcst.get("wdir", fcst.get("windDirection", None)),
                 "windSpeed": fcst.get("wspd", fcst.get("windSpeed", None)),
                 "windGust": fcst.get("wspdGust", fcst.get("windGust", None)),
                 "visibility": fcst.get("visib", fcst.get("visibility", None)),
-                "skyConditions": _parse_taf_sky_conditions(fcst),
+                "skyConditions": sky_conditions,
                 "flightCategory": fcst.get("flightCategory", fcst.get("flightcat", None))
             }
             forecasts.append(forecast_period)
