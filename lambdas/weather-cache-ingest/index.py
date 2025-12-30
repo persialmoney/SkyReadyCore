@@ -351,7 +351,7 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
 
 
 def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
-    """Parse TAF XML data."""
+    """Parse TAF XML data and extract both parsed fields and raw XML elements."""
     records = []
     try:
         root = ET.fromstring(data)
@@ -376,7 +376,20 @@ def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
             
             # Extract raw TAF text
             if 'rawTAF' not in record:
-                record['rawTAF'] = taf_elem.findtext('rawTAF', '')
+                raw_text_elem = taf_elem.find('raw_text')
+                if raw_text_elem is not None and raw_text_elem.text:
+                    record['rawTAF'] = raw_text_elem.text
+                else:
+                    record['rawTAF'] = taf_elem.findtext('rawTAF', '')
+            
+            # Extract the entire TAF element as XML string for frontend parsing
+            # Convert element to string while preserving structure
+            try:
+                raw_xml = ET.tostring(taf_elem, encoding='unicode')
+                record['_rawXml'] = raw_xml
+            except Exception as e:
+                logger.warning(f"Failed to extract raw XML for TAF element: {str(e)}")
+                record['_rawXml'] = None
             
             records.append(record)
         logger.info(f"Parsed {len(records)} TAF records from XML")
@@ -508,20 +521,30 @@ def store_metar(redis_client: redis.Redis, records: List[Dict[str, Any]]):
 
 
 def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
-    """Store TAF records in ValKey."""
+    """Store TAF records in ValKey, including raw XML elements."""
     pipeline = redis_client.pipeline()
     station_ids = set()
     current_time = int(datetime.utcnow().timestamp())
     
     for record in records:
-        station_id = record.get('icaoId') or record.get('stationId')
+        station_id = record.get('icaoId') or record.get('stationId') or record.get('station_id')
         if not station_id:
             continue
         
         station_id = station_id.upper()
         key = f"taf:{station_id}"
         
+        # Extract raw XML before storing (remove from record dict to avoid storing in JSON)
+        raw_xml = record.pop('_rawXml', None)
+        
+        # Store parsed JSON data (backward compatibility)
         pipeline.setex(key, TTL_TAF, json.dumps(record))
+        
+        # Store raw XML element separately for frontend parsing
+        if raw_xml:
+            xml_key = f"taf:{station_id}:xml"
+            pipeline.setex(xml_key, TTL_TAF, raw_xml)
+        
         station_ids.add(station_id)
         pipeline.zadd("taf:updated", {station_id: current_time})
     
@@ -530,7 +553,7 @@ def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
         pipeline.sadd("taf:stations", *station_ids)
     
     pipeline.execute()
-    logger.info(f"Stored {len(station_ids)} TAF records")
+    logger.info(f"Stored {len(station_ids)} TAF records (with raw XML)")
 
 
 def store_sigmet(redis_client: redis.Redis, records: List[Dict[str, Any]]):
