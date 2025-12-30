@@ -7,6 +7,7 @@ import json
 import os
 import boto3
 import re
+import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import urllib.request
@@ -39,27 +40,78 @@ redis_client = None
 
 
 def get_redis_client() -> Optional[redis.Redis]:
-    """Get or create Redis client connection."""
+    """Get or create Redis client connection with retry logic."""
     global redis_client
     if not ELASTICACHE_ENDPOINT:
+        logger.warning("[ElastiCache] No ELASTICACHE_ENDPOINT configured, skipping cache")
         return None
     
-    if redis_client is None:
+    # Check if existing connection is still valid
+    if redis_client is not None:
         try:
+            redis_client.ping()
+            return redis_client
+        except Exception as e:
+            logger.warning(f"[ElastiCache] Existing connection is stale: {str(e)}, creating new connection")
+            redis_client = None
+    
+    # Retry connection with exponential backoff
+    max_retries = 3
+    base_delay = 0.1  # 100ms base delay
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"[ElastiCache] Connection attempt {attempt + 1}/{max_retries} to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
+            
             redis_client = redis.Redis(
                 host=ELASTICACHE_ENDPOINT,
                 port=ELASTICACHE_PORT,
                 decode_responses=True,
-                socket_connect_timeout=2,
-                socket_timeout=2,
-                retry_on_timeout=False,
+                socket_connect_timeout=5,  # Increased from 2 to 5 seconds for VPC connections
+                socket_timeout=5,  # Increased from 2 to 5 seconds
+                retry_on_timeout=True,  # Enable retry on timeout
             )
+            
+            # Test connection with ping
             redis_client.ping()
-            logger.info(f"Connected to ElastiCache at {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
-        except Exception as e:
-            logger.warning(f"Failed to connect to ElastiCache: {str(e)}, will use API fallback")
+            logger.info(f"[ElastiCache] Successfully connected to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
+            return redis_client
+            
+        except redis.TimeoutError as e:
+            error_msg = f"Timeout connecting to ElastiCache: {str(e)}"
+            logger.warning(f"[ElastiCache] {error_msg}")
             redis_client = None
-    return redis_client
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # Exponential backoff
+                logger.info(f"[ElastiCache] Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"[ElastiCache] All {max_retries} connection attempts failed, will use API fallback")
+                
+        except redis.ConnectionError as e:
+            error_msg = f"Connection error to ElastiCache: {str(e)}"
+            logger.warning(f"[ElastiCache] {error_msg}")
+            redis_client = None
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.info(f"[ElastiCache] Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"[ElastiCache] All {max_retries} connection attempts failed, will use API fallback")
+                
+        except Exception as e:
+            error_type = type(e).__name__
+            error_msg = f"Unexpected error connecting to ElastiCache ({error_type}): {str(e)}"
+            logger.error(f"[ElastiCache] {error_msg}")
+            redis_client = None
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.info(f"[ElastiCache] Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"[ElastiCache] All {max_retries} connection attempts failed, will use API fallback")
+    
+    return None
 
 
 def fetch_metar(airport_code: str) -> Dict[str, Any]:
