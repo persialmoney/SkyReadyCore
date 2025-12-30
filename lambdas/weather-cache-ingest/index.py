@@ -493,31 +493,45 @@ def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
                 
                 # Extract sky conditions - handle multiple sky_condition elements
                 sky_conditions = forecast_elem.findall('sky_condition')
+                logger.info(f"[Cache Ingest] Found {len(sky_conditions)} sky_condition elements in forecast")
                 sky_cover_list = []
                 cloud_base_list = []
                 cloud_type_list = []
                 
-                for sky_cond in sky_conditions:
+                for idx, sky_cond in enumerate(sky_conditions):
+                    # Log raw XML element attributes
+                    logger.info(f"[Cache Ingest] Sky condition {idx}: tag={sky_cond.tag}, attrib={sky_cond.attrib}")
+                    logger.info(f"[Cache Ingest] Sky condition {idx}: attrib keys={list(sky_cond.attrib.keys())}")
+                    
                     # Extract attributes (sky_cover and cloud_base_ft_agl are attributes)
-                    sky_cover = sky_cond.get('sky_cover', None)
-                    cloud_base_ft_agl = sky_cond.get('cloud_base_ft_agl', None)
-                    cloud_type = sky_cond.get('cloud_type', None)
+                    # Try both methods to ensure we get the attribute
+                    sky_cover = sky_cond.get('sky_cover', None) or sky_cond.attrib.get('sky_cover', None)
+                    cloud_base_ft_agl = sky_cond.get('cloud_base_ft_agl', None) or sky_cond.attrib.get('cloud_base_ft_agl', None)
+                    cloud_type = sky_cond.get('cloud_type', None) or sky_cond.attrib.get('cloud_type', None)
+                    
+                    logger.info(f"[Cache Ingest] Sky condition {idx} extracted - sky_cover={sky_cover}, cloud_base_ft_agl={cloud_base_ft_agl}, cloud_type={cloud_type}")
                     
                     if sky_cover:
                         sky_cover_list.append(sky_cover.strip().upper())
                         # cloud_base_ft_agl is already in feet (not hundreds)
                         if cloud_base_ft_agl:
                             try:
-                                cloud_base_list.append(int(float(cloud_base_ft_agl)))
-                            except (ValueError, TypeError):
+                                cloud_base_value = int(float(cloud_base_ft_agl))
+                                cloud_base_list.append(cloud_base_value)
+                                logger.info(f"[Cache Ingest] Sky condition {idx}: Parsed cloud_base={cloud_base_value} from raw={cloud_base_ft_agl}")
+                            except (ValueError, TypeError) as e:
+                                logger.warning(f"[Cache Ingest] Sky condition {idx}: Failed to parse cloud_base_ft_agl={cloud_base_ft_agl}, error={e}")
                                 cloud_base_list.append(None)
                         else:
+                            logger.warning(f"[Cache Ingest] Sky condition {idx}: No cloud_base_ft_agl attribute found")
                             cloud_base_list.append(None)
                         
                         if cloud_type:
                             cloud_type_list.append(cloud_type.strip())
                         else:
                             cloud_type_list.append(None)
+                    else:
+                        logger.warning(f"[Cache Ingest] Sky condition {idx}: No sky_cover attribute found")
                 
                 # Map sky conditions to skyc1/skyl1/skyt1 format (for compatibility with weather lambda)
                 # Also store as structured array
@@ -538,6 +552,14 @@ def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
                 # Store structured sky conditions
                 if structured_sky_conditions:
                     forecast['skyConditions'] = structured_sky_conditions
+                    logger.info(f"[Cache Ingest] Final structured skyConditions for forecast: {structured_sky_conditions}")
+                    for idx, sky in enumerate(structured_sky_conditions):
+                        logger.info(f"[Cache Ingest] Structured sky condition {idx}: skyCover={sky.get('skyCover')}, cloudBase={sky.get('cloudBase')}, cloudBaseType={type(sky.get('cloudBase'))}")
+                else:
+                    logger.warning(f"[Cache Ingest] No structured sky conditions created for forecast")
+                
+                # Log the forecast period summary
+                logger.info(f"[Cache Ingest] Forecast period summary - fcstTimeFrom={forecast.get('fcstTimeFrom')}, fcstTimeTo={forecast.get('fcstTimeTo')}, skyc1={forecast.get('skyc1')}, skyl1={forecast.get('skyl1')}")
                 
                 forecasts.append(forecast)
             
@@ -687,6 +709,21 @@ def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
         
         station_id = station_id.upper()
         key = f"taf:{station_id}"
+        
+        # Log forecast data before storing
+        if 'forecast' in record and isinstance(record['forecast'], list):
+            logger.info(f"[Cache Store] Storing TAF for {station_id} with {len(record['forecast'])} forecast periods")
+            for idx, fcst in enumerate(record['forecast']):
+                logger.info(f"[Cache Store] Forecast {idx} for {station_id}: fcstTimeFrom={fcst.get('fcstTimeFrom')}, fcstTimeTo={fcst.get('fcstTimeTo')}")
+                logger.info(f"[Cache Store] Forecast {idx} for {station_id}: skyc1={fcst.get('skyc1')}, skyl1={fcst.get('skyl1')}, skyc2={fcst.get('skyc2')}, skyl2={fcst.get('skyl2')}")
+                if 'skyConditions' in fcst and isinstance(fcst['skyConditions'], list):
+                    logger.info(f"[Cache Store] Forecast {idx} for {station_id}: skyConditions count={len(fcst['skyConditions'])}")
+                    for sky_idx, sky in enumerate(fcst['skyConditions']):
+                        logger.info(f"[Cache Store] Forecast {idx}, Sky {sky_idx} for {station_id}: skyCover={sky.get('skyCover')}, cloudBase={sky.get('cloudBase')}, cloudBaseType={type(sky.get('cloudBase'))}")
+                else:
+                    logger.warning(f"[Cache Store] Forecast {idx} for {station_id}: No skyConditions array found")
+        else:
+            logger.warning(f"[Cache Store] TAF for {station_id}: No forecast array found")
         
         pipeline.setex(key, TTL_TAF, json.dumps(record))
         station_ids.add(station_id)

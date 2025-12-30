@@ -505,10 +505,44 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
 
 def transform_taf_from_cache(taf_data: Dict[str, Any], airport_code: str) -> Dict[str, Any]:
     """Transform cached TAF data to expected format."""
+    logger.info(f"[TAF Transform] Transforming TAF for {airport_code}")
+    logger.info(f"[TAF Transform] Cached data keys: {list(taf_data.keys())}")
+    logger.info(f"[TAF Transform] Has 'forecast' in cached data: {'forecast' in taf_data}")
+    
+    if 'forecast' in taf_data:
+        logger.info(f"[TAF Transform] Forecast type: {type(taf_data['forecast'])}, length: {len(taf_data['forecast']) if isinstance(taf_data['forecast'], list) else 'N/A'}")
+        if isinstance(taf_data['forecast'], list) and len(taf_data['forecast']) > 0:
+            logger.info(f"[TAF Transform] Processing {len(taf_data['forecast'])} cached forecast periods")
+            for fcst_idx, fcst in enumerate(taf_data['forecast']):
+                logger.info(f"[TAF Transform] Cached forecast {fcst_idx} keys: {list(fcst.keys())}")
+                logger.info(f"[TAF Transform] Cached forecast {fcst_idx} - fcstTimeFrom: {fcst.get('fcstTimeFrom')}, fcstTimeTo: {fcst.get('fcstTimeTo')}")
+                logger.info(f"[TAF Transform] Cached forecast {fcst_idx} - skyc1: {fcst.get('skyc1')}, skyl1: {fcst.get('skyl1')}, skyc2: {fcst.get('skyc2')}, skyl2: {fcst.get('skyl2')}")
+                logger.info(f"[TAF Transform] Cached forecast {fcst_idx} - has skyConditions: {'skyConditions' in fcst}")
+                if 'skyConditions' in fcst and isinstance(fcst['skyConditions'], list):
+                    logger.info(f"[TAF Transform] Cached forecast {fcst_idx} - skyConditions count: {len(fcst['skyConditions'])}")
+                    for sky_idx, sky in enumerate(fcst['skyConditions']):
+                        logger.info(f"[TAF Transform] Cached forecast {fcst_idx}, Sky {sky_idx}: skyCover={sky.get('skyCover')}, cloudBase={sky.get('cloudBase')}, cloudBaseType={type(sky.get('cloudBase'))}")
+                else:
+                    logger.warning(f"[TAF Transform] Cached forecast {fcst_idx}: No skyConditions array or not a list")
+    
     # Ensure all non-nullable fields have values (never None)
     current_time = datetime.utcnow().isoformat()
     parsed_forecast = parse_taf_forecast(taf_data)
-    return {
+    
+    logger.info(f"[TAF Transform] Parsed {len(parsed_forecast)} forecast periods")
+    if parsed_forecast and len(parsed_forecast) > 0:
+        logger.info(f"[TAF Transform] Processing {len(parsed_forecast)} parsed forecast periods")
+        for fcst_idx, parsed_fcst in enumerate(parsed_forecast):
+            logger.info(f"[TAF Transform] Parsed forecast {fcst_idx} - fcstTimeFrom: {parsed_fcst.get('fcstTimeFrom')}, fcstTimeTo: {parsed_fcst.get('fcstTimeTo')}")
+            logger.info(f"[TAF Transform] Parsed forecast {fcst_idx} - skyConditions count: {len(parsed_fcst.get('skyConditions', []))}")
+            if parsed_fcst.get('skyConditions'):
+                logger.info(f"[TAF Transform] Parsed forecast {fcst_idx} - skyConditions: {parsed_fcst['skyConditions']}")
+                for sky_idx, sky in enumerate(parsed_fcst['skyConditions']):
+                    logger.info(f"[TAF Transform] Parsed forecast {fcst_idx}, Sky {sky_idx}: skyCover={sky.get('skyCover')}, cloudBase={sky.get('cloudBase')}, cloudBaseType={type(sky.get('cloudBase'))}")
+            else:
+                logger.warning(f"[TAF Transform] Parsed forecast {fcst_idx}: No skyConditions found")
+    
+    result = {
         "airportCode": airport_code,
         "rawText": taf_data.get("rawTAF") or taf_data.get("rawText") or "",
         "issueTime": taf_data.get("issueTime") or current_time,
@@ -517,6 +551,9 @@ def transform_taf_from_cache(taf_data: Dict[str, Any], airport_code: str) -> Dic
         "remarks": taf_data.get("remarks") or "",
         "forecast": parsed_forecast if parsed_forecast else []  # Ensure it's always a list
     }
+    
+    logger.info(f"[TAF Transform] Returning result with {len(result['forecast'])} forecast periods")
+    return result
 
 
 def fetch_notams(airport_code: str) -> list:
