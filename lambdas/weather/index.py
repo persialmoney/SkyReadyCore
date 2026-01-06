@@ -91,19 +91,16 @@ def get_redis_client() -> Optional[redis.Redis]:
             # Configure Redis client for VPC connections
             # Increased timeouts for VPC: Lambda ENI creation and DNS resolution can take time
             # Following AWS tutorial: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/LambdaRedis.html
+            # Note: ElastiCache Serverless doesn't require SSL unless in-transit encryption is enabled
             redis_client = redis.Redis(
                 host=ELASTICACHE_ENDPOINT,
                 port=ELASTICACHE_PORT,
                 decode_responses=True,
                 socket_connect_timeout=10,  # 10 seconds for VPC connections (allows time for ENI setup)
                 socket_timeout=10,  # 10 seconds for socket operations
-                socket_keepalive=True,  # Enable TCP keepalive for connection health
-                socket_keepalive_options={
-                    1: 1,  # TCP_KEEPIDLE: start keepalive after 1 second of inactivity
-                    2: 3,  # TCP_KEEPINTVL: send keepalive probes every 3 seconds
-                    3: 3,  # TCP_KEEPCNT: send 3 probes before considering connection dead
-                },
                 retry_on_timeout=True,  # Enable retry on timeout
+                # Note: socket_keepalive_options removed - can cause "Error 22: Invalid argument" on some systems
+                # TCP keepalive is handled by the OS by default
             )
             
             # Test connection with ping (with timeout)

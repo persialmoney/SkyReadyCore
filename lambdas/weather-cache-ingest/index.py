@@ -41,16 +41,21 @@ redis_client = None
 
 
 def get_redis_client():
-    """Get or create Redis client connection."""
+    """
+    Get or create Redis client connection.
+    Following AWS tutorial: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/LambdaRedis.html
+    """
     global redis_client
     if redis_client is None:
         try:
+            # Configure Redis client for VPC connections
+            # ElastiCache Serverless doesn't require SSL unless in-transit encryption is enabled
             redis_client = redis.Redis(
                 host=ELASTICACHE_ENDPOINT,
                 port=ELASTICACHE_PORT,
                 decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=5,
+                socket_connect_timeout=10,  # Increased for VPC connections
+                socket_timeout=10,  # Increased for VPC connections
                 retry_on_timeout=True,
             )
             # Test connection
