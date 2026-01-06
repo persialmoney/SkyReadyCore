@@ -40,11 +40,24 @@ redis_client = None
 
 
 def get_redis_client() -> Optional[redis.Redis]:
-    """Get or create Redis client connection with retry logic."""
+    """
+    Get or create Redis client connection with retry logic.
+    Optimized for VPC connections with increased timeouts and better error handling.
+    Following AWS tutorial: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/LambdaRedis.html
+    """
     global redis_client
     if not ELASTICACHE_ENDPOINT:
         logger.warning("[ElastiCache] No ELASTICACHE_ENDPOINT configured, skipping cache")
         return None
+    
+    # Log VPC environment info for debugging
+    try:
+        import socket
+        local_hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(local_hostname)
+        logger.info(f"[ElastiCache] Lambda network info - hostname: {local_hostname}, IP: {local_ip}")
+    except Exception as e:
+        logger.debug(f"[ElastiCache] Could not get network info: {str(e)}")
     
     # Check if existing connection is still valid
     if redis_client is not None:
@@ -63,16 +76,37 @@ def get_redis_client() -> Optional[redis.Redis]:
         try:
             logger.info(f"[ElastiCache] Connection attempt {attempt + 1}/{max_retries} to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
             
+            # Test DNS resolution first (helps diagnose VPC DNS issues)
+            try:
+                import socket
+                logger.info(f"[ElastiCache] Resolving DNS for {ELASTICACHE_ENDPOINT}...")
+                resolved_ip = socket.gethostbyname(ELASTICACHE_ENDPOINT)
+                logger.info(f"[ElastiCache] DNS resolved to IP: {resolved_ip}")
+            except socket.gaierror as dns_error:
+                logger.error(f"[ElastiCache] DNS resolution failed: {str(dns_error)} - check VPC DNS configuration")
+                raise redis.ConnectionError(f"DNS resolution failed: {str(dns_error)}")
+            except Exception as dns_error:
+                logger.warning(f"[ElastiCache] DNS resolution check failed (non-fatal): {str(dns_error)}")
+            
+            # Configure Redis client for VPC connections
+            # Increased timeouts for VPC: Lambda ENI creation and DNS resolution can take time
+            # Following AWS tutorial: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/LambdaRedis.html
             redis_client = redis.Redis(
                 host=ELASTICACHE_ENDPOINT,
                 port=ELASTICACHE_PORT,
                 decode_responses=True,
-                socket_connect_timeout=5,  # Increased from 2 to 5 seconds for VPC connections
-                socket_timeout=5,  # Increased from 2 to 5 seconds
+                socket_connect_timeout=10,  # 10 seconds for VPC connections (allows time for ENI setup)
+                socket_timeout=10,  # 10 seconds for socket operations
+                socket_keepalive=True,  # Enable TCP keepalive for connection health
+                socket_keepalive_options={
+                    1: 1,  # TCP_KEEPIDLE: start keepalive after 1 second of inactivity
+                    2: 3,  # TCP_KEEPINTVL: send keepalive probes every 3 seconds
+                    3: 3,  # TCP_KEEPCNT: send 3 probes before considering connection dead
+                },
                 retry_on_timeout=True,  # Enable retry on timeout
             )
             
-            # Test connection with ping
+            # Test connection with ping (with timeout)
             redis_client.ping()
             logger.info(f"[ElastiCache] Successfully connected to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
             return redis_client
@@ -80,6 +114,9 @@ def get_redis_client() -> Optional[redis.Redis]:
         except redis.TimeoutError as e:
             error_msg = f"Timeout connecting to ElastiCache: {str(e)}"
             logger.warning(f"[ElastiCache] {error_msg}")
+            # Check if this might be a DNS resolution issue
+            if "getaddrinfo" in str(e).lower() or "name resolution" in str(e).lower():
+                logger.error("[ElastiCache] DNS resolution failed - check VPC DNS configuration")
             redis_client = None
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)  # Exponential backoff
@@ -91,6 +128,14 @@ def get_redis_client() -> Optional[redis.Redis]:
         except redis.ConnectionError as e:
             error_msg = f"Connection error to ElastiCache: {str(e)}"
             logger.warning(f"[ElastiCache] {error_msg}")
+            # Distinguish between different connection error types
+            error_str = str(e).lower()
+            if "refused" in error_str:
+                logger.error("[ElastiCache] Connection refused - check security group rules and endpoint")
+            elif "getaddrinfo" in error_str or "name or service not known" in error_str:
+                logger.error("[ElastiCache] DNS resolution failed - check VPC DNS configuration and endpoint")
+            elif "network is unreachable" in error_str:
+                logger.error("[ElastiCache] Network unreachable - check VPC routing and subnet configuration")
             redis_client = None
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
@@ -103,6 +148,9 @@ def get_redis_client() -> Optional[redis.Redis]:
             error_type = type(e).__name__
             error_msg = f"Unexpected error connecting to ElastiCache ({error_type}): {str(e)}"
             logger.error(f"[ElastiCache] {error_msg}")
+            # Log full exception details for debugging
+            import traceback
+            logger.debug(f"[ElastiCache] Full traceback: {traceback.format_exc()}")
             redis_client = None
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
