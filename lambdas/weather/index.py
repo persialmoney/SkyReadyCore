@@ -120,23 +120,28 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
     Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
     """
     airport_code = airport_code.upper()
+    cache_key = f"metar:{airport_code}"
     
     # Try to get from cache first
     redis_client = get_redis_client()
     if redis_client:
         try:
-            cache_key = f"metar:{airport_code}"
+            logger.info(f"[METAR Cache] Checking cache for key: {cache_key}")
             cached_data = redis_client.get(cache_key)
             if cached_data:
-                logger.info(f"Cache hit for METAR: {airport_code}")
+                logger.info(f"[METAR Cache] ✅ Cache HIT for {airport_code} (key: {cache_key})")
                 metar_data = json.loads(cached_data)
                 # Transform to expected format
                 return transform_metar_from_cache(metar_data, airport_code)
+            else:
+                logger.info(f"[METAR Cache] ❌ Cache MISS for {airport_code} - key '{cache_key}' not found in cache")
         except Exception as e:
-            logger.warning(f"Cache read error for {airport_code}: {str(e)}, falling back to API")
+            logger.warning(f"[METAR Cache] ⚠️ Cache read error for {airport_code} (key: {cache_key}): {str(e)}, falling back to API")
+    else:
+        logger.warning(f"[METAR Cache] ⚠️ Cannot check cache for {airport_code} - ElastiCache connection failed (key would be: {cache_key})")
     
     # Cache miss or error - fetch from API
-    logger.info(f"Cache miss for METAR: {airport_code}, fetching from API")
+    logger.info(f"[METAR Cache] Fetching METAR for {airport_code} from API (cache unavailable or miss)")
     try:
         # Use decoded format to get structured fields like skyc1, skyl1, etc.
         url = f"{METAR_URL}?ids={airport_code}&format=json&taf=false&hours=1"
@@ -452,22 +457,27 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
     Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
     """
     airport_code = airport_code.upper()
+    cache_key = f"taf:{airport_code}"
     
     # Try to get from cache first
     redis_client = get_redis_client()
     if redis_client:
         try:
-            cache_key = f"taf:{airport_code}"
+            logger.info(f"[TAF Cache] Checking cache for key: {cache_key}")
             cached_data = redis_client.get(cache_key)
             if cached_data:
-                logger.info(f"Cache hit for TAF: {airport_code}")
+                logger.info(f"[TAF Cache] ✅ Cache HIT for {airport_code} (key: {cache_key})")
                 taf_data = json.loads(cached_data)
                 return transform_taf_from_cache(taf_data, airport_code)
+            else:
+                logger.info(f"[TAF Cache] ❌ Cache MISS for {airport_code} - key '{cache_key}' not found in cache")
         except Exception as e:
-            logger.warning(f"Cache read error for TAF {airport_code}: {str(e)}, falling back to API")
+            logger.warning(f"[TAF Cache] ⚠️ Cache read error for {airport_code} (key: {cache_key}): {str(e)}, falling back to API")
+    else:
+        logger.warning(f"[TAF Cache] ⚠️ Cannot check cache for {airport_code} - ElastiCache connection failed (key would be: {cache_key})")
     
     # Cache miss or error - fetch from API
-    logger.info(f"Cache miss for TAF: {airport_code}, fetching from API")
+    logger.info(f"[TAF Cache] Fetching TAF for {airport_code} from API (cache unavailable or miss)")
     try:
         url = f"{TAF_URL}?ids={airport_code}&format=json"
         with urllib.request.urlopen(url, timeout=10) as response:

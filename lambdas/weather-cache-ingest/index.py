@@ -141,6 +141,7 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
             # Map station ID
             station_id = get_col('station_id', '')
             if not station_id:
+                logger.warning(f"[Cache Ingest] Skipping METAR record - missing station_id. Row data: {row[:5] if len(row) > 5 else row}")
                 continue  # Skip records without station ID
             
             # Map observation time
@@ -387,6 +388,9 @@ def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
             if station_id:
                 record['icaoId'] = station_id.upper()
                 record['stationId'] = station_id.upper()
+                logger.debug(f"[Cache Ingest] TAF record - extracted station_id: {station_id}, mapped to icaoId: {record['icaoId']}, stationId: {record['stationId']}")
+            else:
+                logger.warning(f"[Cache Ingest] TAF record missing station_id. Record keys: {list(record.keys())[:10]}")
             
             # Extract raw TAF text - handle both raw_text and rawTAF
             if 'rawTAF' not in record:
@@ -546,7 +550,13 @@ def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
                 record['forecast'] = forecasts
             
             records.append(record)
-        logger.info(f"Parsed {len(records)} TAF records from XML")
+        
+        # Log summary of parsed records
+        records_with_station_id = sum(1 for r in records if r.get('icaoId') or r.get('stationId'))
+        records_without_station_id = len(records) - records_with_station_id
+        logger.info(f"[Cache Ingest] Parsed {len(records)} TAF records from XML - {records_with_station_id} with station_id, {records_without_station_id} without")
+        if records_without_station_id > 0:
+            logger.warning(f"[Cache Ingest] {records_without_station_id} TAF records will be skipped during storage due to missing station_id")
     except Exception as e:
         logger.error(f"Error parsing TAF XML: {str(e)}")
         raise
@@ -649,14 +659,28 @@ def store_metar(redis_client: redis.Redis, records: List[Dict[str, Any]]):
     pipeline = redis_client.pipeline()
     station_ids = set()
     current_time = int(datetime.utcnow().timestamp())
+    skipped_count = 0
+    
+    logger.info(f"[Cache Store] Storing {len(records)} METAR records")
     
     for record in records:
-        station_id = record.get('icaoId') or record.get('stationId')
+        # Log raw values for debugging
+        icao_id = record.get('icaoId')
+        station_id_field = record.get('stationId')
+        raw_station_id = record.get('station_id')  # From CSV/XML parsing
+        
+        station_id = icao_id or station_id_field
         if not station_id:
+            skipped_count += 1
+            logger.warning(f"[Cache Store] Skipping METAR record - missing icaoId and stationId. Raw station_id: {raw_station_id}, record keys: {list(record.keys())[:10]}")
             continue
         
         station_id = station_id.upper()
         key = f"metar:{station_id}"
+        
+        # Log key being stored (sample first 5 for brevity)
+        if len(station_ids) < 5:
+            logger.info(f"[Cache Store] Storing METAR - station_id: {station_id}, icaoId: {icao_id}, stationId: {station_id_field}, key: {key}")
         
         # Store METAR data
         pipeline.setex(key, TTL_METAR, json.dumps(record))
@@ -671,7 +695,10 @@ def store_metar(redis_client: redis.Redis, records: List[Dict[str, Any]]):
         pipeline.sadd("metar:stations", *station_ids)
     
     pipeline.execute()
-    logger.info(f"Stored {len(station_ids)} METAR records")
+    logger.info(f"[Cache Store] Stored {len(station_ids)} METAR records, skipped {skipped_count} records")
+    if station_ids:
+        sample_keys = list(station_ids)[:5]
+        logger.info(f"[Cache Store] Sample METAR keys stored: {sample_keys}")
 
 
 def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
@@ -679,14 +706,36 @@ def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
     pipeline = redis_client.pipeline()
     station_ids = set()
     current_time = int(datetime.utcnow().timestamp())
+    skipped_count = 0
+    
+    logger.info(f"[Cache Store] Storing {len(records)} TAF records")
     
     for record in records:
-        station_id = record.get('icaoId') or record.get('stationId')
+        # Log raw values for debugging
+        icao_id = record.get('icaoId')
+        station_id_field = record.get('stationId')
+        raw_station_id = record.get('station_id')  # From XML parsing
+        
+        station_id = icao_id or station_id_field
         if not station_id:
+            skipped_count += 1
+            logger.warning(f"[Cache Store] Skipping TAF record - missing icaoId and stationId. Raw station_id: {raw_station_id}, record keys: {list(record.keys())[:10]}")
             continue
         
         station_id = station_id.upper()
         key = f"taf:{station_id}"
+        
+        # Log key being stored (sample first record for brevity)
+        if len(station_ids) == 0:
+            logger.info(f"[Cache Store] Storing TAF - station_id: {station_id}, icaoId: {icao_id}, stationId: {station_id_field}, key: {key}")
+        
+        # Log forecast data before storing (from earlier implementation)
+        if 'forecast' in record and isinstance(record['forecast'], list):
+            if len(station_ids) == 0:  # Only log for first record to avoid spam
+                logger.info(f"[Cache Store] TAF {station_id} has {len(record['forecast'])} forecast periods")
+                if len(record['forecast']) > 0:
+                    first_fcst = record['forecast'][0]
+                    logger.info(f"[Cache Store] First forecast for {station_id}: skyc1={first_fcst.get('skyc1')}, skyl1={first_fcst.get('skyl1')}")
         
         pipeline.setex(key, TTL_TAF, json.dumps(record))
         station_ids.add(station_id)
@@ -697,7 +746,10 @@ def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
         pipeline.sadd("taf:stations", *station_ids)
     
     pipeline.execute()
-    logger.info(f"Stored {len(station_ids)} TAF records")
+    logger.info(f"[Cache Store] Stored {len(station_ids)} TAF records, skipped {skipped_count} records")
+    if station_ids:
+        sample_keys = list(station_ids)[:5]
+        logger.info(f"[Cache Store] Sample TAF keys stored: {sample_keys}")
 
 
 def store_sigmet(redis_client: redis.Redis, records: List[Dict[str, Any]]):
