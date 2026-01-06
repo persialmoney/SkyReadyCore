@@ -144,6 +144,10 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
                 logger.warning(f"[Cache Ingest] Skipping METAR record - missing station_id. Row data: {row[:5] if len(row) > 5 else row}")
                 continue  # Skip records without station ID
             
+            # Map station_id to expected field names (like parse_xml_taf does)
+            record['icaoId'] = station_id.upper()
+            record['stationId'] = station_id.upper()
+            
             # Map observation time
             obs_time = get_col('observation_time', '')
             if obs_time:
