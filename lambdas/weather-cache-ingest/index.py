@@ -9,9 +9,20 @@ import csv
 import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.error
+import asyncio
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-import redis  # ValKey is Redis-compatible, so we use the redis Python library
+from glide import (
+    ClosingError,
+    ConnectionError as GlideConnectionError,
+    GlideClusterClient,
+    GlideClusterClientConfiguration,
+    Logger as GlideLogger,
+    LogLevel,
+    NodeAddress,
+    RequestError,
+    TimeoutError as GlideTimeoutError,
+)
 import boto3
 import logging
 
@@ -36,35 +47,42 @@ TTL_AIRMET = 120  # 2 minutes
 TTL_PIREP = 120  # 2 minutes
 TTL_STATION = 90000  # 25 hours
 
-# Redis connection pool (reused across invocations)
-redis_client = None
+# Glide client (reused across invocations)
+glide_client = None
 
 
-def get_redis_client():
+async def get_glide_client():
     """
-    Get or create Redis client connection.
+    Get or create Glide client connection.
     Following AWS tutorial: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/LambdaRedis.html
+    Using valkey-glide library for ElastiCache Serverless access.
     """
-    global redis_client
-    if redis_client is None:
+    global glide_client
+    if glide_client is None:
         try:
-            # Configure Redis client for VPC connections
-            # ElastiCache Serverless doesn't require SSL unless in-transit encryption is enabled
-            redis_client = redis.Redis(
-                host=ELASTICACHE_ENDPOINT,
-                port=ELASTICACHE_PORT,
-                decode_responses=True,
-                socket_connect_timeout=10,  # Increased for VPC connections
-                socket_timeout=10,  # Increased for VPC connections
-                retry_on_timeout=True,
+            # Set Glide logger configuration
+            GlideLogger.set_logger_config(LogLevel.INFO)
+            
+            # Configure Glide client for VPC connections
+            # ElastiCache Serverless doesn't require TLS unless in-transit encryption is enabled
+            addresses = [
+                NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)
+            ]
+            config = GlideClusterClientConfiguration(
+                addresses=addresses,
+                use_tls=False,  # Set to True if in-transit encryption is enabled
             )
+            
+            # Create the client
+            glide_client = await GlideClusterClient.create(config)
+            
             # Test connection
-            redis_client.ping()
+            await glide_client.ping()
             logger.info(f"Connected to ElastiCache at {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
         except Exception as e:
             logger.error(f"Failed to connect to ElastiCache: {str(e)}")
             raise
-    return redis_client
+    return glide_client
 
 
 def download_and_decompress(url: str) -> bytes:
@@ -663,14 +681,16 @@ def parse_json_stations(data: bytes) -> List[Dict[str, Any]]:
         raise
 
 
-def store_metar(redis_client: redis.Redis, records: List[Dict[str, Any]]):
+async def store_metar(glide_client: GlideClusterClient, records: List[Dict[str, Any]]):
     """Store METAR records in ValKey."""
-    pipeline = redis_client.pipeline()
     station_ids = set()
     current_time = int(datetime.utcnow().timestamp())
     skipped_count = 0
     
     logger.info(f"[Cache Store] Storing {len(records)} METAR records")
+    
+    # Batch operations for better performance
+    operations = []
     
     for record in records:
         # Log raw values for debugging
@@ -691,33 +711,39 @@ def store_metar(redis_client: redis.Redis, records: List[Dict[str, Any]]):
         if len(station_ids) < 5:
             logger.info(f"[Cache Store] Storing METAR - station_id: {station_id}, icaoId: {icao_id}, stationId: {station_id_field}, key: {key}")
         
-        # Store METAR data
-        pipeline.setex(key, TTL_METAR, json.dumps(record))
+        # Store METAR data with TTL
+        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_METAR))
         station_ids.add(station_id)
         
         # Update sorted set with timestamp
-        pipeline.zadd("metar:updated", {station_id: current_time})
+        operations.append(glide_client.zadd("metar:updated", {station_id: current_time}))
+    
+    # Execute all operations concurrently
+    if operations:
+        await asyncio.gather(*operations, return_exceptions=True)
     
     # Update station set
     if station_ids:
-        pipeline.delete("metar:stations")
-        pipeline.sadd("metar:stations", *station_ids)
+        await glide_client.delete("metar:stations")
+        # SADD with multiple members
+        for station_id in station_ids:
+            await glide_client.sadd("metar:stations", station_id)
     
-    pipeline.execute()
     logger.info(f"[Cache Store] Stored {len(station_ids)} METAR records, skipped {skipped_count} records")
     if station_ids:
         sample_keys = list(station_ids)[:5]
         logger.info(f"[Cache Store] Sample METAR keys stored: {sample_keys}")
 
 
-def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
+async def store_taf(glide_client: GlideClusterClient, records: List[Dict[str, Any]]):
     """Store TAF records in ValKey."""
-    pipeline = redis_client.pipeline()
     station_ids = set()
     current_time = int(datetime.utcnow().timestamp())
     skipped_count = 0
     
     logger.info(f"[Cache Store] Storing {len(records)} TAF records")
+    
+    operations = []
     
     for record in records:
         # Log raw values for debugging
@@ -746,26 +772,29 @@ def store_taf(redis_client: redis.Redis, records: List[Dict[str, Any]]):
                     first_fcst = record['forecast'][0]
                     logger.info(f"[Cache Store] First forecast for {station_id}: skyc1={first_fcst.get('skyc1')}, skyl1={first_fcst.get('skyl1')}")
         
-        pipeline.setex(key, TTL_TAF, json.dumps(record))
+        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_TAF))
         station_ids.add(station_id)
-        pipeline.zadd("taf:updated", {station_id: current_time})
+        operations.append(glide_client.zadd("taf:updated", {station_id: current_time}))
+    
+    if operations:
+        await asyncio.gather(*operations, return_exceptions=True)
     
     if station_ids:
-        pipeline.delete("taf:stations")
-        pipeline.sadd("taf:stations", *station_ids)
+        await glide_client.delete("taf:stations")
+        for station_id in station_ids:
+            await glide_client.sadd("taf:stations", station_id)
     
-    pipeline.execute()
     logger.info(f"[Cache Store] Stored {len(station_ids)} TAF records, skipped {skipped_count} records")
     if station_ids:
         sample_keys = list(station_ids)[:5]
         logger.info(f"[Cache Store] Sample TAF keys stored: {sample_keys}")
 
 
-def store_sigmet(redis_client: redis.Redis, records: List[Dict[str, Any]]):
+async def store_sigmet(glide_client: GlideClusterClient, records: List[Dict[str, Any]]):
     """Store SIGMET records in ValKey."""
-    pipeline = redis_client.pipeline()
     sigmet_ids = set()
     hazard_types = {}
+    operations = []
     
     for record in records:
         sigmet_id = record.get('airsigmetId') or record.get('id')
@@ -773,7 +802,7 @@ def store_sigmet(redis_client: redis.Redis, records: List[Dict[str, Any]]):
             continue
         
         key = f"sigmet:{sigmet_id}"
-        pipeline.setex(key, TTL_SIGMET, json.dumps(record))
+        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_SIGMET))
         sigmet_ids.add(sigmet_id)
         
         # Index by hazard type
@@ -782,25 +811,29 @@ def store_sigmet(redis_client: redis.Redis, records: List[Dict[str, Any]]):
             hazard_types[hazard] = set()
         hazard_types[hazard].add(sigmet_id)
     
+    if operations:
+        await asyncio.gather(*operations, return_exceptions=True)
+    
     # Update indexes
     if sigmet_ids:
-        pipeline.delete("sigmet:all")
-        pipeline.sadd("sigmet:all", *sigmet_ids)
+        await glide_client.delete("sigmet:all")
+        for sigmet_id in sigmet_ids:
+            await glide_client.sadd("sigmet:all", sigmet_id)
     
     for hazard, ids in hazard_types.items():
         hazard_key = f"sigmet:hazard:{hazard}"
-        pipeline.delete(hazard_key)
-        pipeline.sadd(hazard_key, *ids)
+        await glide_client.delete(hazard_key)
+        for sigmet_id in ids:
+            await glide_client.sadd(hazard_key, sigmet_id)
     
-    pipeline.execute()
     logger.info(f"Stored {len(sigmet_ids)} SIGMET records")
 
 
-def store_airmet(redis_client: redis.Redis, records: List[Dict[str, Any]]):
+async def store_airmet(glide_client: GlideClusterClient, records: List[Dict[str, Any]]):
     """Store G-AIRMET records in ValKey."""
-    pipeline = redis_client.pipeline()
     airmet_ids = set()
     hazard_types = {}
+    operations = []
     
     for record in records:
         airmet_id = record.get('forecastId') or record.get('id')
@@ -808,7 +841,7 @@ def store_airmet(redis_client: redis.Redis, records: List[Dict[str, Any]]):
             continue
         
         key = f"airmet:{airmet_id}"
-        pipeline.setex(key, TTL_AIRMET, json.dumps(record))
+        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_AIRMET))
         airmet_ids.add(airmet_id)
         
         hazard = record.get('hazard', 'UNKNOWN')
@@ -816,24 +849,28 @@ def store_airmet(redis_client: redis.Redis, records: List[Dict[str, Any]]):
             hazard_types[hazard] = set()
         hazard_types[hazard].add(airmet_id)
     
+    if operations:
+        await asyncio.gather(*operations, return_exceptions=True)
+    
     if airmet_ids:
-        pipeline.delete("airmet:all")
-        pipeline.sadd("airmet:all", *airmet_ids)
+        await glide_client.delete("airmet:all")
+        for airmet_id in airmet_ids:
+            await glide_client.sadd("airmet:all", airmet_id)
     
     for hazard, ids in hazard_types.items():
         hazard_key = f"airmet:hazard:{hazard}"
-        pipeline.delete(hazard_key)
-        pipeline.sadd(hazard_key, *ids)
+        await glide_client.delete(hazard_key)
+        for airmet_id in ids:
+            await glide_client.sadd(hazard_key, airmet_id)
     
-    pipeline.execute()
     logger.info(f"Stored {len(airmet_ids)} G-AIRMET records")
 
 
-def store_pirep(redis_client: redis.Redis, records: List[Dict[str, Any]]):
+async def store_pirep(glide_client: GlideClusterClient, records: List[Dict[str, Any]]):
     """Store PIREP records in ValKey."""
-    pipeline = redis_client.pipeline()
     pirep_ids = set()
     current_time = int(datetime.utcnow().timestamp())
+    operations = []
     
     for record in records:
         pirep_id = record.get('aircraftReportId') or record.get('id')
@@ -841,29 +878,32 @@ def store_pirep(redis_client: redis.Redis, records: List[Dict[str, Any]]):
             continue
         
         key = f"pirep:{pirep_id}"
-        pipeline.setex(key, TTL_PIREP, json.dumps(record))
+        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_PIREP))
         pirep_ids.add(pirep_id)
         
         # Add to recent sorted set
-        pipeline.zadd("pirep:recent", {pirep_id: current_time})
+        operations.append(glide_client.zadd("pirep:recent", {pirep_id: current_time}))
+    
+    if operations:
+        await asyncio.gather(*operations, return_exceptions=True)
     
     if pirep_ids:
-        pipeline.delete("pirep:all")
-        pipeline.sadd("pirep:all", *pirep_ids)
+        await glide_client.delete("pirep:all")
+        for pirep_id in pirep_ids:
+            await glide_client.sadd("pirep:all", pirep_id)
     
     # Keep only last 1000 PIREPs in recent set
-    pipeline.zremrangebyrank("pirep:recent", 0, -1001)
+    await glide_client.zremrangebyrank("pirep:recent", 0, -1001)
     
-    pipeline.execute()
     logger.info(f"Stored {len(pirep_ids)} PIREP records")
 
 
-def store_stations(redis_client: redis.Redis, records: List[Dict[str, Any]]):
+async def store_stations(glide_client: GlideClusterClient, records: List[Dict[str, Any]]):
     """Store Station records in ValKey."""
-    pipeline = redis_client.pipeline()
     station_codes = set()
     name_index = {}
     iata_index = {}
+    operations = []
     
     for record in records:
         station_code = record.get('icaoId') or record.get('id')
@@ -872,7 +912,7 @@ def store_stations(redis_client: redis.Redis, records: List[Dict[str, Any]]):
         
         station_code = station_code.upper()
         key = f"station:{station_code}"
-        pipeline.setex(key, TTL_STATION, json.dumps(record))
+        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_STATION))
         station_codes.add(station_code)
         
         # Index by name
@@ -888,26 +928,30 @@ def store_stations(redis_client: redis.Redis, records: List[Dict[str, Any]]):
         if iata:
             iata_index[iata.upper()] = station_code
     
+    if operations:
+        await asyncio.gather(*operations, return_exceptions=True)
+    
     # Update indexes
     if station_codes:
-        pipeline.delete("station:all")
-        pipeline.sadd("station:all", *station_codes)
+        await glide_client.delete("station:all")
+        for station_code in station_codes:
+            await glide_client.sadd("station:all", station_code)
     
     # Update name index
     for name, codes in name_index.items():
         name_key = f"station:name:{name}"
-        pipeline.delete(name_key)
-        pipeline.sadd(name_key, *codes)
+        await glide_client.delete(name_key)
+        for code in codes:
+            await glide_client.sadd(name_key, code)
     
     # Update IATA index
     for iata, icao in iata_index.items():
-        pipeline.set(f"station:iata:{iata}", icao)
+        await glide_client.set(f"station:iata:{iata}", icao)
     
-    pipeline.execute()
     logger.info(f"Stored {len(station_codes)} station records")
 
 
-def process_cache_file(data_type: str, source_url: str) -> Dict[str, Any]:
+async def process_cache_file(data_type: str, source_url: str) -> Dict[str, Any]:
     """Process a cache file and store data in ValKey."""
     start_time = datetime.utcnow()
     records_processed = 0
@@ -938,22 +982,22 @@ def process_cache_file(data_type: str, source_url: str) -> Dict[str, Any]:
         else:
             raise ValueError(f"Unknown data type: {data_type}")
         
-        # Connect to Redis
-        redis_client = get_redis_client()
+        # Connect to Glide
+        glide_client = await get_glide_client()
         
         # Store records
         if data_type == "metar":
-            store_metar(redis_client, records)
+            await store_metar(glide_client, records)
         elif data_type == "taf":
-            store_taf(redis_client, records)
+            await store_taf(glide_client, records)
         elif data_type == "sigmet":
-            store_sigmet(redis_client, records)
+            await store_sigmet(glide_client, records)
         elif data_type == "airmet":
-            store_airmet(redis_client, records)
+            await store_airmet(glide_client, records)
         elif data_type == "pirep":
-            store_pirep(redis_client, records)
+            await store_pirep(glide_client, records)
         elif data_type == "station":
-            store_stations(redis_client, records)
+            await store_stations(glide_client, records)
         
         records_processed = len(records)
         
@@ -985,31 +1029,35 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "source": "https://aviationweather.gov/data/cache/..."
     }
     """
-    try:
-        data_type = event.get('dataType', '').lower()
-        source_url = event.get('source', '')
-        
-        if not data_type or not source_url:
-            raise ValueError("dataType and source are required in event")
-        
-        logger.info(f"Processing {data_type} cache from {source_url}")
-        
-        result = process_cache_file(data_type, source_url)
-        
-        logger.info(f"Successfully processed {result['recordsProcessed']} {data_type} records in {result['durationSeconds']:.2f}s")
-        
-        return {
-            "statusCode": 200,
-            "body": json.dumps(result)
-        }
-        
-    except Exception as e:
-        logger.error(f"Handler error: {str(e)}", exc_info=True)
-        return {
-            "statusCode": 500,
-            "body": json.dumps({
-                "error": str(e),
-                "dataType": event.get('dataType', 'unknown'),
-                "timestamp": datetime.utcnow().isoformat() + 'Z'
-            })
-        }
+    async def async_handler():
+        try:
+            data_type = event.get('dataType', '').lower()
+            source_url = event.get('source', '')
+            
+            if not data_type or not source_url:
+                raise ValueError("dataType and source are required in event")
+            
+            logger.info(f"Processing {data_type} cache from {source_url}")
+            
+            result = await process_cache_file(data_type, source_url)
+            
+            logger.info(f"Successfully processed {result['recordsProcessed']} {data_type} records in {result['durationSeconds']:.2f}s")
+            
+            return {
+                "statusCode": 200,
+                "body": json.dumps(result)
+            }
+            
+        except Exception as e:
+            logger.error(f"Handler error: {str(e)}", exc_info=True)
+            return {
+                "statusCode": 500,
+                "body": json.dumps({
+                    "error": str(e),
+                    "dataType": event.get('dataType', 'unknown'),
+                    "timestamp": datetime.utcnow().isoformat() + 'Z'
+                })
+            }
+    
+    # Run async handler
+    return asyncio.run(async_handler())

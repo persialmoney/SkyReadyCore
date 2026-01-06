@@ -8,11 +8,22 @@ import os
 import boto3
 import re
 import time
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import urllib.request
 import urllib.error
-import redis  # ValKey is Redis-compatible, so we use the redis Python library
+from glide import (
+    ClosingError,
+    ConnectionError as GlideConnectionError,
+    GlideClusterClient,
+    GlideClusterClientConfiguration,
+    Logger as GlideLogger,
+    LogLevel,
+    NodeAddress,
+    RequestError,
+    TimeoutError as GlideTimeoutError,
+)
 import logging
 
 # Configure logging
@@ -35,17 +46,17 @@ METAR_URL = f"{AWC_BASE_URL}/metar"
 TAF_URL = f"{AWC_BASE_URL}/taf"
 NOTAM_URL = f"{AWC_BASE_URL}/notam"
 
-# Redis client (lazy initialization)
-redis_client = None
+# Glide client (lazy initialization)
+glide_client = None
 
 
-def get_redis_client() -> Optional[redis.Redis]:
+async def get_glide_client() -> Optional[GlideClusterClient]:
     """
-    Get or create Redis client connection with retry logic.
+    Get or create Glide client connection with retry logic.
     Optimized for VPC connections with increased timeouts and better error handling.
-    Following AWS tutorial: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/LambdaRedis.html
+    Using valkey-glide library for ElastiCache Serverless access.
     """
-    global redis_client
+    global glide_client
     if not ELASTICACHE_ENDPOINT:
         logger.warning("[ElastiCache] No ELASTICACHE_ENDPOINT configured, skipping cache")
         return None
@@ -60,17 +71,24 @@ def get_redis_client() -> Optional[redis.Redis]:
         logger.debug(f"[ElastiCache] Could not get network info: {str(e)}")
     
     # Check if existing connection is still valid
-    if redis_client is not None:
+    if glide_client is not None:
         try:
-            redis_client.ping()
-            return redis_client
+            await glide_client.ping()
+            return glide_client
         except Exception as e:
             logger.warning(f"[ElastiCache] Existing connection is stale: {str(e)}, creating new connection")
-            redis_client = None
+            try:
+                await glide_client.close()
+            except:
+                pass
+            glide_client = None
     
     # Retry connection with exponential backoff
     max_retries = 3
     base_delay = 0.1  # 100ms base delay
+    
+    # Set Glide logger configuration
+    GlideLogger.set_logger_config(LogLevel.INFO)
     
     for attempt in range(max_retries):
         try:
@@ -84,45 +102,46 @@ def get_redis_client() -> Optional[redis.Redis]:
                 logger.info(f"[ElastiCache] DNS resolved to IP: {resolved_ip}")
             except socket.gaierror as dns_error:
                 logger.error(f"[ElastiCache] DNS resolution failed: {str(dns_error)} - check VPC DNS configuration")
-                raise redis.ConnectionError(f"DNS resolution failed: {str(dns_error)}")
+                raise GlideConnectionError(f"DNS resolution failed: {str(dns_error)}")
             except Exception as dns_error:
                 logger.warning(f"[ElastiCache] DNS resolution check failed (non-fatal): {str(dns_error)}")
             
-            # Configure Redis client for VPC connections
-            # Increased timeouts for VPC: Lambda ENI creation and DNS resolution can take time
-            # Following AWS tutorial: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/LambdaRedis.html
-            # Note: ElastiCache Serverless doesn't require SSL unless in-transit encryption is enabled
-            redis_client = redis.Redis(
-                host=ELASTICACHE_ENDPOINT,
-                port=ELASTICACHE_PORT,
-                decode_responses=True,
-                socket_connect_timeout=10,  # 10 seconds for VPC connections (allows time for ENI setup)
-                socket_timeout=10,  # 10 seconds for socket operations
-                retry_on_timeout=True,  # Enable retry on timeout
-                # Note: socket_keepalive_options removed - can cause "Error 22: Invalid argument" on some systems
-                # TCP keepalive is handled by the OS by default
+            # Configure Glide client for VPC connections
+            # ElastiCache Serverless doesn't require TLS unless in-transit encryption is enabled
+            addresses = [
+                NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)
+            ]
+            config = GlideClusterClientConfiguration(
+                addresses=addresses,
+                use_tls=False,  # Set to True if in-transit encryption is enabled
             )
             
-            # Test connection with ping (with timeout)
-            redis_client.ping()
-            logger.info(f"[ElastiCache] Successfully connected to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
-            return redis_client
+            # Create the client
+            glide_client = await GlideClusterClient.create(config)
             
-        except redis.TimeoutError as e:
+            # Test connection with ping
+            await glide_client.ping()
+            logger.info(f"[ElastiCache] Successfully connected to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
+            return glide_client
+            
+        except GlideTimeoutError as e:
             error_msg = f"Timeout connecting to ElastiCache: {str(e)}"
             logger.warning(f"[ElastiCache] {error_msg}")
-            # Check if this might be a DNS resolution issue
-            if "getaddrinfo" in str(e).lower() or "name resolution" in str(e).lower():
-                logger.error("[ElastiCache] DNS resolution failed - check VPC DNS configuration")
-            redis_client = None
+            logger.error(
+                "[ElastiCache] Connection timeout - possible causes: "
+                "1) Security group blocking traffic, "
+                "2) ElastiCache not in same VPC/subnet, "
+                "3) Network routing issue"
+            )
+            glide_client = None
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)  # Exponential backoff
                 logger.info(f"[ElastiCache] Retrying in {delay:.2f} seconds...")
-                time.sleep(delay)
+                await asyncio.sleep(delay)
             else:
                 logger.error(f"[ElastiCache] All {max_retries} connection attempts failed, will use API fallback")
                 
-        except redis.ConnectionError as e:
+        except (GlideConnectionError, RequestError) as e:
             error_msg = f"Connection error to ElastiCache: {str(e)}"
             logger.warning(f"[ElastiCache] {error_msg}")
             # Distinguish between different connection error types
@@ -133,11 +152,11 @@ def get_redis_client() -> Optional[redis.Redis]:
                 logger.error("[ElastiCache] DNS resolution failed - check VPC DNS configuration and endpoint")
             elif "network is unreachable" in error_str:
                 logger.error("[ElastiCache] Network unreachable - check VPC routing and subnet configuration")
-            redis_client = None
+            glide_client = None
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
                 logger.info(f"[ElastiCache] Retrying in {delay:.2f} seconds...")
-                time.sleep(delay)
+                await asyncio.sleep(delay)
             else:
                 logger.error(f"[ElastiCache] All {max_retries} connection attempts failed, will use API fallback")
                 
@@ -148,18 +167,18 @@ def get_redis_client() -> Optional[redis.Redis]:
             # Log full exception details for debugging
             import traceback
             logger.debug(f"[ElastiCache] Full traceback: {traceback.format_exc()}")
-            redis_client = None
+            glide_client = None
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
                 logger.info(f"[ElastiCache] Retrying in {delay:.2f} seconds...")
-                time.sleep(delay)
+                await asyncio.sleep(delay)
             else:
                 logger.error(f"[ElastiCache] All {max_retries} connection attempts failed, will use API fallback")
     
     return None
 
 
-def fetch_metar(airport_code: str) -> Dict[str, Any]:
+async def fetch_metar(airport_code: str) -> Dict[str, Any]:
     """
     Fetch METAR data for an airport.
     Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
@@ -168,13 +187,16 @@ def fetch_metar(airport_code: str) -> Dict[str, Any]:
     cache_key = f"metar:{airport_code}"
     
     # Try to get from cache first
-    redis_client = get_redis_client()
-    if redis_client:
+    glide_client = await get_glide_client()
+    if glide_client:
         try:
             logger.info(f"[METAR Cache] Checking cache for key: {cache_key}")
-            cached_data = redis_client.get(cache_key)
+            cached_data = await glide_client.get(cache_key)
             if cached_data:
                 logger.info(f"[METAR Cache] ✅ Cache HIT for {airport_code} (key: {cache_key})")
+                # Glide returns bytes, decode if needed
+                if isinstance(cached_data, bytes):
+                    cached_data = cached_data.decode('utf-8')
                 metar_data = json.loads(cached_data)
                 # Transform to expected format
                 return transform_metar_from_cache(metar_data, airport_code)
@@ -496,7 +518,7 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
     return result
 
 
-def fetch_taf(airport_code: str) -> Dict[str, Any]:
+async def fetch_taf(airport_code: str) -> Dict[str, Any]:
     """
     Fetch TAF data for an airport.
     Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
@@ -505,13 +527,16 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
     cache_key = f"taf:{airport_code}"
     
     # Try to get from cache first
-    redis_client = get_redis_client()
-    if redis_client:
+    glide_client = await get_glide_client()
+    if glide_client:
         try:
             logger.info(f"[TAF Cache] Checking cache for key: {cache_key}")
-            cached_data = redis_client.get(cache_key)
+            cached_data = await glide_client.get(cache_key)
             if cached_data:
                 logger.info(f"[TAF Cache] ✅ Cache HIT for {airport_code} (key: {cache_key})")
+                # Glide returns bytes, decode if needed
+                if isinstance(cached_data, bytes):
+                    cached_data = cached_data.decode('utf-8')
                 taf_data = json.loads(cached_data)
                 return transform_taf_from_cache(taf_data, airport_code)
             else:
@@ -564,10 +589,10 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
             }
             
             # Write-through: Store in cache for next request
-            if redis_client:
+            if glide_client:
                 try:
                     cache_key = f"taf:{airport_code}"
-                    redis_client.setex(cache_key, 900, json.dumps(taf))  # 15 minute TTL
+                    await glide_client.set(cache_key, json.dumps(taf), ex=900)  # 15 minute TTL
                 except Exception as e:
                     logger.warning(f"Failed to cache TAF for {airport_code}: {str(e)}")
             
