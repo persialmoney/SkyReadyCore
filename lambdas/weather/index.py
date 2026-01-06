@@ -1182,67 +1182,71 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     field_name = event.get("info", {}).get("fieldName", "")
     arguments = event.get("arguments", {})
     
-    try:
-        if field_name == "getMETAR":
-            airport_code = arguments.get("airportCode")
-            if not airport_code:
-                raise ValueError("airportCode is required")
-            return fetch_metar(airport_code)
+    async def async_handler():
+        try:
+            if field_name == "getMETAR":
+                airport_code = arguments.get("airportCode")
+                if not airport_code:
+                    raise ValueError("airportCode is required")
+                return await fetch_metar(airport_code)
+            
+            elif field_name == "getTAF":
+                airport_code = arguments.get("airportCode")
+                if not airport_code:
+                    raise ValueError("airportCode is required")
+                return await fetch_taf(airport_code)
+            
+            elif field_name == "getNOTAMs":
+                airport_code = arguments.get("airportCode")
+                if not airport_code:
+                    raise ValueError("airportCode is required")
+                return fetch_notams(airport_code)  # This function is not async
+            
+            elif field_name == "getDistance":
+                # Calculate distance between airports
+                source = arguments.get("sourceAirport", "").upper()
+                dest = arguments.get("destinationAirport", "").upper()
+                
+                # Simple airport database (in production, use DynamoDB or external API)
+                airports = {
+                    'JFK': {'lat': 40.6413, 'lon': -73.7781},
+                    'LAX': {'lat': 33.9425, 'lon': -118.4081},
+                    # Add more airports as needed
+                }
+                
+                if source not in airports or dest not in airports:
+                    raise ValueError(f"Airport not found: {source} or {dest}")
+                
+                # Haversine formula
+                from math import radians, sin, cos, sqrt, atan2
+                R = 3440.065  # Earth radius in nautical miles
+                
+                lat1, lon1 = radians(airports[source]['lat']), radians(airports[source]['lon'])
+                lat2, lon2 = radians(airports[dest]['lat']), radians(airports[dest]['lon'])
+                
+                dlat = lat2 - lat1
+                dlon = lon2 - lon1
+                
+                a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+                c = 2 * atan2(sqrt(a), sqrt(1-a))
+                distance = R * c
+                
+                return {
+                    "sourceAirport": source,
+                    "destinationAirport": dest,
+                    "distance": round(distance, 1),
+                    "unit": "nautical miles"
+                }
+            
+            else:
+                raise ValueError(f"Unknown field: {field_name}")
         
-        elif field_name == "getTAF":
-            airport_code = arguments.get("airportCode")
-            if not airport_code:
-                raise ValueError("airportCode is required")
-            return fetch_taf(airport_code)
-        
-        elif field_name == "getNOTAMs":
-            airport_code = arguments.get("airportCode")
-            if not airport_code:
-                raise ValueError("airportCode is required")
-            return fetch_notams(airport_code)
-        
-        elif field_name == "getDistance":
-            # Calculate distance between airports
-            source = arguments.get("sourceAirport", "").upper()
-            dest = arguments.get("destinationAirport", "").upper()
-            
-            # Simple airport database (in production, use DynamoDB or external API)
-            airports = {
-                'JFK': {'lat': 40.6413, 'lon': -73.7781},
-                'LAX': {'lat': 33.9425, 'lon': -118.4081},
-                # Add more airports as needed
-            }
-            
-            if source not in airports or dest not in airports:
-                raise ValueError(f"Airport not found: {source} or {dest}")
-            
-            # Haversine formula
-            from math import radians, sin, cos, sqrt, atan2
-            R = 3440.065  # Earth radius in nautical miles
-            
-            lat1, lon1 = radians(airports[source]['lat']), radians(airports[source]['lon'])
-            lat2, lon2 = radians(airports[dest]['lat']), radians(airports[dest]['lon'])
-            
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            
-            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-            c = 2 * atan2(sqrt(a), sqrt(1-a))
-            distance = R * c
-            
+        except Exception as e:
             return {
-                "sourceAirport": source,
-                "destinationAirport": dest,
-                "distance": round(distance, 1),
-                "unit": "nautical miles"
+                "error": str(e),
+                "fieldName": field_name,
+                "arguments": arguments
             }
-        
-        else:
-            raise ValueError(f"Unknown field: {field_name}")
     
-    except Exception as e:
-        return {
-            "error": str(e),
-            "fieldName": field_name,
-            "arguments": arguments
-        }
+    # Run async handler
+    return asyncio.run(async_handler())
