@@ -342,7 +342,7 @@ def parse_csv_metar(data: bytes) -> List[Dict[str, Any]]:
                 record['clouds'] = []
             
             # Map weather string
-            record['wxString'] = row.get('wx_string', '')
+            record['wxString'] = get_col('wx_string', '')
             
             records.append(record)
         logger.info(f"Parsed {len(records)} METAR records from CSV")
