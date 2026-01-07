@@ -8,11 +8,16 @@ import os
 import boto3
 import re
 import time
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import urllib.request
 import urllib.error
-import redis  # ValKey is Redis-compatible, so we use the redis Python library
+from glide import (
+    GlideClusterClient,
+    GlideClusterClientConfiguration,
+    NodeAddress,
+)
 import logging
 
 # Configure logging
@@ -35,108 +40,65 @@ METAR_URL = f"{AWC_BASE_URL}/metar"
 TAF_URL = f"{AWC_BASE_URL}/taf"
 NOTAM_URL = f"{AWC_BASE_URL}/notam"
 
-# Redis client (lazy initialization)
-redis_client = None
+# Glide client (lazy initialization)
+glide_client = None
 
 
-def get_redis_client() -> Optional[redis.Redis]:
-    """Get or create Redis client connection with retry logic."""
-    global redis_client
+async def get_glide_client() -> Optional[GlideClusterClient]:
+    """
+    Get or create Glide cluster client connection.
+    """
+    global glide_client
     if not ELASTICACHE_ENDPOINT:
-        logger.warning("[ElastiCache] No ELASTICACHE_ENDPOINT configured, skipping cache")
         return None
     
-    # Check if existing connection is still valid
-    if redis_client is not None:
+    if glide_client is not None:
         try:
-            redis_client.ping()
-            return redis_client
-        except Exception as e:
-            logger.warning(f"[ElastiCache] Existing connection is stale: {str(e)}, creating new connection")
-            redis_client = None
+            await glide_client.ping()
+            return glide_client
+        except Exception:
+            try:
+                await glide_client.close()
+            except:
+                pass
+            glide_client = None
     
-    # Retry connection with exponential backoff
-    max_retries = 3
-    base_delay = 0.1  # 100ms base delay
-    
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"[ElastiCache] Connection attempt {attempt + 1}/{max_retries} to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
-            
-            redis_client = redis.Redis(
-                host=ELASTICACHE_ENDPOINT,
-                port=ELASTICACHE_PORT,
-                decode_responses=True,
-                socket_connect_timeout=5,  # Increased from 2 to 5 seconds for VPC connections
-                socket_timeout=5,  # Increased from 2 to 5 seconds
-                retry_on_timeout=True,  # Enable retry on timeout
-            )
-            
-            # Test connection with ping
-            redis_client.ping()
-            logger.info(f"[ElastiCache] Successfully connected to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
-            return redis_client
-            
-        except redis.TimeoutError as e:
-            error_msg = f"Timeout connecting to ElastiCache: {str(e)}"
-            logger.warning(f"[ElastiCache] {error_msg}")
-            redis_client = None
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)  # Exponential backoff
-                logger.info(f"[ElastiCache] Retrying in {delay:.2f} seconds...")
-                time.sleep(delay)
-            else:
-                logger.error(f"[ElastiCache] All {max_retries} connection attempts failed, will use API fallback")
-                
-        except redis.ConnectionError as e:
-            error_msg = f"Connection error to ElastiCache: {str(e)}"
-            logger.warning(f"[ElastiCache] {error_msg}")
-            redis_client = None
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                logger.info(f"[ElastiCache] Retrying in {delay:.2f} seconds...")
-                time.sleep(delay)
-            else:
-                logger.error(f"[ElastiCache] All {max_retries} connection attempts failed, will use API fallback")
-                
-        except Exception as e:
-            error_type = type(e).__name__
-            error_msg = f"Unexpected error connecting to ElastiCache ({error_type}): {str(e)}"
-            logger.error(f"[ElastiCache] {error_msg}")
-            redis_client = None
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                logger.info(f"[ElastiCache] Retrying in {delay:.2f} seconds...")
-                time.sleep(delay)
-            else:
-                logger.error(f"[ElastiCache] All {max_retries} connection attempts failed, will use API fallback")
-    
-    return None
+    try:
+        config = GlideClusterClientConfiguration(
+            addresses=[NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)],
+            use_tls=True,
+            request_timeout=10000,
+        )
+        glide_client = await GlideClusterClient.create(config)
+        return glide_client
+    except Exception as e:
+        logger.error(f"[ElastiCache] Connection failed: {str(e)}")
+        glide_client = None
+        return None
 
 
-def fetch_metar(airport_code: str) -> Dict[str, Any]:
+async def fetch_metar(airport_code: str) -> Dict[str, Any]:
     """
     Fetch METAR data for an airport.
     Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
     """
     airport_code = airport_code.upper()
+    cache_key = f"metar:{airport_code}"
     
     # Try to get from cache first
-    redis_client = get_redis_client()
-    if redis_client:
+    glide_client = await get_glide_client()
+    if glide_client:
         try:
-            cache_key = f"metar:{airport_code}"
-            cached_data = redis_client.get(cache_key)
+            cached_data = await glide_client.get(cache_key)
             if cached_data:
-                logger.info(f"Cache hit for METAR: {airport_code}")
+                if isinstance(cached_data, bytes):
+                    cached_data = cached_data.decode('utf-8')
                 metar_data = json.loads(cached_data)
-                # Transform to expected format
                 return transform_metar_from_cache(metar_data, airport_code)
-        except Exception as e:
-            logger.warning(f"Cache read error for {airport_code}: {str(e)}, falling back to API")
+        except Exception:
+            pass
     
     # Cache miss or error - fetch from API
-    logger.info(f"Cache miss for METAR: {airport_code}, fetching from API")
     try:
         # Use decoded format to get structured fields like skyc1, skyl1, etc.
         url = f"{METAR_URL}?ids={airport_code}&format=json&taf=false&hours=1"
@@ -335,8 +297,6 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
         # Try alternative field name from CSV
         obs_time = metar_data.get("observation_time", None)
     
-    logger.info(f"Raw obs_time: {obs_time}, type: {type(obs_time)}")
-    
     if obs_time:
         # Check if it's a Unix timestamp (integer) from API
         if isinstance(obs_time, int):
@@ -361,11 +321,8 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
                 obs_time = obs_time_str
         else:
             obs_time = str(obs_time).strip()
-    else:
-        logger.warning(f"No observation time found for {airport_code}, using current time")
-        obs_time = datetime.utcnow().isoformat() + 'Z'
-    
-    logger.info(f"Final obs_time: {obs_time}")
+        else:
+            obs_time = datetime.utcnow().isoformat() + 'Z'
     
     # Parse visibility - handle both old and new field names
     visibility = metar_data.get("visib", None)
@@ -446,28 +403,28 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
     return result
 
 
-def fetch_taf(airport_code: str) -> Dict[str, Any]:
+async def fetch_taf(airport_code: str) -> Dict[str, Any]:
     """
     Fetch TAF data for an airport.
     Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
     """
     airport_code = airport_code.upper()
+    cache_key = f"taf:{airport_code}"
     
     # Try to get from cache first
-    redis_client = get_redis_client()
-    if redis_client:
+    glide_client = await get_glide_client()
+    if glide_client:
         try:
-            cache_key = f"taf:{airport_code}"
-            cached_data = redis_client.get(cache_key)
+            cached_data = await glide_client.get(cache_key)
             if cached_data:
-                logger.info(f"Cache hit for TAF: {airport_code}")
+                if isinstance(cached_data, bytes):
+                    cached_data = cached_data.decode('utf-8')
                 taf_data = json.loads(cached_data)
                 return transform_taf_from_cache(taf_data, airport_code)
-        except Exception as e:
-            logger.warning(f"Cache read error for TAF {airport_code}: {str(e)}, falling back to API")
+        except Exception:
+            pass
     
     # Cache miss or error - fetch from API
-    logger.info(f"Cache miss for TAF: {airport_code}, fetching from API")
     try:
         url = f"{TAF_URL}?ids={airport_code}&format=json"
         with urllib.request.urlopen(url, timeout=10) as response:
@@ -487,14 +444,7 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
                 }
             
             taf = data[0]
-            
-            # Log the TAF structure for debugging
-            logger.info(f"TAF data keys: {list(taf.keys())}")
-            if "forecast" in taf:
-                logger.info(f"Forecast type: {type(taf['forecast'])}, length: {len(taf['forecast']) if isinstance(taf['forecast'], list) else 'N/A'}")
-            
             parsed_forecast = parse_taf_forecast(taf)
-            logger.info(f"Parsed {len(parsed_forecast)} forecast periods")
             
             # Ensure all non-nullable fields have values (never None)
             current_time = datetime.utcnow().isoformat()
@@ -509,12 +459,12 @@ def fetch_taf(airport_code: str) -> Dict[str, Any]:
             }
             
             # Write-through: Store in cache for next request
-            if redis_client:
+            if glide_client:
                 try:
                     cache_key = f"taf:{airport_code}"
-                    redis_client.setex(cache_key, 900, json.dumps(taf))  # 15 minute TTL
-                except Exception as e:
-                    logger.warning(f"Failed to cache TAF for {airport_code}: {str(e)}")
+                    await glide_client.set(cache_key, json.dumps(taf), ex=900)
+                except Exception:
+                    pass
             
             return result
     except urllib.error.URLError as e:
@@ -1102,67 +1052,71 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     field_name = event.get("info", {}).get("fieldName", "")
     arguments = event.get("arguments", {})
     
-    try:
-        if field_name == "getMETAR":
-            airport_code = arguments.get("airportCode")
-            if not airport_code:
-                raise ValueError("airportCode is required")
-            return fetch_metar(airport_code)
+    async def async_handler():
+        try:
+            if field_name == "getMETAR":
+                airport_code = arguments.get("airportCode")
+                if not airport_code:
+                    raise ValueError("airportCode is required")
+                return await fetch_metar(airport_code)
+            
+            elif field_name == "getTAF":
+                airport_code = arguments.get("airportCode")
+                if not airport_code:
+                    raise ValueError("airportCode is required")
+                return await fetch_taf(airport_code)
+            
+            elif field_name == "getNOTAMs":
+                airport_code = arguments.get("airportCode")
+                if not airport_code:
+                    raise ValueError("airportCode is required")
+                return fetch_notams(airport_code)  # This function is not async
+            
+            elif field_name == "getDistance":
+                # Calculate distance between airports
+                source = arguments.get("sourceAirport", "").upper()
+                dest = arguments.get("destinationAirport", "").upper()
+                
+                # Simple airport database (in production, use DynamoDB or external API)
+                airports = {
+                    'JFK': {'lat': 40.6413, 'lon': -73.7781},
+                    'LAX': {'lat': 33.9425, 'lon': -118.4081},
+                    # Add more airports as needed
+                }
+                
+                if source not in airports or dest not in airports:
+                    raise ValueError(f"Airport not found: {source} or {dest}")
+                
+                # Haversine formula
+                from math import radians, sin, cos, sqrt, atan2
+                R = 3440.065  # Earth radius in nautical miles
+                
+                lat1, lon1 = radians(airports[source]['lat']), radians(airports[source]['lon'])
+                lat2, lon2 = radians(airports[dest]['lat']), radians(airports[dest]['lon'])
+                
+                dlat = lat2 - lat1
+                dlon = lon2 - lon1
+                
+                a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+                c = 2 * atan2(sqrt(a), sqrt(1-a))
+                distance = R * c
+                
+                return {
+                    "sourceAirport": source,
+                    "destinationAirport": dest,
+                    "distance": round(distance, 1),
+                    "unit": "nautical miles"
+                }
+            
+            else:
+                raise ValueError(f"Unknown field: {field_name}")
         
-        elif field_name == "getTAF":
-            airport_code = arguments.get("airportCode")
-            if not airport_code:
-                raise ValueError("airportCode is required")
-            return fetch_taf(airport_code)
-        
-        elif field_name == "getNOTAMs":
-            airport_code = arguments.get("airportCode")
-            if not airport_code:
-                raise ValueError("airportCode is required")
-            return fetch_notams(airport_code)
-        
-        elif field_name == "getDistance":
-            # Calculate distance between airports
-            source = arguments.get("sourceAirport", "").upper()
-            dest = arguments.get("destinationAirport", "").upper()
-            
-            # Simple airport database (in production, use DynamoDB or external API)
-            airports = {
-                'JFK': {'lat': 40.6413, 'lon': -73.7781},
-                'LAX': {'lat': 33.9425, 'lon': -118.4081},
-                # Add more airports as needed
-            }
-            
-            if source not in airports or dest not in airports:
-                raise ValueError(f"Airport not found: {source} or {dest}")
-            
-            # Haversine formula
-            from math import radians, sin, cos, sqrt, atan2
-            R = 3440.065  # Earth radius in nautical miles
-            
-            lat1, lon1 = radians(airports[source]['lat']), radians(airports[source]['lon'])
-            lat2, lon2 = radians(airports[dest]['lat']), radians(airports[dest]['lon'])
-            
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            
-            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-            c = 2 * atan2(sqrt(a), sqrt(1-a))
-            distance = R * c
-            
+        except Exception as e:
             return {
-                "sourceAirport": source,
-                "destinationAirport": dest,
-                "distance": round(distance, 1),
-                "unit": "nautical miles"
+                "error": str(e),
+                "fieldName": field_name,
+                "arguments": arguments
             }
-        
-        else:
-            raise ValueError(f"Unknown field: {field_name}")
     
-    except Exception as e:
-        return {
-            "error": str(e),
-            "fieldName": field_name,
-            "arguments": arguments
-        }
+    # Run async handler
+    return asyncio.run(async_handler())
