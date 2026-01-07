@@ -99,6 +99,8 @@ async def get_glide_client():
                 config = GlideClientConfiguration(
                     addresses=[NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)],
                     use_tls=False,  # Set to True if in-transit encryption is enabled
+                    connection_timeout=15000,  # 15 seconds - sufficient for Lambda ENI setup
+                    request_timeout=10000,  # 10 seconds - sufficient for VPC network latency
                 )
                 glide_client = await GlideClient.create(config)
             except Exception as e:
@@ -110,6 +112,8 @@ async def get_glide_client():
                 config = GlideClusterClientConfiguration(
                     addresses=addresses,
                     use_tls=False,  # Set to True if in-transit encryption is enabled
+                    connection_timeout=15000,  # 15 seconds - sufficient for Lambda ENI setup
+                    request_timeout=10000,  # 10 seconds - sufficient for VPC network latency
                 )
                 glide_client = await GlideClusterClient.create(config)
             
