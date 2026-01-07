@@ -18,6 +18,8 @@ from glide import (
     ConnectionError as GlideConnectionError,
     GlideClusterClient,
     GlideClusterClientConfiguration,
+    GlideClient,
+    GlideClientConfiguration,
     Logger as GlideLogger,
     LogLevel,
     NodeAddress,
@@ -50,7 +52,7 @@ NOTAM_URL = f"{AWC_BASE_URL}/notam"
 glide_client = None
 
 
-async def get_glide_client() -> Optional[GlideClusterClient]:
+async def get_glide_client() -> Optional[Any]:
     """
     Get or create Glide client connection with retry logic.
     Optimized for VPC connections with increased timeouts and better error handling.
@@ -95,6 +97,7 @@ async def get_glide_client() -> Optional[GlideClusterClient]:
             logger.info(f"[ElastiCache] Connection attempt {attempt + 1}/{max_retries} to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
             
             # Test DNS resolution first (helps diagnose VPC DNS issues)
+            resolved_ip = None
             try:
                 import socket
                 logger.info(f"[ElastiCache] Resolving DNS for {ELASTICACHE_ENDPOINT}...")
@@ -106,18 +109,45 @@ async def get_glide_client() -> Optional[GlideClusterClient]:
             except Exception as dns_error:
                 logger.warning(f"[ElastiCache] DNS resolution check failed (non-fatal): {str(dns_error)}")
             
+            # Test TCP connectivity to ElastiCache endpoint
+            if resolved_ip:
+                try:
+                    import socket
+                    logger.info(f"[ElastiCache] Testing TCP connection to {resolved_ip}:{ELASTICACHE_PORT}...")
+                    test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    test_socket.settimeout(5)  # 5 second timeout for test
+                    result = test_socket.connect_ex((resolved_ip, ELASTICACHE_PORT))
+                    test_socket.close()
+                    if result == 0:
+                        logger.info(f"[ElastiCache] TCP connection test successful to {resolved_ip}:{ELASTICACHE_PORT}")
+                    else:
+                        logger.warning(f"[ElastiCache] TCP connection test failed (error code: {result}) - check security groups and network ACLs")
+                except Exception as tcp_error:
+                    logger.warning(f"[ElastiCache] TCP connection test failed (non-fatal): {str(tcp_error)}")
+            
             # Configure Glide client for VPC connections
             # ElastiCache Serverless doesn't require TLS unless in-transit encryption is enabled
-            addresses = [
-                NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)
-            ]
-            config = GlideClusterClientConfiguration(
-                addresses=addresses,
-                use_tls=False,  # Set to True if in-transit encryption is enabled
-            )
-            
-            # Create the client
-            glide_client = await GlideClusterClient.create(config)
+            # Note: ElastiCache Serverless may work better with GlideClient (standalone) vs GlideClusterClient
+            # Try GlideClient first for Serverless endpoints
+            try:
+                # Try standalone client first (better for Serverless)
+                logger.info("[ElastiCache] Attempting connection with GlideClient (standalone) for Serverless")
+                config = GlideClientConfiguration(
+                    addresses=[NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)],
+                    use_tls=False,  # Set to True if in-transit encryption is enabled
+                )
+                glide_client = await GlideClient.create(config)
+            except Exception as e:
+                logger.warning(f"[ElastiCache] GlideClient failed: {str(e)}, trying GlideClusterClient")
+                # Fallback to cluster client
+                addresses = [
+                    NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)
+                ]
+                config = GlideClusterClientConfiguration(
+                    addresses=addresses,
+                    use_tls=False,  # Set to True if in-transit encryption is enabled
+                )
+                glide_client = await GlideClusterClient.create(config)
             
             # Test connection with ping
             await glide_client.ping()
