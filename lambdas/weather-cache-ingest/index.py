@@ -691,7 +691,7 @@ async def store_metar(glide_client: GlideClusterClient, records: List[Dict[str, 
             logger.info(f"[Cache Store] Storing METAR - station_id: {station_id}, icaoId: {icao_id}, stationId: {station_id_field}, key: {key}")
         
         # Store METAR data with TTL
-        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_METAR))
+        operations.append(glide_client.setex(key, TTL_METAR, json.dumps(record)))
         station_ids.add(station_id)
         
         # Update sorted set with timestamp
@@ -751,7 +751,7 @@ async def store_taf(glide_client: GlideClusterClient, records: List[Dict[str, An
                     first_fcst = record['forecast'][0]
                     logger.info(f"[Cache Store] First forecast for {station_id}: skyc1={first_fcst.get('skyc1')}, skyl1={first_fcst.get('skyl1')}")
         
-        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_TAF))
+        operations.append(glide_client.setex(key, TTL_TAF, json.dumps(record)))
         station_ids.add(station_id)
         operations.append(glide_client.zadd("taf:updated", {station_id: current_time}))
     
@@ -781,7 +781,7 @@ async def store_sigmet(glide_client: GlideClusterClient, records: List[Dict[str,
             continue
         
         key = f"sigmet:{sigmet_id}"
-        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_SIGMET))
+        operations.append(glide_client.setex(key, TTL_SIGMET, json.dumps(record)))
         sigmet_ids.add(sigmet_id)
         
         # Index by hazard type
@@ -820,7 +820,7 @@ async def store_airmet(glide_client: GlideClusterClient, records: List[Dict[str,
             continue
         
         key = f"airmet:{airmet_id}"
-        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_AIRMET))
+        operations.append(glide_client.setex(key, TTL_AIRMET, json.dumps(record)))
         airmet_ids.add(airmet_id)
         
         hazard = record.get('hazard', 'UNKNOWN')
@@ -857,7 +857,7 @@ async def store_pirep(glide_client: GlideClusterClient, records: List[Dict[str, 
             continue
         
         key = f"pirep:{pirep_id}"
-        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_PIREP))
+        operations.append(glide_client.setex(key, TTL_PIREP, json.dumps(record)))
         pirep_ids.add(pirep_id)
         
         # Add to recent sorted set
@@ -891,7 +891,7 @@ async def store_stations(glide_client: GlideClusterClient, records: List[Dict[st
         
         station_code = station_code.upper()
         key = f"station:{station_code}"
-        operations.append(glide_client.set(key, json.dumps(record), ex=TTL_STATION))
+        operations.append(glide_client.setex(key, TTL_STATION, json.dumps(record)))
         station_codes.add(station_code)
         
         # Index by name

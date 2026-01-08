@@ -50,29 +50,38 @@ async def get_glide_client() -> Optional[GlideClusterClient]:
     """
     global glide_client
     if not ELASTICACHE_ENDPOINT:
+        logger.info("[ElastiCache] No endpoint configured")
         return None
     
     if glide_client is not None:
+        logger.info("[ElastiCache] Checking existing connection")
         try:
             await glide_client.ping()
+            logger.info("[ElastiCache] Existing connection is valid")
             return glide_client
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[ElastiCache] Existing connection failed ping: {str(e)}, creating new")
             try:
                 await glide_client.close()
             except:
                 pass
             glide_client = None
     
+    logger.info(f"[ElastiCache] Creating new connection to {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
     try:
         config = GlideClusterClientConfiguration(
             addresses=[NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)],
             use_tls=True,
             request_timeout=10000,
         )
+        logger.info("[ElastiCache] Configuration created, initializing client")
         glide_client = await GlideClusterClient.create(config)
+        logger.info("[ElastiCache] Client created successfully")
         return glide_client
     except Exception as e:
         logger.error(f"[ElastiCache] Connection failed: {str(e)}")
+        import traceback
+        logger.error(f"[ElastiCache] Traceback: {traceback.format_exc()}")
         glide_client = None
         return None
 
@@ -82,30 +91,45 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
     Fetch METAR data for an airport.
     Cache-first strategy: checks ElastiCache, falls back to API if cache miss.
     """
+    logger.info(f"[METAR] Starting fetch for {airport_code}")
     airport_code = airport_code.upper()
     cache_key = f"metar:{airport_code}"
     
     # Try to get from cache first
+    logger.info(f"[METAR] Getting Glide client for {airport_code}")
     glide_client = await get_glide_client()
     if glide_client:
+        logger.info(f"[METAR] Glide client obtained, checking cache for {airport_code}")
         try:
             cached_data = await glide_client.get(cache_key)
             if cached_data:
+                logger.info(f"[METAR] Cache hit for {airport_code}, transforming data")
                 if isinstance(cached_data, bytes):
                     cached_data = cached_data.decode('utf-8')
                 metar_data = json.loads(cached_data)
-                return transform_metar_from_cache(metar_data, airport_code)
-        except Exception:
-            pass
+                result = transform_metar_from_cache(metar_data, airport_code)
+                logger.info(f"[METAR] Successfully returned cached METAR for {airport_code}")
+                return result
+            else:
+                logger.info(f"[METAR] Cache miss for {airport_code}")
+        except Exception as e:
+            logger.warning(f"[METAR] Cache read error for {airport_code}: {str(e)}")
+    else:
+        logger.info(f"[METAR] No Glide client available for {airport_code}, fetching from API")
     
     # Cache miss or error - fetch from API
+    logger.info(f"[METAR] Fetching from API for {airport_code}")
     try:
         # Use decoded format to get structured fields like skyc1, skyl1, etc.
         url = f"{METAR_URL}?ids={airport_code}&format=json&taf=false&hours=1"
+        logger.info(f"[METAR] Making API request to {url}")
         with urllib.request.urlopen(url, timeout=10) as response:
+            logger.info(f"[METAR] API response received for {airport_code}, parsing data")
             data = json.loads(response.read().decode())
+            logger.info(f"[METAR] Parsed API response for {airport_code}, {len(data)} records")
             
             if not data or len(data) == 0:
+                logger.warning(f"[METAR] No data returned from API for {airport_code}")
                 return {
                     "airportCode": airport_code.upper(),
                     "rawText": "No data available",
@@ -115,6 +139,7 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
             
             # Parse the first METAR (most recent)
             metar = data[0]
+            logger.info(f"[METAR] Processing METAR data for {airport_code}")
             
             # Parse altimeter - AWC API provides altim_in_hg field for inHg directly
             # Fallback to altim field (which may be in hPa) if altim_in_hg is not available
@@ -241,6 +266,9 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
                             except ValueError:
                                 pass
             
+            logger.info(f"[METAR] Parsing sky conditions for {airport_code}")
+            sky_conditions = parse_sky_conditions(metar)
+            logger.info(f"[METAR] Sky conditions parsed for {airport_code}, returning result")
             return {
                 "airportCode": airport_code.upper(),
                 "rawText": metar.get("rawOb", ""),
@@ -252,12 +280,13 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
                 "windGust": wind_gust,
                 "visibility": visibility,
                 "altimeter": altim_inhg,
-                "skyConditions": parse_sky_conditions(metar),
+                "skyConditions": sky_conditions,
                 "flightCategory": metar.get("flightCategory", None),
                 "metarType": metar.get("metarType", None),
                 "elevation": metar.get("elev", None)
             }
     except urllib.error.URLError as e:
+        logger.error(f"[METAR] URL error for {airport_code}: {str(e)}")
         return {
             "airportCode": airport_code.upper(),
             "rawText": f"Error fetching METAR: {str(e)}",
@@ -265,6 +294,9 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
             "error": str(e)
         }
     except Exception as e:
+        logger.error(f"[METAR] Exception processing METAR for {airport_code}: {str(e)}")
+        import traceback
+        logger.error(f"[METAR] Traceback: {traceback.format_exc()}")
         return {
             "airportCode": airport_code.upper(),
             "rawText": f"Error processing METAR: {str(e)}",
@@ -321,8 +353,8 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
                 obs_time = obs_time_str
         else:
             obs_time = str(obs_time).strip()
-        else:
-            obs_time = datetime.utcnow().isoformat() + 'Z'
+    else:
+        obs_time = datetime.utcnow().isoformat() + 'Z'
     
     # Parse visibility - handle both old and new field names
     visibility = metar_data.get("visib", None)
@@ -462,7 +494,7 @@ async def fetch_taf(airport_code: str) -> Dict[str, Any]:
             if glide_client:
                 try:
                     cache_key = f"taf:{airport_code}"
-                    await glide_client.set(cache_key, json.dumps(taf), ex=900)
+                    await glide_client.setex(cache_key, 900, json.dumps(taf))
                 except Exception:
                     pass
             
@@ -558,6 +590,7 @@ def fetch_notams(airport_code: str) -> list:
 
 def parse_sky_conditions(metar: Dict) -> list:
     """Parse sky conditions from METAR data."""
+    logger.info("[METAR] Starting parse_sky_conditions")
     sky_conditions = []
     
     # AWC API provides sky conditions with fields like:
@@ -565,18 +598,8 @@ def parse_sky_conditions(metar: Dict) -> list:
     # skyl1, skyl2, skyl3, skyl4 (cloud base levels in HUNDREDS of feet, e.g., 25 = 2500ft)
     # skyt1, skyt2, skyt3, skyt4 (cloud types, optional)
     
-    # Debug: Log available sky condition fields and all metar keys
     sky_fields = {k: v for k, v in metar.items() if k.startswith('sky')}
-    all_keys = list(metar.keys())
-    print(f"DEBUG: All METAR keys: {all_keys[:20]}...")  # Show first 20 keys
-    if sky_fields:
-        print(f"DEBUG: Sky condition fields found: {sky_fields}")
-    else:
-        print(f"DEBUG: No sky condition fields found. Checking for alternative field names...")
-        # Check for alternative field names
-        alt_fields = {k: v for k, v in metar.items() if 'cloud' in k.lower() or 'sky' in k.lower()}
-        if alt_fields:
-            print(f"DEBUG: Alternative cloud/sky fields: {alt_fields}")
+    logger.info(f"[METAR] Found {len(sky_fields)} sky condition fields")
     
     # Parse up to 4 cloud layers
     for i in range(1, 5):
@@ -657,8 +680,10 @@ def parse_sky_conditions(metar: Dict) -> list:
         
         # If still no cloud layers found, return clear skies
         if not sky_conditions:
+            logger.info("[METAR] No sky conditions found, returning CLR")
             return [{"skyCover": "CLR", "cloudBase": None, "cloudType": None}]
     
+    logger.info(f"[METAR] parse_sky_conditions completed, returning {len(sky_conditions)} conditions")
     return sky_conditions
 
 
@@ -1053,12 +1078,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     arguments = event.get("arguments", {})
     
     async def async_handler():
+        import time
+        start_time = time.time()
+        logger.info(f"[Handler] Processing {field_name} request")
         try:
             if field_name == "getMETAR":
                 airport_code = arguments.get("airportCode")
                 if not airport_code:
                     raise ValueError("airportCode is required")
-                return await fetch_metar(airport_code)
+                logger.info(f"[Handler] Calling fetch_metar for {airport_code}")
+                result = await fetch_metar(airport_code)
+                elapsed = time.time() - start_time
+                logger.info(f"[Handler] getMETAR completed for {airport_code} in {elapsed:.2f}s")
+                return result
             
             elif field_name == "getTAF":
                 airport_code = arguments.get("airportCode")
