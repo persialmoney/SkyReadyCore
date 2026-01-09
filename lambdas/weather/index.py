@@ -494,7 +494,8 @@ async def fetch_taf(airport_code: str) -> Dict[str, Any]:
             if glide_client:
                 try:
                     cache_key = f"taf:{airport_code}"
-                    await glide_client.setex(cache_key, 900, json.dumps(taf))
+                    await glide_client.set(cache_key, json.dumps(taf))
+                    await glide_client.expire(cache_key, 900)
                 except Exception:
                     pass
             
