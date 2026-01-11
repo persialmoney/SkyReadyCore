@@ -20,6 +20,9 @@ from glide import (
 import boto3
 import logging
 
+# Initialize CloudWatch client for custom metrics
+cloudwatch_client = boto3.client('cloudwatch')
+
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -48,6 +51,7 @@ glide_client = None
 async def get_glide_client():
     """
     Get or create Glide cluster client connection.
+    Resets connection on failure to prevent stale connections.
     """
     global glide_client
     if glide_client is None:
@@ -58,10 +62,47 @@ async def get_glide_client():
                 request_timeout=10000,
             )
             glide_client = await GlideClusterClient.create(config)
+            logger.info("Successfully connected to ElastiCache")
         except Exception as e:
             logger.error(f"Failed to connect to ElastiCache: {str(e)}")
+            glide_client = None  # Reset on failure
             raise
     return glide_client
+
+
+def reset_glide_client():
+    """
+    Reset the global Glide client connection.
+    Used when connection errors occur to force reconnection on next invocation.
+    """
+    global glide_client
+    if glide_client is not None:
+        logger.warning("Resetting Glide client connection due to error")
+        glide_client = None
+
+
+async def execute_operations_with_error_logging(operations: List, operation_name: str):
+    """
+    Execute async operations and log any exceptions instead of silently swallowing them.
+    
+    Args:
+        operations: List of async operations to execute
+        operation_name: Name of the operation type for logging context
+    """
+    if not operations:
+        return
+    
+    results = await asyncio.gather(*operations, return_exceptions=True)
+    
+    # Log any exceptions that occurred
+    error_count = 0
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            error_count += 1
+            logger.error(f"[{operation_name}] Operation {i} failed: {type(result).__name__}: {str(result)}")
+    
+    if error_count > 0:
+        logger.warning(f"[{operation_name}] {error_count} out of {len(operations)} operations failed")
 
 
 def download_and_decompress(url: str) -> bytes:
@@ -698,9 +739,8 @@ async def store_metar(glide_client: GlideClusterClient, records: List[Dict[str, 
         # Update sorted set with timestamp
         operations.append(glide_client.zadd("metar:updated", {station_id: current_time}))
     
-    # Execute all operations concurrently
-    if operations:
-        await asyncio.gather(*operations, return_exceptions=True)
+    # Execute all operations concurrently with error logging
+    await execute_operations_with_error_logging(operations, "METAR")
     
     # Update station set
     if station_ids:
@@ -757,8 +797,8 @@ async def store_taf(glide_client: GlideClusterClient, records: List[Dict[str, An
         station_ids.add(station_id)
         operations.append(glide_client.zadd("taf:updated", {station_id: current_time}))
     
-    if operations:
-        await asyncio.gather(*operations, return_exceptions=True)
+    # Execute all operations concurrently with error logging
+    await execute_operations_with_error_logging(operations, "TAF")
     
     if station_ids:
         await glide_client.delete("taf:stations")
@@ -793,8 +833,8 @@ async def store_sigmet(glide_client: GlideClusterClient, records: List[Dict[str,
             hazard_types[hazard] = set()
         hazard_types[hazard].add(sigmet_id)
     
-    if operations:
-        await asyncio.gather(*operations, return_exceptions=True)
+    # Execute all operations concurrently with error logging
+    await execute_operations_with_error_logging(operations, "SIGMET")
     
     # Update indexes
     if sigmet_ids:
@@ -832,8 +872,8 @@ async def store_airmet(glide_client: GlideClusterClient, records: List[Dict[str,
             hazard_types[hazard] = set()
         hazard_types[hazard].add(airmet_id)
     
-    if operations:
-        await asyncio.gather(*operations, return_exceptions=True)
+    # Execute all operations concurrently with error logging
+    await execute_operations_with_error_logging(operations, "AIRMET")
     
     if airmet_ids:
         await glide_client.delete("airmet:all")
@@ -868,8 +908,8 @@ async def store_pirep(glide_client: GlideClusterClient, records: List[Dict[str, 
         # Add to recent sorted set
         operations.append(glide_client.zadd("pirep:recent", {pirep_id: current_time}))
     
-    if operations:
-        await asyncio.gather(*operations, return_exceptions=True)
+    # Execute all operations concurrently with error logging
+    await execute_operations_with_error_logging(operations, "PIREP")
     
     if pirep_ids:
         await glide_client.delete("pirep:all")
@@ -913,8 +953,8 @@ async def store_stations(glide_client: GlideClusterClient, records: List[Dict[st
         if iata:
             iata_index[iata.upper()] = station_code
     
-    if operations:
-        await asyncio.gather(*operations, return_exceptions=True)
+    # Execute all operations concurrently with error logging
+    await execute_operations_with_error_logging(operations, "STATIONS")
     
     # Update indexes
     if station_codes:
@@ -968,21 +1008,31 @@ async def process_cache_file(data_type: str, source_url: str) -> Dict[str, Any]:
             raise ValueError(f"Unknown data type: {data_type}")
         
         # Connect to Glide
-        glide_client = await get_glide_client()
+        try:
+            glide_client = await get_glide_client()
+        except Exception as e:
+            # Reset connection on failure
+            reset_glide_client()
+            raise
         
         # Store records
-        if data_type == "metar":
-            await store_metar(glide_client, records)
-        elif data_type == "taf":
-            await store_taf(glide_client, records)
-        elif data_type == "sigmet":
-            await store_sigmet(glide_client, records)
-        elif data_type == "airmet":
-            await store_airmet(glide_client, records)
-        elif data_type == "pirep":
-            await store_pirep(glide_client, records)
-        elif data_type == "station":
-            await store_stations(glide_client, records)
+        try:
+            if data_type == "metar":
+                await store_metar(glide_client, records)
+            elif data_type == "taf":
+                await store_taf(glide_client, records)
+            elif data_type == "sigmet":
+                await store_sigmet(glide_client, records)
+            elif data_type == "airmet":
+                await store_airmet(glide_client, records)
+            elif data_type == "pirep":
+                await store_pirep(glide_client, records)
+            elif data_type == "station":
+                await store_stations(glide_client, records)
+        except Exception as e:
+            # Reset connection if storage fails (might be connection issue)
+            reset_glide_client()
+            raise
         
         records_processed = len(records)
         
@@ -1028,6 +1078,44 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             
             logger.info(f"Successfully processed {result['recordsProcessed']} {data_type} records in {result['durationSeconds']:.2f}s")
             
+            # Publish success metrics to CloudWatch
+            try:
+                cloudwatch_client.put_metric_data(
+                    Namespace=f"WeatherCache/{STAGE}",
+                    MetricData=[
+                        {
+                            'MetricName': f'{data_type.title()}RecordsProcessed',
+                            'Value': result['recordsProcessed'],
+                            'Unit': 'Count',
+                            'Dimensions': [
+                                {'Name': 'DataType', 'Value': data_type},
+                                {'Name': 'Stage', 'Value': STAGE}
+                            ]
+                        },
+                        {
+                            'MetricName': f'{data_type.title()}Duration',
+                            'Value': result['durationSeconds'],
+                            'Unit': 'Seconds',
+                            'Dimensions': [
+                                {'Name': 'DataType', 'Value': data_type},
+                                {'Name': 'Stage', 'Value': STAGE}
+                            ]
+                        },
+                        {
+                            'MetricName': f'{data_type.title()}Success',
+                            'Value': 1,
+                            'Unit': 'Count',
+                            'Dimensions': [
+                                {'Name': 'DataType', 'Value': data_type},
+                                {'Name': 'Stage', 'Value': STAGE}
+                            ]
+                        }
+                    ]
+                )
+            except Exception as metric_error:
+                # Don't fail the handler if metrics fail
+                logger.warning(f"Failed to publish metrics: {str(metric_error)}")
+            
             return {
                 "statusCode": 200,
                 "body": json.dumps(result)
@@ -1035,11 +1123,34 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             
         except Exception as e:
             logger.error(f"Handler error: {str(e)}", exc_info=True)
+            
+            # Publish error metrics to CloudWatch
+            data_type = event.get('dataType', 'unknown')
+            try:
+                cloudwatch_client.put_metric_data(
+                    Namespace=f"WeatherCache/{STAGE}",
+                    MetricData=[
+                        {
+                            'MetricName': f'{data_type.title()}Errors',
+                            'Value': 1,
+                            'Unit': 'Count',
+                            'Dimensions': [
+                                {'Name': 'DataType', 'Value': data_type},
+                                {'Name': 'Stage', 'Value': STAGE},
+                                {'Name': 'ErrorType', 'Value': type(e).__name__}
+                            ]
+                        }
+                    ]
+                )
+            except Exception as metric_error:
+                # Don't fail the handler if metrics fail
+                logger.warning(f"Failed to publish error metrics: {str(metric_error)}")
+            
             return {
                 "statusCode": 500,
                 "body": json.dumps({
                     "error": str(e),
-                    "dataType": event.get('dataType', 'unknown'),
+                    "dataType": data_type,
                     "timestamp": datetime.utcnow().isoformat() + 'Z'
                 })
             }
