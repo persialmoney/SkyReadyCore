@@ -9,9 +9,22 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Any, Optional
 
-# Initialize DynamoDB client
-dynamodb = boto3.resource('dynamodb')
-users_table = dynamodb.Table(os.environ.get('USERS_TABLE', 'sky-ready-users-dev'))
+# Lazy initialization - DynamoDB resources created on first use to reduce cold start time
+_dynamodb_resource = None
+_users_table = None
+
+
+def get_users_table():
+    """Get DynamoDB table reference with lazy initialization."""
+    global _users_table, _dynamodb_resource
+    
+    if _users_table is None:
+        # Use resource for table operations (simpler API)
+        # Initialize only when needed to reduce cold start time
+        _dynamodb_resource = boto3.resource('dynamodb')
+        _users_table = _dynamodb_resource.Table(os.environ.get('USERS_TABLE', 'sky-ready-users-dev'))
+    
+    return _users_table
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -112,6 +125,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Add expression names if we have any (for reserved words like 'name')
         if expression_names:
             update_params['ExpressionAttributeNames'] = expression_names
+        
+        # Get table reference (lazy initialization reduces cold start time)
+        users_table = get_users_table()
         
         # Perform the update
         response = users_table.update_item(**update_params)
