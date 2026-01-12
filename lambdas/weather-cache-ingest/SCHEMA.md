@@ -84,7 +84,7 @@ metar:updated → Sorted SET (ZSET) of station IDs by update timestamp
 ```
 
 ### TTL
-- **120 seconds** (2 minutes) - provides buffer beyond 1-minute update frequency
+- **3600 seconds** (1 hour) - expires after 1 hour unless updated
 
 ### Example Keys
 ```
@@ -159,7 +159,7 @@ taf:updated → Sorted SET (ZSET) of station IDs by update timestamp
 ```
 
 ### TTL
-- **900 seconds** (15 minutes) - provides buffer beyond 10-minute update frequency
+- **3600 seconds** (1 hour) - expires after 1 hour unless updated
 
 ### Example Keys
 ```

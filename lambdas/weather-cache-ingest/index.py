@@ -37,8 +37,8 @@ CACHE_FILES_BUCKET = os.environ.get('CACHE_FILES_BUCKET')
 STAGE = os.environ.get('STAGE', 'dev')
 
 # TTL values (in seconds)
-TTL_METAR = 120  # 2 minutes
-TTL_TAF = 900  # 15 minutes
+TTL_METAR = 3600  # 1 hour
+TTL_TAF = 3600  # 1 hour
 TTL_SIGMET = 120  # 2 minutes
 TTL_AIRMET = 120  # 2 minutes
 TTL_PIREP = 120  # 2 minutes

@@ -145,8 +145,8 @@ station:iata:{iata}      → String mapping IATA to ICAO code
 
 Time-to-live values ensure data freshness:
 
-- **METAR**: 120 seconds (2 minutes) - buffer beyond 1-minute updates
-- **TAF**: 900 seconds (15 minutes) - buffer beyond 10-minute updates
+- **METAR**: 3600 seconds (1 hour) - expires after 1 hour unless updated
+- **TAF**: 3600 seconds (1 hour) - expires after 1 hour unless updated
 - **SIGMET/AIRMET**: 120 seconds (2 minutes)
 - **PIREP**: 120 seconds (2 minutes)
 - **Stations**: 90000 seconds (25 hours) - buffer beyond daily updates
