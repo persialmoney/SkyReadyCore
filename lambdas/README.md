@@ -27,7 +27,7 @@ Scheduled function that downloads bulk cache files from AWC and populates Elasti
 **Handler**: `index.handler`  
 **Runtime**: Python 3.11  
 **Function Name**: `sky-ready-weather-cache-ingest-{stage}`  
-**Trigger**: EventBridge schedules (METAR/SIGMET/AIRMET/PIREP: 1 min, TAF: 10 min, Stations: daily)
+**Trigger**: EventBridge schedules (METAR/SIGMET/AIRMET/PIREP: 5 min, TAF: 10 min, Stations: daily)
 
 **Usage**: Background job to keep weather cache populated with latest data from AWC cache API.
 

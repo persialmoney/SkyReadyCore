@@ -21,7 +21,7 @@ SkyReady uses AWS ElastiCache ValKey to cache aviation weather data from the Avi
 ┌─────────────────────────────────────────────────────────────┐
 │  Cache Ingest Lambda (weather-cache-ingest)                 │
 │  Triggered by EventBridge:                                  │
-│  - METAR/SIGMET/AIRMET/PIREP: Every 1 minute               │
+│  - METAR/SIGMET/AIRMET/PIREP: Every 5 minutes               │
 │  - TAF: Every 10 minutes                                    │
 │  - Stations: Daily at midnight UTC                          │
 │                                                              │
@@ -57,7 +57,7 @@ SkyReady uses AWS ElastiCache ValKey to cache aviation weather data from the Avi
 **Purpose**: Downloads bulk cache files from AWC and stores parsed data in ElastiCache ValKey.
 
 **Trigger**: EventBridge rules with different schedules:
-- **METAR, SIGMET, G-AIRMET, PIREP**: Every 1 minute
+- **METAR, SIGMET, G-AIRMET, PIREP**: Every 5 minutes
 - **TAF**: Every 10 minutes
 - **Stations**: Daily at 00:00 UTC
 

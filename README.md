@@ -62,7 +62,7 @@ Scheduled function that downloads bulk cache files from AWC and populates Elasti
 - **Handler**: `index.handler`
 - **Runtime**: Python 3.11
 - **Trigger**: EventBridge schedules
-  - METAR/SIGMET/AIRMET/PIREP: Every 1 minute
+  - METAR/SIGMET/AIRMET/PIREP: Every 5 minutes
   - TAF: Every 10 minutes
   - Stations: Daily at midnight UTC
 - **Function Name**: `sky-ready-weather-cache-ingest-{stage}`
