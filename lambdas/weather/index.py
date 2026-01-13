@@ -56,9 +56,17 @@ async def get_glide_client() -> Optional[GlideClusterClient]:
     if glide_client is not None:
         logger.info("[ElastiCache] Checking existing connection")
         try:
-            await glide_client.ping()
+            # Use 1-second timeout for ping to fail fast if connection is stale
+            await asyncio.wait_for(glide_client.ping(), timeout=1.0)
             logger.info("[ElastiCache] Existing connection is valid")
             return glide_client
+        except asyncio.TimeoutError:
+            logger.warning("[ElastiCache] Ping timeout - connection is stale, closing and creating new")
+            try:
+                await glide_client.close()
+            except:
+                pass
+            glide_client = None
         except Exception as e:
             logger.warning(f"[ElastiCache] Existing connection failed ping: {str(e)}, creating new")
             try:
@@ -1150,6 +1158,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "fieldName": field_name,
                 "arguments": arguments
             }
+        finally:
+            # Cleanup: close Glide client connection after handler completes
+            # This prevents stale connections from persisting across Lambda invocations
+            global glide_client
+            if glide_client is not None:
+                try:
+                    logger.info("[Handler] Closing Glide client connection")
+                    await glide_client.close()
+                    logger.info("[Handler] Glide client connection closed successfully")
+                except Exception as e:
+                    logger.warning(f"[Handler] Error closing Glide client: {str(e)}")
+                finally:
+                    glide_client = None
     
     # Run async handler
     return asyncio.run(async_handler())
