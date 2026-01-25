@@ -748,6 +748,9 @@ async def store_metar(glide_client: GlideClusterClient, records: List[Dict[str, 
         # SADD with multiple members
         for station_id in station_ids:
             await glide_client.sadd("metar:stations", station_id)
+        # Set TTL on index keys
+        await glide_client.expire("metar:stations", TTL_METAR)
+        await glide_client.expire("metar:updated", TTL_METAR)
     
     logger.info(f"[Cache Store] Stored {len(station_ids)} METAR records, skipped {skipped_count} records")
     if station_ids:
@@ -804,6 +807,9 @@ async def store_taf(glide_client: GlideClusterClient, records: List[Dict[str, An
         await glide_client.delete("taf:stations")
         for station_id in station_ids:
             await glide_client.sadd("taf:stations", station_id)
+        # Set TTL on index keys
+        await glide_client.expire("taf:stations", TTL_TAF)
+        await glide_client.expire("taf:updated", TTL_TAF)
     
     logger.info(f"[Cache Store] Stored {len(station_ids)} TAF records, skipped {skipped_count} records")
     if station_ids:
@@ -841,12 +847,16 @@ async def store_sigmet(glide_client: GlideClusterClient, records: List[Dict[str,
         await glide_client.delete("sigmet:all")
         for sigmet_id in sigmet_ids:
             await glide_client.sadd("sigmet:all", sigmet_id)
+        # Set TTL on index key
+        await glide_client.expire("sigmet:all", TTL_SIGMET)
     
     for hazard, ids in hazard_types.items():
         hazard_key = f"sigmet:hazard:{hazard}"
         await glide_client.delete(hazard_key)
         for sigmet_id in ids:
             await glide_client.sadd(hazard_key, sigmet_id)
+        # Set TTL on hazard index key
+        await glide_client.expire(hazard_key, TTL_SIGMET)
     
     logger.info(f"Stored {len(sigmet_ids)} SIGMET records")
 
@@ -879,12 +889,16 @@ async def store_airmet(glide_client: GlideClusterClient, records: List[Dict[str,
         await glide_client.delete("airmet:all")
         for airmet_id in airmet_ids:
             await glide_client.sadd("airmet:all", airmet_id)
+        # Set TTL on index key
+        await glide_client.expire("airmet:all", TTL_AIRMET)
     
     for hazard, ids in hazard_types.items():
         hazard_key = f"airmet:hazard:{hazard}"
         await glide_client.delete(hazard_key)
         for airmet_id in ids:
             await glide_client.sadd(hazard_key, airmet_id)
+        # Set TTL on hazard index key
+        await glide_client.expire(hazard_key, TTL_AIRMET)
     
     logger.info(f"Stored {len(airmet_ids)} G-AIRMET records")
 
@@ -915,9 +929,13 @@ async def store_pirep(glide_client: GlideClusterClient, records: List[Dict[str, 
         await glide_client.delete("pirep:all")
         for pirep_id in pirep_ids:
             await glide_client.sadd("pirep:all", pirep_id)
+        # Set TTL on index key
+        await glide_client.expire("pirep:all", TTL_PIREP)
     
     # Keep only last 1000 PIREPs in recent set
     await glide_client.zremrangebyrank("pirep:recent", 0, -1001)
+    # Set TTL on recent sorted set
+    await glide_client.expire("pirep:recent", TTL_PIREP)
     
     logger.info(f"Stored {len(pirep_ids)} PIREP records")
 
@@ -961,6 +979,8 @@ async def store_stations(glide_client: GlideClusterClient, records: List[Dict[st
         await glide_client.delete("station:all")
         for station_code in station_codes:
             await glide_client.sadd("station:all", station_code)
+        # Set TTL on index key
+        await glide_client.expire("station:all", TTL_STATION)
     
     # Update name index
     for name, codes in name_index.items():
@@ -968,10 +988,15 @@ async def store_stations(glide_client: GlideClusterClient, records: List[Dict[st
         await glide_client.delete(name_key)
         for code in codes:
             await glide_client.sadd(name_key, code)
+        # Set TTL on name index key
+        await glide_client.expire(name_key, TTL_STATION)
     
     # Update IATA index
     for iata, icao in iata_index.items():
-        await glide_client.set(f"station:iata:{iata}", icao)
+        iata_key = f"station:iata:{iata}"
+        await glide_client.set(iata_key, icao)
+        # Set TTL on IATA index key
+        await glide_client.expire(iata_key, TTL_STATION)
     
     logger.info(f"Stored {len(station_codes)} station records")
 

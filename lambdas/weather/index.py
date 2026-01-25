@@ -137,10 +137,11 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
             logger.info(f"[METAR] Parsed API response for {airport_code}, {len(data)} records")
             
             if not data or len(data) == 0:
-                logger.warning(f"[METAR] No data returned from API for {airport_code}")
+                # METAR not found - return user-friendly message
+                logger.info(f"METAR not found for {airport_code} - API returned empty data")
                 return {
                     "airportCode": airport_code.upper(),
-                    "rawText": "No data available",
+                    "rawText": "METAR not found for this airport",
                     "observationTime": datetime.utcnow().isoformat(),
                     "error": "No METAR data found for this airport"
                 }
@@ -148,6 +149,18 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
             # Parse the first METAR (most recent)
             metar = data[0]
             logger.info(f"[METAR] Processing METAR data for {airport_code}")
+            
+            # Check if METAR data is actually valid (has rawText)
+            raw_text = metar.get("rawOb", "") or metar.get("rawText", "")
+            if not raw_text or raw_text.strip() == "":
+                # METAR data exists but has no content - treat as not found
+                logger.info(f"METAR data for {airport_code} has no rawText - treating as not found")
+                return {
+                    "airportCode": airport_code.upper(),
+                    "rawText": "METAR not found for this airport",
+                    "observationTime": datetime.utcnow().isoformat(),
+                    "error": "No METAR data found for this airport"
+                }
             
             # Parse altimeter - AWC API provides altim_in_hg field for inHg directly
             # Fallback to altim field (which may be in hPa) if altim_in_hg is not available
@@ -275,11 +288,23 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
                                 pass
             
             logger.info(f"[METAR] Parsing sky conditions for {airport_code}")
-            sky_conditions = parse_sky_conditions(metar)
+            try:
+                sky_conditions = parse_sky_conditions(metar)
+            except Exception as parse_error:
+                # If parsing fails, log it but treat as "not found" rather than error
+                logger.warning(f"Failed to parse METAR sky conditions for {airport_code}: {str(parse_error)}")
+                logger.info(f"Treating parsing failure as METAR not found for {airport_code}")
+                return {
+                    "airportCode": airport_code.upper(),
+                    "rawText": "METAR not found for this airport",
+                    "observationTime": datetime.utcnow().isoformat(),
+                    "error": "No METAR data found for this airport"
+                }
+            
             logger.info(f"[METAR] Sky conditions parsed for {airport_code}, returning result")
             return {
                 "airportCode": airport_code.upper(),
-                "rawText": metar.get("rawOb", ""),
+                "rawText": raw_text,
                 "observationTime": obs_time,
                 "temperature": metar.get("temp", None),
                 "dewpoint": metar.get("dewp", None),
@@ -295,9 +320,11 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
             }
     except urllib.error.URLError as e:
         logger.error(f"[METAR] URL error for {airport_code}: {str(e)}")
+        import traceback
+        logger.error(f"[METAR] Traceback: {traceback.format_exc()}")
         return {
             "airportCode": airport_code.upper(),
-            "rawText": f"Error fetching METAR: {str(e)}",
+            "rawText": "Unable to retrieve METAR data",
             "observationTime": datetime.utcnow().isoformat(),
             "error": str(e)
         }
@@ -307,7 +334,7 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
         logger.error(f"[METAR] Traceback: {traceback.format_exc()}")
         return {
             "airportCode": airport_code.upper(),
-            "rawText": f"Error processing METAR: {str(e)}",
+            "rawText": "Unable to retrieve METAR data",
             "observationTime": datetime.utcnow().isoformat(),
             "error": str(e)
         }
@@ -315,6 +342,31 @@ async def fetch_metar(airport_code: str) -> Dict[str, Any]:
 
 def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) -> Dict[str, Any]:
     """Transform cached METAR data to expected format."""
+    # Check if this is an error state from cache
+    raw_text = metar_data.get("rawOb", "") or metar_data.get("rawText", "") or ""
+    
+    # If rawText indicates an error state or is empty, preserve it and skip parsing
+    if raw_text in ["METAR not found for this airport", "Unable to retrieve METAR data"] or not raw_text.strip():
+        if not raw_text.strip():
+            # Empty rawText in cache - treat as not found
+            raw_text = "METAR not found for this airport"
+        return {
+            "airportCode": airport_code,
+            "rawText": raw_text,
+            "observationTime": datetime.utcnow().isoformat(),
+            "temperature": None,
+            "dewpoint": None,
+            "windDirection": None,
+            "windSpeed": None,
+            "windGust": None,
+            "visibility": None,
+            "altimeter": None,
+            "skyConditions": [],
+            "flightCategory": None,
+            "metarType": None,
+            "elevation": None
+        }
+    
     # Parse altimeter
     altim_inhg = None
     if "altim_in_hg" in metar_data:
@@ -421,9 +473,33 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
         logger.warning(f"Invalid observation time for {airport_code}, using current time")
         obs_time = datetime.utcnow().isoformat() + 'Z'
     
+    # Try to parse sky conditions, but handle parsing errors gracefully
+    try:
+        sky_conditions = parse_sky_conditions(metar_data)
+    except Exception as parse_error:
+        # If parsing fails, log it but treat as "not found" rather than error
+        logger.warning(f"Failed to parse cached METAR sky conditions for {airport_code}: {str(parse_error)}")
+        logger.info(f"Treating parsing failure as METAR not found for {airport_code}")
+        return {
+            "airportCode": airport_code,
+            "rawText": "METAR not found for this airport",
+            "observationTime": str(obs_time).strip(),
+            "temperature": None,
+            "dewpoint": None,
+            "windDirection": None,
+            "windSpeed": None,
+            "windGust": None,
+            "visibility": None,
+            "altimeter": None,
+            "skyConditions": [],
+            "flightCategory": None,
+            "metarType": None,
+            "elevation": None
+        }
+    
     result = {
         "airportCode": airport_code,
-        "rawText": metar_data.get("rawOb", metar_data.get("raw_text", "")),
+        "rawText": raw_text if raw_text else metar_data.get("rawOb", metar_data.get("raw_text", "")),
         "observationTime": str(obs_time).strip(),  # Ensure it's always a string
         "temperature": metar_data.get("temp", None),
         "dewpoint": metar_data.get("dewp", None),
@@ -432,7 +508,7 @@ def transform_metar_from_cache(metar_data: Dict[str, Any], airport_code: str) ->
         "windGust": wind_gust,
         "visibility": visibility,
         "altimeter": altim_inhg,
-        "skyConditions": parse_sky_conditions(metar_data),
+        "skyConditions": sky_conditions,
         "flightCategory": metar_data.get("flightCategory", None),
         "metarType": metar_data.get("metarType", None),
         "elevation": metar_data.get("elev", None)
@@ -471,11 +547,12 @@ async def fetch_taf(airport_code: str) -> Dict[str, Any]:
             data = json.loads(response.read().decode())
             
             if not data or len(data) == 0:
-                # Return valid TAF structure with all required non-nullable fields
+                # TAF not found - return user-friendly message
+                logger.info(f"TAF not found for {airport_code} - API returned empty data")
                 current_time = datetime.utcnow().isoformat()
                 return {
                     "airportCode": airport_code.upper(),
-                    "rawText": "No data available",
+                    "rawText": "TAF not found for this airport",
                     "issueTime": current_time,
                     "validTimeFrom": current_time,
                     "validTimeTo": current_time,
@@ -484,13 +561,46 @@ async def fetch_taf(airport_code: str) -> Dict[str, Any]:
                 }
             
             taf = data[0]
-            parsed_forecast = parse_taf_forecast(taf)
+            
+            # Check if TAF data is actually valid (has rawText)
+            raw_text = taf.get("rawTAF") or taf.get("rawText") or ""
+            if not raw_text or raw_text.strip() == "":
+                # TAF data exists but has no content - treat as not found
+                logger.info(f"TAF data for {airport_code} has no rawText - treating as not found")
+                current_time = datetime.utcnow().isoformat()
+                return {
+                    "airportCode": airport_code.upper(),
+                    "rawText": "TAF not found for this airport",
+                    "issueTime": current_time,
+                    "validTimeFrom": current_time,
+                    "validTimeTo": current_time,
+                    "remarks": "",
+                    "forecast": []  # Empty list is valid for [TAFForecast!]!
+                }
+            
+            # Try to parse forecast, but handle parsing errors gracefully
+            try:
+                parsed_forecast = parse_taf_forecast(taf)
+            except Exception as parse_error:
+                # If parsing fails, log it but treat as "not found" rather than error
+                logger.warning(f"Failed to parse TAF forecast for {airport_code}: {str(parse_error)}")
+                logger.info(f"Treating parsing failure as TAF not found for {airport_code}")
+                current_time = datetime.utcnow().isoformat()
+                return {
+                    "airportCode": airport_code.upper(),
+                    "rawText": "TAF not found for this airport",
+                    "issueTime": current_time,
+                    "validTimeFrom": current_time,
+                    "validTimeTo": current_time,
+                    "remarks": "",
+                    "forecast": []  # Empty list is valid for [TAFForecast!]!
+                }
             
             # Ensure all non-nullable fields have values (never None)
             current_time = datetime.utcnow().isoformat()
             result = {
                 "airportCode": airport_code,
-                "rawText": taf.get("rawTAF") or taf.get("rawText") or "",
+                "rawText": raw_text,
                 "issueTime": taf.get("issueTime") or current_time,
                 "validTimeFrom": taf.get("validTimeFrom") or current_time,
                 "validTimeTo": taf.get("validTimeTo") or current_time,
@@ -510,10 +620,12 @@ async def fetch_taf(airport_code: str) -> Dict[str, Any]:
             return result
     except urllib.error.URLError as e:
         logger.error(f"Network error fetching TAF for {airport_code}: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         current_time = datetime.utcnow().isoformat()
         return {
             "airportCode": airport_code.upper(),
-            "rawText": "Error fetching TAF data",
+            "rawText": "Unable to retrieve TAF data",
             "issueTime": current_time,
             "validTimeFrom": current_time,
             "validTimeTo": current_time,
@@ -522,10 +634,12 @@ async def fetch_taf(airport_code: str) -> Dict[str, Any]:
         }
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error for TAF {airport_code}: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         current_time = datetime.utcnow().isoformat()
         return {
             "airportCode": airport_code.upper(),
-            "rawText": "Error parsing TAF data",
+            "rawText": "Unable to retrieve TAF data",
             "issueTime": current_time,
             "validTimeFrom": current_time,
             "validTimeTo": current_time,
@@ -534,10 +648,12 @@ async def fetch_taf(airport_code: str) -> Dict[str, Any]:
         }
     except Exception as e:
         logger.error(f"Unexpected error fetching TAF for {airport_code}: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         current_time = datetime.utcnow().isoformat()
         return {
             "airportCode": airport_code.upper(),
-            "rawText": "Error fetching TAF data",
+            "rawText": "Unable to retrieve TAF data",
             "issueTime": current_time,
             "validTimeFrom": current_time,
             "validTimeTo": current_time,
@@ -550,10 +666,45 @@ def transform_taf_from_cache(taf_data: Dict[str, Any], airport_code: str) -> Dic
     """Transform cached TAF data to expected format."""
     # Ensure all non-nullable fields have values (never None)
     current_time = datetime.utcnow().isoformat()
-    parsed_forecast = parse_taf_forecast(taf_data)
+    
+    # Check if this is an error state from cache
+    raw_text = taf_data.get("rawTAF") or taf_data.get("rawText") or ""
+    
+    # If rawText indicates an error state or is empty, preserve it and skip parsing
+    if raw_text in ["TAF not found for this airport", "Unable to retrieve TAF data"] or not raw_text.strip():
+        if not raw_text.strip():
+            # Empty rawText in cache - treat as not found
+            raw_text = "TAF not found for this airport"
+        return {
+            "airportCode": airport_code,
+            "rawText": raw_text,
+            "issueTime": taf_data.get("issueTime") or current_time,
+            "validTimeFrom": taf_data.get("validTimeFrom") or current_time,
+            "validTimeTo": taf_data.get("validTimeTo") or current_time,
+            "remarks": taf_data.get("remarks") or "",
+            "forecast": []  # Empty list for error/not found states
+        }
+    
+    # Try to parse forecast, but handle parsing errors gracefully
+    try:
+        parsed_forecast = parse_taf_forecast(taf_data)
+    except Exception as parse_error:
+        # If parsing fails, log it but treat as "not found" rather than error
+        logger.warning(f"Failed to parse cached TAF forecast for {airport_code}: {str(parse_error)}")
+        logger.info(f"Treating parsing failure as TAF not found for {airport_code}")
+        return {
+            "airportCode": airport_code,
+            "rawText": "TAF not found for this airport",
+            "issueTime": taf_data.get("issueTime") or current_time,
+            "validTimeFrom": taf_data.get("validTimeFrom") or current_time,
+            "validTimeTo": taf_data.get("validTimeTo") or current_time,
+            "remarks": taf_data.get("remarks") or "",
+            "forecast": []  # Empty list for parsing failures
+        }
+    
     return {
         "airportCode": airport_code,
-        "rawText": taf_data.get("rawTAF") or taf_data.get("rawText") or "",
+        "rawText": raw_text,
         "issueTime": taf_data.get("issueTime") or current_time,
         "validTimeFrom": taf_data.get("validTimeFrom") or current_time,
         "validTimeTo": taf_data.get("validTimeTo") or current_time,
