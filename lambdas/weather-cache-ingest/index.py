@@ -17,6 +17,7 @@ from glide import (
     GlideClusterClientConfiguration,
     NodeAddress,
 )
+from glide.async_commands.batch import Batch
 import boto3
 import logging
 
@@ -735,22 +736,28 @@ async def store_metar(glide_client: GlideClusterClient, records: List[Dict[str, 
         operations.append(glide_client.set(key, json.dumps(record)))
         operations.append(glide_client.expire(key, TTL_METAR))
         station_ids.add(station_id)
-        
-        # Update sorted set with timestamp
-        operations.append(glide_client.zadd("metar:updated", {station_id: current_time}))
     
     # Execute all operations concurrently with error logging
     await execute_operations_with_error_logging(operations, "METAR")
     
-    # Update station set
+    # Update station set and updated ZSET atomically
     if station_ids:
-        await glide_client.delete("metar:stations")
-        # SADD with multiple members
+        # Create atomic batch for index updates (prevents race conditions)
+        batch = Batch(is_atomic=True)
+        batch.delete("metar:stations")
+        batch.delete("metar:updated")
+        
+        # Add all SET and ZSET entries
         for station_id in station_ids:
-            await glide_client.sadd("metar:stations", station_id)
-        # Set TTL on index keys
-        await glide_client.expire("metar:stations", TTL_METAR)
-        await glide_client.expire("metar:updated", TTL_METAR)
+            batch.sadd("metar:stations", station_id)
+            batch.zadd("metar:updated", {station_id: current_time})
+        
+        # Set TTLs
+        batch.expire("metar:stations", TTL_METAR)
+        batch.expire("metar:updated", TTL_METAR)
+        
+        # Execute atomically (all-or-nothing)
+        await glide_client.exec(batch, False)
     
     logger.info(f"[Cache Store] Stored {len(station_ids)} METAR records, skipped {skipped_count} records")
     if station_ids:
@@ -798,18 +805,27 @@ async def store_taf(glide_client: GlideClusterClient, records: List[Dict[str, An
         operations.append(glide_client.set(key, json.dumps(record)))
         operations.append(glide_client.expire(key, TTL_TAF))
         station_ids.add(station_id)
-        operations.append(glide_client.zadd("taf:updated", {station_id: current_time}))
     
     # Execute all operations concurrently with error logging
     await execute_operations_with_error_logging(operations, "TAF")
     
     if station_ids:
-        await glide_client.delete("taf:stations")
+        # Create atomic batch for index updates (prevents race conditions)
+        batch = Batch(is_atomic=True)
+        batch.delete("taf:stations")
+        batch.delete("taf:updated")
+        
+        # Add all SET and ZSET entries
         for station_id in station_ids:
-            await glide_client.sadd("taf:stations", station_id)
-        # Set TTL on index keys
-        await glide_client.expire("taf:stations", TTL_TAF)
-        await glide_client.expire("taf:updated", TTL_TAF)
+            batch.sadd("taf:stations", station_id)
+            batch.zadd("taf:updated", {station_id: current_time})
+        
+        # Set TTLs
+        batch.expire("taf:stations", TTL_TAF)
+        batch.expire("taf:updated", TTL_TAF)
+        
+        # Execute atomically (all-or-nothing)
+        await glide_client.exec(batch, False)
     
     logger.info(f"[Cache Store] Stored {len(station_ids)} TAF records, skipped {skipped_count} records")
     if station_ids:
