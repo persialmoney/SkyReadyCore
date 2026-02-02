@@ -17,7 +17,7 @@ from glide import (
     GlideClusterClientConfiguration,
     NodeAddress,
 )
-from glide.async_commands.batch import Batch
+from glide.async_commands.cluster_batch import ClusterBatch
 import boto3
 import logging
 
@@ -744,7 +744,7 @@ async def store_metar(glide_client: GlideClusterClient, records: List[Dict[str, 
     if station_ids:
         try:
             # Try atomic batch first
-            batch = Batch(is_atomic=True)
+            batch = ClusterBatch(is_atomic=True)
             batch.delete("metar:stations")
             batch.delete("metar:updated")
             
@@ -830,7 +830,7 @@ async def store_taf(glide_client: GlideClusterClient, records: List[Dict[str, An
     if station_ids:
         try:
             # Try atomic batch first
-            batch = Batch(is_atomic=True)
+            batch = ClusterBatch(is_atomic=True)
             batch.delete("taf:stations")
             batch.delete("taf:updated")
             
