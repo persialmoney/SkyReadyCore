@@ -17,7 +17,6 @@ from glide import (
     GlideClusterClientConfiguration,
     NodeAddress,
 )
-from glide.async_commands.cluster_batch import ClusterBatch
 import boto3
 import logging
 
@@ -740,42 +739,18 @@ async def store_metar(glide_client: GlideClusterClient, records: List[Dict[str, 
     # Execute all operations concurrently with error logging
     await execute_operations_with_error_logging(operations, "METAR")
     
-    # Update station set and updated ZSET atomically
+    # Update station set and updated ZSET
     if station_ids:
         try:
-            # Try atomic batch first
-            batch = ClusterBatch(is_atomic=True)
-            batch.delete("metar:stations")
-            batch.delete("metar:updated")
-            
-            # Add all SET and ZSET entries
+            await glide_client.delete("metar:stations")
+            await glide_client.delete("metar:updated")
             for station_id in station_ids:
-                batch.sadd("metar:stations", station_id)
-                batch.zadd("metar:updated", {station_id: current_time})
-            
-            # Set TTLs
-            batch.expire("metar:stations", TTL_METAR)
-            batch.expire("metar:updated", TTL_METAR)
-            
-            # Execute atomically (all-or-nothing)
-            await glide_client.exec(batch, False)
-            logger.debug(f"[Cache Store] Successfully updated METAR indexes atomically")
-        except Exception as batch_error:
-            # Fallback to non-atomic operations if batch fails
-            logger.error(f"[Cache Store] Atomic batch failed for METAR indexes: {type(batch_error).__name__}: {str(batch_error)}")
-            logger.warning(f"[Cache Store] Falling back to non-atomic index updates")
-            try:
-                await glide_client.delete("metar:stations")
-                await glide_client.delete("metar:updated")
-                for station_id in station_ids:
-                    await glide_client.sadd("metar:stations", station_id)
-                    await glide_client.zadd("metar:updated", {station_id: current_time})
-                await glide_client.expire("metar:stations", TTL_METAR)
-                await glide_client.expire("metar:updated", TTL_METAR)
-                logger.info(f"[Cache Store] Successfully updated METAR indexes (non-atomic fallback)")
-            except Exception as fallback_error:
-                logger.error(f"[Cache Store] Fallback also failed: {type(fallback_error).__name__}: {str(fallback_error)}")
-                # Don't raise - individual records are already stored
+                await glide_client.sadd("metar:stations", station_id)
+                await glide_client.zadd("metar:updated", {station_id: current_time})
+            await glide_client.expire("metar:stations", TTL_METAR)
+            await glide_client.expire("metar:updated", TTL_METAR)
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update METAR indexes: {type(error).__name__}: {str(error)}")
     
     logger.info(f"[Cache Store] Stored {len(station_ids)} METAR records, skipped {skipped_count} records")
     if station_ids:
@@ -829,39 +804,15 @@ async def store_taf(glide_client: GlideClusterClient, records: List[Dict[str, An
     
     if station_ids:
         try:
-            # Try atomic batch first
-            batch = ClusterBatch(is_atomic=True)
-            batch.delete("taf:stations")
-            batch.delete("taf:updated")
-            
-            # Add all SET and ZSET entries
+            await glide_client.delete("taf:stations")
+            await glide_client.delete("taf:updated")
             for station_id in station_ids:
-                batch.sadd("taf:stations", station_id)
-                batch.zadd("taf:updated", {station_id: current_time})
-            
-            # Set TTLs
-            batch.expire("taf:stations", TTL_TAF)
-            batch.expire("taf:updated", TTL_TAF)
-            
-            # Execute atomically (all-or-nothing)
-            await glide_client.exec(batch, False)
-            logger.debug(f"[Cache Store] Successfully updated TAF indexes atomically")
-        except Exception as batch_error:
-            # Fallback to non-atomic operations if batch fails
-            logger.error(f"[Cache Store] Atomic batch failed for TAF indexes: {type(batch_error).__name__}: {str(batch_error)}")
-            logger.warning(f"[Cache Store] Falling back to non-atomic index updates")
-            try:
-                await glide_client.delete("taf:stations")
-                await glide_client.delete("taf:updated")
-                for station_id in station_ids:
-                    await glide_client.sadd("taf:stations", station_id)
-                    await glide_client.zadd("taf:updated", {station_id: current_time})
-                await glide_client.expire("taf:stations", TTL_TAF)
-                await glide_client.expire("taf:updated", TTL_TAF)
-                logger.info(f"[Cache Store] Successfully updated TAF indexes (non-atomic fallback)")
-            except Exception as fallback_error:
-                logger.error(f"[Cache Store] Fallback also failed: {type(fallback_error).__name__}: {str(fallback_error)}")
-                # Don't raise - individual records are already stored
+                await glide_client.sadd("taf:stations", station_id)
+                await glide_client.zadd("taf:updated", {station_id: current_time})
+            await glide_client.expire("taf:stations", TTL_TAF)
+            await glide_client.expire("taf:updated", TTL_TAF)
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update TAF indexes: {type(error).__name__}: {str(error)}")
     
     logger.info(f"[Cache Store] Stored {len(station_ids)} TAF records, skipped {skipped_count} records")
     if station_ids:
