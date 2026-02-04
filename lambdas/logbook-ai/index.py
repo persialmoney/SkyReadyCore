@@ -196,10 +196,20 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
     """
     try:
-        identity = event.get('identity', {})
+        # Extract common data with defensive null checks
+        identity = event.get('identity') if event else {}
+        if identity is None:
+            identity = {}
+        
+        arguments = event.get('arguments') if event else {}
+        if arguments is None:
+            arguments = {}
+        
+        info = event.get('info') if event else {}
+        if info is None:
+            info = {}
+        
         user_id = identity.get('sub')
-        arguments = event.get('arguments', {})
-        info = event.get('info', {})
         field_name = info.get('fieldName', '')
         
         if not user_id:
@@ -214,15 +224,21 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             raise ValueError(f"Unknown field name: {field_name}")
     
     except Exception as e:
+        import traceback
         error_message = f"Error in logbook AI operation: {str(e)}"
         print(f"[LogbookAI] ERROR: {error_message}")
-        print(f"[LogbookAI] fieldName: {event.get('info', {}).get('fieldName', 'UNKNOWN')}")
+        print(f"[LogbookAI] Full traceback: {traceback.format_exc()}")
+        print(f"[LogbookAI] Event received: {json.dumps(event, default=str)}")
+        print(f"[LogbookAI] fieldName: {event.get('info', {}).get('fieldName', 'UNKNOWN') if event and event.get('info') else 'UNKNOWN'}")
         print(f"[LogbookAI] userId: {event.get('identity', {}).get('sub', 'UNKNOWN')}")
         raise Exception(error_message)
 
 
 def handle_semantic_search(user_id: str, arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Perform semantic search using vector similarity"""
+    if arguments is None:
+        arguments = {}
+    
     query_text = arguments.get('query', '')
     limit = arguments.get('limit', 10)
     
@@ -268,6 +284,9 @@ def handle_semantic_search(user_id: str, arguments: Dict[str, Any]) -> List[Dict
 
 def handle_chat_query(user_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle conversational AI query about logbook"""
+    if arguments is None:
+        arguments = {}
+    
     query = arguments.get('query', '')
     
     if not query:

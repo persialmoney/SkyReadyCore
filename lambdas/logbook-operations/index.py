@@ -228,11 +228,20 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
     """
     try:
-        # Extract common data
-        identity = event.get('identity', {})
+        # Extract common data with defensive null checks
+        identity = event.get('identity') if event else {}
+        if identity is None:
+            identity = {}
+        
+        arguments = event.get('arguments') if event else {}
+        if arguments is None:
+            arguments = {}
+        
+        info = event.get('info') if event else {}
+        if info is None:
+            info = {}
+        
         user_id = identity.get('sub')
-        arguments = event.get('arguments', {})
-        info = event.get('info', {})
         field_name = info.get('fieldName', '')
         
         if not user_id:
@@ -257,15 +266,21 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             raise ValueError(f"Unknown field name: {field_name}")
     
     except Exception as e:
+        import traceback
         error_message = f"Error in logbook operation: {str(e)}"
         print(f"[LogbookOperations] ERROR: {error_message}")
-        print(f"[LogbookOperations] fieldName: {event.get('info', {}).get('fieldName', 'UNKNOWN')}")
-        print(f"[LogbookOperations] userId: {event.get('identity', {}).get('sub', 'UNKNOWN')}")
+        print(f"[LogbookOperations] Full traceback: {traceback.format_exc()}")
+        print(f"[LogbookOperations] Event received: {json.dumps(event, default=str)}")
+        print(f"[LogbookOperations] fieldName: {event.get('info', {}).get('fieldName', 'UNKNOWN') if event and event.get('info') else 'UNKNOWN'}")
+        print(f"[LogbookOperations] userId: {event.get('identity', {}).get('sub', 'UNKNOWN') if event and event.get('identity') else 'UNKNOWN'}")
         raise Exception(error_message)
 
 
 def handle_create_entry(user_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Create a new logbook entry with embedding"""
+    if arguments is None:
+        arguments = {}
+    
     input_data = arguments.get('input', {})
     if not input_data:
         raise ValueError("input is required")
@@ -385,6 +400,9 @@ def handle_create_entry(user_id: str, arguments: Dict[str, Any]) -> Dict[str, An
 
 def handle_update_entry(user_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Update an existing logbook entry and regenerate embedding"""
+    if arguments is None:
+        arguments = {}
+    
     entry_id = arguments.get('entryId')
     if not entry_id:
         raise ValueError("entryId is required")
@@ -513,6 +531,9 @@ def handle_update_entry(user_id: str, arguments: Dict[str, Any]) -> Dict[str, An
 
 def handle_delete_entry(user_id: str, arguments: Dict[str, Any]) -> bool:
     """Delete a logbook entry and its embedding"""
+    if arguments is None:
+        arguments = {}
+    
     entry_id = arguments.get('entryId')
     if not entry_id:
         raise ValueError("entryId is required")
@@ -547,6 +568,9 @@ def handle_delete_entry(user_id: str, arguments: Dict[str, Any]) -> bool:
 
 def handle_get_entry(user_id: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Get a single logbook entry by ID"""
+    if arguments is None:
+        arguments = {}
+    
     entry_id = arguments.get('entryId')
     if not entry_id:
         raise ValueError("entryId is required")
@@ -576,7 +600,14 @@ def handle_get_entry(user_id: str, arguments: Dict[str, Any]) -> Optional[Dict[s
 
 def handle_list_entries(user_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """List logbook entries with optional filters"""
+    # Ensure arguments is not None
+    if arguments is None:
+        arguments = {}
+    
     filters = arguments.get('filters', {})
+    if filters is None:
+        filters = {}
+    
     limit = arguments.get('limit', 50)
     next_token = arguments.get('nextToken')
     
@@ -641,6 +672,9 @@ def handle_list_entries(user_id: str, arguments: Dict[str, Any]) -> Dict[str, An
 
 def handle_request_signature(user_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Request signature for a logbook entry (change status to pending-signature)"""
+    if arguments is None:
+        arguments = {}
+    
     entry_id = arguments.get('entryId')
     instructor_id = arguments.get('instructorId')
     
@@ -683,6 +717,9 @@ def handle_request_signature(user_id: str, arguments: Dict[str, Any]) -> Dict[st
 
 def handle_sign_entry(user_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Sign a logbook entry (add signature and change status to signed)"""
+    if arguments is None:
+        arguments = {}
+    
     entry_id = arguments.get('entryId')
     signature_input = arguments.get('signature')
     
