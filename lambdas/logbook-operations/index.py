@@ -568,7 +568,11 @@ def handle_list_entries(user_id: str, arguments: Dict[str, Any]) -> Dict[str, An
     if filters is None:
         filters = {}
     
-    limit = arguments.get('limit', 50)
+    # Handle None limit values from GraphQL (when limit is explicitly null)
+    limit = arguments.get('limit')
+    if limit is None:
+        limit = 50
+    
     next_token = arguments.get('nextToken')
     
     conn = None

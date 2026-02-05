@@ -498,6 +498,33 @@ class TestHandleListEntries:
         # Should return 5 items and a nextToken
         assert len(result['items']) == 5
         assert result['nextToken'] is not None
+    
+    @patch('index.get_db_connection')
+    @patch('index.return_db_connection')
+    def test_list_entries_with_null_limit(
+        self,
+        mock_return_conn,
+        mock_get_conn,
+        mock_db_connection,
+        sample_db_entry
+    ):
+        """Test list with None/null limit (from GraphQL)."""
+        conn, cursor = mock_db_connection
+        mock_get_conn.return_value = conn
+        cursor.fetchall.return_value = [sample_db_entry]
+        
+        # Simulate GraphQL passing limit: null (becomes None in Python)
+        arguments = {'limit': None}
+        result = handle_list_entries('user-456', arguments)
+        
+        # Should use default limit of 50 and not crash
+        assert 'items' in result
+        assert len(result['items']) == 1
+        cursor.execute.assert_called_once()
+        
+        # Verify the query was called with default limit + 1 (51)
+        call_args = cursor.execute.call_args
+        assert call_args[0][1][-1] == 51  # Last param should be limit + 1
 
 
 class TestHandleSignatureOperations:
