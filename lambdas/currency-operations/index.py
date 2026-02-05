@@ -209,7 +209,7 @@ def calculate_night_currency(cursor, user_id: str) -> Dict[str, Any]:
             'daysRemaining': days_remaining if days_remaining > 0 else 0,
             'validUntil': expiration_date.strftime('%b %d, %Y'),
             'details': f'{night_landings} night landings (full stop) in last 90 days',
-            'explanation': f'You are current to carry passengers at night. You have completed {night_landings} night full-stop landings in the preceding 90 days.',
+            'explanation': f'You are current to carry passengers at night. You have completed {night_landings} night full stop landings in the preceding 90 days.',
             'requirements': '• 3 takeoffs and landings to a full stop\n• Within preceding 90 days\n• Between 1 hour after sunset and 1 hour before sunrise\n• In same category and class of aircraft\n• Required to carry passengers at night'
         }
     else:
