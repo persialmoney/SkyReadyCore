@@ -1,6 +1,9 @@
 """
 AppSync Lambda Resolver for currency operations.
 Calculates pilot currency requirements based on logbook entries.
+
+Returns RAW DATA only - frontend generates all UI messages from currencyMessages.ts
+This follows industry standard: backend handles data, frontend handles presentation.
 """
 import json
 import os
@@ -97,7 +100,10 @@ def handle_get_currency(user_id: str, arguments: Dict[str, Any]) -> Dict[str, An
 
 
 def calculate_day_currency(cursor, user_id: str) -> Dict[str, Any]:
-    """Calculate day currency from logbook entries (14 CFR 61.57(a))"""
+    """
+    Calculate day currency from logbook entries (14 CFR 61.57(a))
+    Returns RAW DATA only - frontend generates messages
+    """
     query = """
         SELECT 
             COALESCE(SUM(day_landings), 0) as total_landings,
@@ -110,27 +116,15 @@ def calculate_day_currency(cursor, user_id: str) -> Dict[str, Any]:
     cursor.execute(query, (user_id,))
     result = cursor.fetchone()
     
-    # Handle empty result set or None values
-    if not result:
-        return {
-            'name': 'Day Currency',
-            'status': 'EXPIRED',
-            'daysRemaining': None,
-            'validUntil': None,
-            'details': 'No landings recorded',
-            'explanation': 'You are NOT current to carry passengers during the day. You need 3 takeoffs and landings within the preceding 90 days.',
-            'requirements': '• 3 takeoffs and landings within preceding 90 days\n• In same category and class of aircraft\n• Full stop landings required for tailwheel aircraft\n• May use flight simulator with instructor for currency'
-        }
+    # Extract data
+    total_landings = int(result['total_landings']) if result and result['total_landings'] is not None else 0
+    last_landing_date = result['last_landing_date'] if result else None
     
-    total_landings = int(result['total_landings']) if result['total_landings'] is not None else 0
-    last_landing_date = result['last_landing_date']
-    
+    # Calculate status and expiration
     if total_landings >= 3 and last_landing_date is not None:
-        # Calculate expiration (90 days from last landing)
         expiration_date = last_landing_date + timedelta(days=90)
         days_remaining = (expiration_date - datetime.now().date()).days
         
-        # Determine status
         if days_remaining > 15:
             status = 'CURRENT'
         elif days_remaining > 0:
@@ -143,9 +137,8 @@ def calculate_day_currency(cursor, user_id: str) -> Dict[str, Any]:
             'status': status,
             'daysRemaining': days_remaining if days_remaining > 0 else 0,
             'validUntil': expiration_date.strftime('%b %d, %Y'),
-            'details': f'{total_landings} T/O & Ldg in last 90 days',
-            'explanation': f'You are current to carry passengers during the day. You have completed {total_landings} takeoffs and landings in the preceding 90 days.',
-            'requirements': '• 3 takeoffs and landings within preceding 90 days\n• In same category and class of aircraft\n• Full stop landings required for tailwheel aircraft\n• May use flight simulator with instructor for currency'
+            'totalLandings': total_landings,
+            'lastLandingDate': last_landing_date.strftime('%Y-%m-%d') if last_landing_date else None,
         }
     else:
         return {
@@ -153,14 +146,16 @@ def calculate_day_currency(cursor, user_id: str) -> Dict[str, Any]:
             'status': 'EXPIRED',
             'daysRemaining': None,
             'validUntil': None,
-            'details': f'Only {total_landings} landings in last 90 days',
-            'explanation': 'You are NOT current to carry passengers during the day. You need 3 takeoffs and landings within the preceding 90 days.',
-            'requirements': '• 3 takeoffs and landings within preceding 90 days\n• In same category and class of aircraft\n• Full stop landings required for tailwheel aircraft\n• May use flight simulator with instructor for currency'
+            'totalLandings': total_landings,
+            'lastLandingDate': last_landing_date.strftime('%Y-%m-%d') if last_landing_date else None,
         }
 
 
 def calculate_night_currency(cursor, user_id: str) -> Dict[str, Any]:
-    """Calculate night currency from logbook entries (14 CFR 61.57(b))"""
+    """
+    Calculate night currency from logbook entries (14 CFR 61.57(b))
+    Returns RAW DATA only - frontend generates messages
+    """
     query = """
         SELECT 
             COALESCE(SUM(night_landings), 0) as night_landings,
@@ -175,21 +170,10 @@ def calculate_night_currency(cursor, user_id: str) -> Dict[str, Any]:
     cursor.execute(query, (user_id,))
     result = cursor.fetchone()
     
-    # Handle empty result set or None values
-    if not result:
-        return {
-            'name': 'Night Currency',
-            'status': 'EXPIRED',
-            'daysRemaining': None,
-            'validUntil': None,
-            'details': 'No night landings recorded',
-            'explanation': 'You are NOT current to carry passengers at night. You need 3 night takeoffs and landings to a full stop within the preceding 90 days.',
-            'requirements': '• 3 takeoffs and landings to a full stop\n• Within preceding 90 days\n• Between 1 hour after sunset and 1 hour before sunrise\n• In same category and class of aircraft\n• Required to carry passengers at night'
-        }
-    
-    night_landings = int(result['night_landings']) if result['night_landings'] is not None else 0
-    full_stops = int(result['full_stops']) if result['full_stops'] is not None else 0
-    last_night_date = result['last_night_date']
+    # Extract data
+    night_landings = int(result['night_landings']) if result and result['night_landings'] is not None else 0
+    full_stops = int(result['full_stops']) if result and result['full_stops'] is not None else 0
+    last_night_date = result['last_night_date'] if result else None
     
     # Night currency requires 3 night landings AND 3 full stops
     if night_landings >= 3 and full_stops >= 3 and last_night_date is not None:
@@ -208,9 +192,9 @@ def calculate_night_currency(cursor, user_id: str) -> Dict[str, Any]:
             'status': status,
             'daysRemaining': days_remaining if days_remaining > 0 else 0,
             'validUntil': expiration_date.strftime('%b %d, %Y'),
-            'details': f'{night_landings} night landings (full stop) in last 90 days',
-            'explanation': f'You are current to carry passengers at night. You have completed {night_landings} night full stop landings in the preceding 90 days.',
-            'requirements': '• 3 takeoffs and landings to a full stop\n• Within preceding 90 days\n• Between 1 hour after sunset and 1 hour before sunrise\n• In same category and class of aircraft\n• Required to carry passengers at night'
+            'nightLandings': night_landings,
+            'fullStopLandings': full_stops,
+            'lastLandingDate': last_night_date.strftime('%Y-%m-%d') if last_night_date else None,
         }
     else:
         return {
@@ -218,14 +202,17 @@ def calculate_night_currency(cursor, user_id: str) -> Dict[str, Any]:
             'status': 'EXPIRED',
             'daysRemaining': None,
             'validUntil': None,
-            'details': f'Only {night_landings} night full-stop landings in last 90 days',
-            'explanation': 'You are NOT current to carry passengers at night. You need 3 night takeoffs and landings to a full stop within the preceding 90 days.',
-            'requirements': '• 3 takeoffs and landings to a full stop\n• Within preceding 90 days\n• Between 1 hour after sunset and 1 hour before sunrise\n• In same category and class of aircraft\n• Required to carry passengers at night'
+            'nightLandings': night_landings,
+            'fullStopLandings': full_stops,
+            'lastLandingDate': last_night_date.strftime('%Y-%m-%d') if last_night_date else None,
         }
 
 
 def calculate_ifr_currency(cursor, user_id: str) -> Dict[str, Any]:
-    """Calculate IFR currency from logbook entries (14 CFR 61.57(c))"""
+    """
+    Calculate IFR currency from logbook entries (14 CFR 61.57(c))
+    Returns RAW DATA only - frontend generates messages
+    """
     query = """
         SELECT 
             COALESCE(SUM(approaches), 0) as total_approaches,
@@ -240,22 +227,11 @@ def calculate_ifr_currency(cursor, user_id: str) -> Dict[str, Any]:
     cursor.execute(query, (user_id,))
     result = cursor.fetchone()
     
-    # Handle empty result set or None values
-    if not result:
-        return {
-            'name': 'IFR Currency',
-            'status': 'EXPIRED',
-            'daysRemaining': None,
-            'validUntil': None,
-            'details': 'No IFR activity recorded',
-            'explanation': 'You are NOT current to file and fly under IFR. You need 6 approaches, holding procedures, and tracking/intercepting within the preceding 6 months.',
-            'requirements': '• 6 instrument approaches\n• Holding procedures and tasks\n• Intercepting and tracking courses through navigation aids\n• Within preceding 6 calendar months\n• May use approved flight simulator or training device'
-        }
-    
-    total_approaches = int(result['total_approaches']) if result['total_approaches'] is not None else 0
-    has_holds = result['has_holds'] or False
-    has_tracking = result['has_tracking'] or False
-    last_ifr_date = result['last_ifr_date']
+    # Extract data
+    total_approaches = int(result['total_approaches']) if result and result['total_approaches'] is not None else 0
+    has_holds = result['has_holds'] or False if result else False
+    has_tracking = result['has_tracking'] or False if result else False
+    last_ifr_date = result['last_ifr_date'] if result else None
     
     # IFR currency requires 6 approaches AND holds AND tracking
     if total_approaches >= 6 and has_holds and has_tracking and last_ifr_date is not None:
@@ -274,34 +250,29 @@ def calculate_ifr_currency(cursor, user_id: str) -> Dict[str, Any]:
             'status': status,
             'daysRemaining': days_remaining if days_remaining > 0 else 0,
             'validUntil': expiration_date.strftime('%b %d, %Y'),
-            'details': f'{total_approaches} approaches in last 6 months',
-            'explanation': f'You are current to file and fly under IFR. You have logged {total_approaches} approaches, holding procedures, and intercepting/tracking courses within the last 6 months.',
-            'requirements': '• 6 instrument approaches\n• Holding procedures and tasks\n• Intercepting and tracking courses through navigation aids\n• Within preceding 6 calendar months\n• May use approved flight simulator or training device'
+            'totalApproaches': total_approaches,
+            'hasHolds': has_holds,
+            'hasTracking': has_tracking,
+            'lastLandingDate': last_ifr_date.strftime('%Y-%m-%d') if last_ifr_date else None,
         }
     else:
-        missing = []
-        if total_approaches < 6:
-            missing.append(f'only {total_approaches} approaches')
-        if not has_holds:
-            missing.append('no holding procedures')
-        if not has_tracking:
-            missing.append('no tracking/intercepting')
-        
-        details = f'Not current: {", ".join(missing)}'
-        
         return {
             'name': 'IFR Currency',
             'status': 'EXPIRED',
             'daysRemaining': None,
             'validUntil': None,
-            'details': details,
-            'explanation': 'You are NOT current to file and fly under IFR. You need 6 approaches, holding procedures, and tracking/intercepting within the preceding 6 months.',
-            'requirements': '• 6 instrument approaches\n• Holding procedures and tasks\n• Intercepting and tracking courses through navigation aids\n• Within preceding 6 calendar months\n• May use approved flight simulator or training device'
+            'totalApproaches': total_approaches,
+            'hasHolds': has_holds,
+            'hasTracking': has_tracking,
+            'lastLandingDate': last_ifr_date.strftime('%Y-%m-%d') if last_ifr_date else None,
         }
 
 
 def calculate_flight_review(cursor, user_id: str) -> Dict[str, Any]:
-    """Calculate flight review from logbook entries with 'Flight Review' flight type (14 CFR 61.56)"""
+    """
+    Calculate flight review from logbook entries with 'Flight Review' flight type (14 CFR 61.56)
+    Returns RAW DATA only - frontend generates messages
+    """
     query = """
         SELECT date
         FROM logbook_entries
@@ -332,9 +303,7 @@ def calculate_flight_review(cursor, user_id: str) -> Dict[str, Any]:
             'status': status,
             'daysRemaining': days_remaining if days_remaining > 0 else 0,
             'validUntil': expiration_date.strftime('%b %d, %Y'),
-            'details': f'Last review: {review_date.strftime("%b %d, %Y")}',
-            'explanation': f'Your last flight review was completed on {review_date.strftime("%b %d, %Y")}. Flight reviews are required every 24 calendar months.',
-            'requirements': '• Minimum 1 hour ground instruction\n• Minimum 1 hour flight instruction\n• Review of Part 91 General Operating Rules\n• Must be endorsed by authorized instructor'
+            'lastReviewDate': review_date.strftime('%b %d, %Y'),
         }
     else:
         return {
@@ -342,14 +311,15 @@ def calculate_flight_review(cursor, user_id: str) -> Dict[str, Any]:
             'status': 'EXPIRED',
             'daysRemaining': None,
             'validUntil': None,
-            'details': 'No flight review found',
-            'explanation': 'No flight review found in your logbook. Add a logbook entry with type "Flight Review" after your next review.',
-            'requirements': '• Required every 24 calendar months\n• Must be logged with instructor signature\n• Log as flight type "Flight Review"'
+            'lastReviewDate': None,
         }
 
 
 def calculate_medical_certificate(user_data: Dict) -> Dict[str, Any]:
-    """Calculate medical certificate expiration from DynamoDB user data (14 CFR 61.23)"""
+    """
+    Calculate medical certificate expiration from DynamoDB user data (14 CFR 61.23)
+    Returns RAW DATA only - frontend generates messages
+    """
     # Handle empty user_data or missing pilotInfo
     if not user_data:
         return {
@@ -357,9 +327,8 @@ def calculate_medical_certificate(user_data: Dict) -> Dict[str, Any]:
             'status': 'NOT_APPLICABLE',
             'daysRemaining': None,
             'validUntil': None,
-            'details': 'Not entered',
-            'explanation': 'Medical certificate information not found. Add your medical exam date in Settings.',
-            'requirements': '• Class 1: 12 months (6 if over 40 for Part 121)\n• Class 2: 12 months (commercial), 24/60 months (private)\n• Class 3: 24 months (over 40), 60 months (under 40)\n• Add in Settings > Pilot Info'
+            'medicalClass': None,
+            'medicalExamDate': None,
         }
     
     pilot_info = user_data.get('pilotInfo', {})
@@ -369,9 +338,8 @@ def calculate_medical_certificate(user_data: Dict) -> Dict[str, Any]:
             'status': 'NOT_APPLICABLE',
             'daysRemaining': None,
             'validUntil': None,
-            'details': 'Not entered',
-            'explanation': 'Medical certificate information not found. Add your medical exam date in Settings.',
-            'requirements': '• Class 1: 12 months (6 if over 40 for Part 121)\n• Class 2: 12 months (commercial), 24/60 months (private)\n• Class 3: 24 months (over 40), 60 months (under 40)\n• Add in Settings > Pilot Info'
+            'medicalClass': None,
+            'medicalExamDate': None,
         }
     
     medical_date_str = pilot_info.get('medicalCertificateDate')
@@ -384,9 +352,8 @@ def calculate_medical_certificate(user_data: Dict) -> Dict[str, Any]:
             'status': 'NOT_APPLICABLE',
             'daysRemaining': None,
             'validUntil': None,
-            'details': 'Not entered',
-            'explanation': 'Medical certificate information not found. Add your medical exam date in Settings.',
-            'requirements': '• Class 1: 12 months (6 if over 40 for Part 121)\n• Class 2: 12 months (commercial), 24/60 months (private)\n• Class 3: 24 months (over 40), 60 months (under 40)\n• Add in Settings > Pilot Info'
+            'medicalClass': None,
+            'medicalExamDate': None,
         }
     
     # Parse medical date with comprehensive error handling
@@ -404,12 +371,11 @@ def calculate_medical_certificate(user_data: Dict) -> Dict[str, Any]:
                 'status': 'NOT_APPLICABLE',
                 'daysRemaining': None,
                 'validUntil': None,
-                'details': 'Invalid date format',
-                'explanation': 'Medical certificate date is in an invalid format. Please update in Settings.',
-                'requirements': '• Class 1: 12 months (6 if over 40 for Part 121)\n• Class 2: 12 months (commercial), 24/60 months (private)\n• Class 3: 24 months (over 40), 60 months (under 40)\n• Add in Settings > Pilot Info'
+                'medicalClass': medical_class,
+                'medicalExamDate': None,
             }
     
-    # Additional safety check - should never be None here but being defensive
+    # Additional safety check
     if medical_date is None:
         print(f"[calculate_medical_certificate] medical_date is None after parsing attempt")
         return {
@@ -417,9 +383,8 @@ def calculate_medical_certificate(user_data: Dict) -> Dict[str, Any]:
             'status': 'NOT_APPLICABLE',
             'daysRemaining': None,
             'validUntil': None,
-            'details': 'Invalid date',
-            'explanation': 'Medical certificate date could not be processed. Please update in Settings.',
-            'requirements': '• Class 1: 12 months (6 if over 40 for Part 121)\n• Class 2: 12 months (commercial), 24/60 months (private)\n• Class 3: 24 months (over 40), 60 months (under 40)\n• Add in Settings > Pilot Info'
+            'medicalClass': medical_class,
+            'medicalExamDate': None,
         }
     
     # Calculate expiration based on class and age
@@ -452,11 +417,10 @@ def calculate_medical_certificate(user_data: Dict) -> Dict[str, Any]:
         status = 'EXPIRED'
     
     return {
-        'name': f'Medical (Class {medical_class})',
+        'name': 'Medical Certificate',
         'status': status,
         'daysRemaining': days_remaining if days_remaining > 0 else 0,
         'validUntil': expiration_date.strftime('%b %d, %Y'),
-        'details': f'Exam date: {medical_date.strftime("%b %d, %Y")}',
-        'explanation': f'Your Class {medical_class} medical certificate is valid for {expiration_months} months for private operations.',
-        'requirements': f'• Valid for {expiration_months} months for your age\n• Must be issued by FAA Aviation Medical Examiner (AME)\n• BasicMed may be an alternative for certain operations'
+        'medicalClass': medical_class,
+        'medicalExamDate': medical_date.strftime('%b %d, %Y'),
     }
