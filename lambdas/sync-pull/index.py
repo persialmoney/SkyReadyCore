@@ -4,12 +4,7 @@ Sync Pull Lambda - Send changes since lastPulledAt (cursor pattern)
 import json
 import time
 import os
-import sys
 from datetime import datetime
-
-# Add shared modules to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'shared'))
-
 from db_utils import get_db_connection
 
 def handler(event, context):

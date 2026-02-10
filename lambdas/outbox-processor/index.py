@@ -4,11 +4,6 @@ Outbox Processor Lambda - Process outbox events to DynamoDB (every 1 minute)
 import boto3
 import json
 import os
-import sys
-
-# Add shared modules to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'shared'))
-
 from db_utils import get_db_connection
 
 dynamodb = boto3.resource('dynamodb')
