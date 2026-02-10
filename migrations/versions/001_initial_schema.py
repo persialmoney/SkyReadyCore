@@ -48,7 +48,8 @@ def upgrade():
             day_landings INTEGER,
             night_takeoffs INTEGER,
             night_landings INTEGER,
-            full_stop_landings INTEGER,
+            day_full_stop_landings INTEGER DEFAULT 0,
+            night_full_stop_landings INTEGER DEFAULT 0,
             
             approaches INTEGER,
             holds BOOLEAN DEFAULT FALSE,
