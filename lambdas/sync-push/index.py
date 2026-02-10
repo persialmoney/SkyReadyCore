@@ -39,14 +39,15 @@ def handler(event, context):
                         pic, sic, dual_received, dual_given, solo,
                         cross_country, night, actual_imc, simulated_instrument,
                         day_takeoffs, day_landings, night_takeoffs, night_landings,
-                        full_stop_landings, approaches, holds, tracking,
+                        day_full_stop_landings, night_full_stop_landings,
+                        approaches, holds, tracking,
                         instructor, student, lesson_topic, ground_instruction,
                         maneuvers, remarks, safety_notes, safety_relevant,
                         status, signature, created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
                     )
                 """, [
                     entry['entryId'], user_id, entry['date'],
@@ -60,7 +61,8 @@ def handler(event, context):
                     entry.get('simulatedInstrument', 0),
                     entry.get('dayTakeoffs', 0), entry.get('dayLandings', 0),
                     entry.get('nightTakeoffs', 0), entry.get('nightLandings', 0),
-                    entry.get('fullStopLandings', 0), entry.get('approaches', 0),
+                    entry.get('dayFullStopLandings', 0),
+                    entry.get('nightFullStopLandings', 0), entry.get('approaches', 0),
                     entry.get('holds', False), entry.get('tracking', False),
                     json.dumps(entry.get('instructor')), json.dumps(entry.get('student')),
                     entry.get('lessonTopic'), entry.get('groundInstruction'),
@@ -108,8 +110,9 @@ def handler(event, context):
                     dual_received = %s, dual_given = %s, solo = %s,
                     cross_country = %s, night = %s, actual_imc = %s,
                     simulated_instrument = %s, day_takeoffs = %s, day_landings = %s,
-                    night_takeoffs = %s, night_landings = %s, approaches = %s,
-                    holds = %s, remarks = %s, status = %s, updated_at = NOW()
+                    night_takeoffs = %s, night_landings = %s,
+                    day_full_stop_landings = %s, night_full_stop_landings = %s,
+                    approaches = %s, holds = %s, remarks = %s, status = %s, updated_at = NOW()
                 WHERE entry_id = %s AND user_id = %s AND deleted_at IS NULL
             """, [
                 entry_data['date'], entry_data.get('totalTime', 0),
@@ -120,6 +123,8 @@ def handler(event, context):
                 entry_data.get('simulatedInstrument', 0),
                 entry_data.get('dayTakeoffs', 0), entry_data.get('dayLandings', 0),
                 entry_data.get('nightTakeoffs', 0), entry_data.get('nightLandings', 0),
+                entry_data.get('dayFullStopLandings', 0),
+                entry_data.get('nightFullStopLandings', 0),
                 entry_data.get('approaches', 0), entry_data.get('holds', False),
                 entry_data.get('remarks'), entry_data.get('status', 'draft'),
                 entry_id, user_id

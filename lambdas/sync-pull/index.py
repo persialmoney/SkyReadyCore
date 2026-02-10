@@ -39,7 +39,8 @@ def handler(event, context):
                 pic, sic, dual_received, dual_given, solo,
                 cross_country, night, actual_imc, simulated_instrument,
                 day_takeoffs, day_landings, night_takeoffs, night_landings,
-                full_stop_landings, approaches, holds, tracking,
+                day_full_stop_landings, night_full_stop_landings,
+                approaches, holds, tracking,
                 instructor, student, lesson_topic, ground_instruction,
                 maneuvers, remarks, safety_notes, safety_relevant,
                 status, signature,
@@ -70,9 +71,9 @@ def handler(event, context):
         
         for row in rows:
             entry_id = row[0]
-            created_at = int(row[36].timestamp() * 1000)
-            updated_at = int(row[37].timestamp() * 1000) if row[37] else created_at
-            deleted_at = int(row[38].timestamp() * 1000) if row[38] else None
+            created_at = int(row[37].timestamp() * 1000)
+            updated_at = int(row[38].timestamp() * 1000) if row[38] else created_at
+            deleted_at = int(row[39].timestamp() * 1000) if row[39] else None
             
             if deleted_at and deleted_at > last_pulled_at:
                 deleted.append(entry_id)
@@ -130,20 +131,21 @@ def format_entry(row):
         'dayLandings': int(row[19]) if row[19] else 0,
         'nightTakeoffs': int(row[20]) if row[20] else 0,
         'nightLandings': int(row[21]) if row[21] else 0,
-        'fullStopLandings': int(row[22]) if row[22] else 0,
-        'approaches': int(row[23]) if row[23] else 0,
-        'holds': bool(row[24]) if row[24] is not None else False,
-        'tracking': bool(row[25]) if row[25] is not None else False,
-        'instructor': row[26],
-        'student': row[27],
-        'lessonTopic': row[28],
-        'groundInstruction': row[29],
-        'maneuvers': row[30] if row[30] else [],
-        'remarks': row[31],
-        'safetyNotes': row[32],
-        'safetyRelevant': bool(row[33]) if row[33] is not None else False,
-        'status': row[34],
-        'signature': row[35],
-        'createdAt': int(row[36].timestamp() * 1000),
-        'updatedAt': int(row[37].timestamp() * 1000) if row[37] else int(row[36].timestamp() * 1000),
+        'dayFullStopLandings': int(row[22]) if row[22] else 0,
+        'nightFullStopLandings': int(row[23]) if row[23] else 0,
+        'approaches': int(row[24]) if row[24] else 0,
+        'holds': bool(row[25]) if row[25] is not None else False,
+        'tracking': bool(row[26]) if row[26] is not None else False,
+        'instructor': row[27],
+        'student': row[28],
+        'lessonTopic': row[29],
+        'groundInstruction': row[30],
+        'maneuvers': row[31] if row[31] else [],
+        'remarks': row[32],
+        'safetyNotes': row[33],
+        'safetyRelevant': bool(row[34]) if row[34] is not None else False,
+        'status': row[35],
+        'signature': row[36],
+        'createdAt': int(row[37].timestamp() * 1000),
+        'updatedAt': int(row[38].timestamp() * 1000) if row[38] else int(row[37].timestamp() * 1000),
     }
