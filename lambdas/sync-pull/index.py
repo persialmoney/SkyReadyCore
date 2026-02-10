@@ -15,14 +15,15 @@ def handler(event, context):
     
     user_id = event['identity']['claims']['sub']
     last_pulled_at = event['arguments'].get('lastPulledAt', 0)
-    cursor_arg = event['arguments'].get('cursor', '0')
+    cursor_arg = event['arguments'].get('cursor')
     
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
         limit = 100
-        offset = int(cursor_arg)
+        # Handle None/null cursor (first request)
+        offset = int(cursor_arg) if cursor_arg is not None else 0
         timestamp = int(time.time() * 1000)
         
         # Convert timestamp to PostgreSQL timestamp

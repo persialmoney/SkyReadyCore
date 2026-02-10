@@ -1,0 +1,15 @@
+# Ignore built dependencies (will be installed during CDK deployment)
+python/boto*
+python/botocore*
+python/psycopg2*
+python/jmespath*
+python/s3transfer*
+python/dateutil*
+python/six*
+python/urllib3*
+python/*.dist-info
+python/bin/
+
+# Keep the structure files
+!python/__init__.py
+!python/db_utils.py

@@ -1,1 +1,1 @@
-psycopg2-binary==2.9.9
+# Dependencies installed in Lambda Layer (no need to duplicate)
