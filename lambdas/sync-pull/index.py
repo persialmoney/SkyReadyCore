@@ -5,7 +5,7 @@ import json
 import time
 import os
 from datetime import datetime
-from db_utils import get_db_connection
+from db_utils import get_db_connection, return_db_connection
 
 def handler(event, context):
     """
@@ -43,7 +43,7 @@ def handler(event, context):
                 approaches, holds, tracking,
                 instructor, student, lesson_topic, ground_instruction,
                 maneuvers, remarks, safety_notes, safety_relevant,
-                status, signature,
+                status, signature, is_flight_review,
                 created_at, updated_at, deleted_at
             FROM logbook_entries
             WHERE user_id = %s
@@ -71,9 +71,9 @@ def handler(event, context):
         
         for row in rows:
             entry_id = row[0]
-            created_at = int(row[37].timestamp() * 1000)
-            updated_at = int(row[38].timestamp() * 1000) if row[38] else created_at
-            deleted_at = int(row[39].timestamp() * 1000) if row[39] else None
+            created_at = int(row[38].timestamp() * 1000)
+            updated_at = int(row[39].timestamp() * 1000) if row[39] else created_at
+            deleted_at = int(row[40].timestamp() * 1000) if row[40] else None
             
             if deleted_at and deleted_at > last_pulled_at:
                 deleted.append(entry_id)
@@ -104,7 +104,7 @@ def handler(event, context):
         raise e
     finally:
         cursor.close()
-        conn.close()
+        return_db_connection(conn)
 
 def format_entry(row):
     """Format database row to GraphQL entry"""
@@ -139,13 +139,14 @@ def format_entry(row):
         'instructor': row[27],
         'student': row[28],
         'lessonTopic': row[29],
-        'groundInstruction': row[30],
+        'groundInstruction': float(row[30]) if row[30] else 0,
         'maneuvers': row[31] if row[31] else [],
         'remarks': row[32],
         'safetyNotes': row[33],
         'safetyRelevant': bool(row[34]) if row[34] is not None else False,
         'status': row[35],
         'signature': row[36],
-        'createdAt': int(row[37].timestamp() * 1000),
-        'updatedAt': int(row[38].timestamp() * 1000) if row[38] else int(row[37].timestamp() * 1000),
+        'isFlightReview': bool(row[37]) if row[37] is not None else False,
+        'createdAt': int(row[38].timestamp() * 1000),
+        'updatedAt': int(row[39].timestamp() * 1000) if row[39] else int(row[38].timestamp() * 1000),
     }

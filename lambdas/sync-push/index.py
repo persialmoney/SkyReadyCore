@@ -5,7 +5,7 @@ Clean implementation - no old CRUD fallbacks
 import json
 import time
 import os
-from db_utils import get_db_connection
+from db_utils import get_db_connection, return_db_connection
 import psycopg2
 
 def handler(event, context):
@@ -43,11 +43,11 @@ def handler(event, context):
                         approaches, holds, tracking,
                         instructor, student, lesson_topic, ground_instruction,
                         maneuvers, remarks, safety_notes, safety_relevant,
-                        status, signature, created_at, updated_at
+                        status, signature, is_flight_review, created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
                     )
                 """, [
                     entry['entryId'], user_id, entry['date'],
@@ -65,10 +65,11 @@ def handler(event, context):
                     entry.get('nightFullStopLandings', 0), entry.get('approaches', 0),
                     entry.get('holds', False), entry.get('tracking', False),
                     json.dumps(entry.get('instructor')), json.dumps(entry.get('student')),
-                    entry.get('lessonTopic'), entry.get('groundInstruction'),
+                    entry.get('lessonTopic'), entry.get('groundInstruction', 0),
                     entry.get('maneuvers', []), entry.get('remarks'),
                     entry.get('safetyNotes'), entry.get('safetyRelevant', False),
-                    entry.get('status', 'draft'), json.dumps(entry.get('signature'))
+                    entry.get('status', 'draft'), json.dumps(entry.get('signature')),
+                    entry.get('isFlightReview', False)
                 ])
                 
             except psycopg2.IntegrityError as e:
@@ -106,16 +107,27 @@ def handler(event, context):
             
             cursor.execute("""
                 UPDATE logbook_entries SET
-                    date = %s, total_time = %s, pic = %s, sic = %s,
+                    date = %s, aircraft = %s, tail_number = %s, route = %s,
+                    route_legs = %s, flight_types = %s,
+                    total_time = %s, pic = %s, sic = %s,
                     dual_received = %s, dual_given = %s, solo = %s,
                     cross_country = %s, night = %s, actual_imc = %s,
                     simulated_instrument = %s, day_takeoffs = %s, day_landings = %s,
                     night_takeoffs = %s, night_landings = %s,
                     day_full_stop_landings = %s, night_full_stop_landings = %s,
-                    approaches = %s, holds = %s, remarks = %s, status = %s, updated_at = NOW()
+                    approaches = %s, holds = %s, tracking = %s,
+                    instructor = %s, student = %s, lesson_topic = %s,
+                    ground_instruction = %s, maneuvers = %s,
+                    remarks = %s, safety_notes = %s, safety_relevant = %s,
+                    status = %s, signature = %s, is_flight_review = %s,
+                    updated_at = NOW()
                 WHERE entry_id = %s AND user_id = %s AND deleted_at IS NULL
             """, [
-                entry_data['date'], entry_data.get('totalTime', 0),
+                entry_data['date'],
+                json.dumps(entry_data.get('aircraft')), entry_data.get('tailNumber'),
+                entry_data.get('route'), json.dumps(entry_data.get('routeLegs', [])),
+                entry_data.get('flightTypes', []),
+                entry_data.get('totalTime', 0),
                 entry_data.get('pic', 0), entry_data.get('sic', 0),
                 entry_data.get('dualReceived', 0), entry_data.get('dualGiven', 0),
                 entry_data.get('solo', 0), entry_data.get('crossCountry', 0),
@@ -126,7 +138,14 @@ def handler(event, context):
                 entry_data.get('dayFullStopLandings', 0),
                 entry_data.get('nightFullStopLandings', 0),
                 entry_data.get('approaches', 0), entry_data.get('holds', False),
-                entry_data.get('remarks'), entry_data.get('status', 'draft'),
+                entry_data.get('tracking', False),
+                json.dumps(entry_data.get('instructor')), json.dumps(entry_data.get('student')),
+                entry_data.get('lessonTopic'), entry_data.get('groundInstruction', 0),
+                entry_data.get('maneuvers', []),
+                entry_data.get('remarks'), entry_data.get('safetyNotes'),
+                entry_data.get('safetyRelevant', False),
+                entry_data.get('status', 'draft'), json.dumps(entry_data.get('signature')),
+                entry_data.get('isFlightReview', False),
                 entry_id, user_id
             ])
         
@@ -156,9 +175,14 @@ def handler(event, context):
         }
     
     except Exception as e:
-        cursor.execute('ROLLBACK')
+        try:
+            cursor.execute('ROLLBACK')
+        except:
+            pass  # Connection might already be closed
         print(f"[sync-push] Error: {e}")
         raise e
     finally:
-        cursor.close()
-        conn.close()
+        if cursor:
+            cursor.close()
+        if conn:
+            return_db_connection(conn)
