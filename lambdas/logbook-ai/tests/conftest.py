@@ -66,7 +66,7 @@ def sample_logbook_entries():
             'flight_types': ['training'],
             'route_legs': [],
             'pic': 0.0,
-            'status': 'draft'
+            'status': 'DRAFT'
         },
         {
             'entry_id': 'entry-2',
@@ -84,7 +84,7 @@ def sample_logbook_entries():
             'flight_types': ['solo', 'cross-country'],
             'route_legs': [],
             'dual_received': None,
-            'status': 'signed'
+            'status': 'SIGNED'
         }
     ]
 

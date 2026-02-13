@@ -68,7 +68,7 @@ def handler(event, context):
                     entry.get('lessonTopic'), entry.get('groundInstruction', 0),
                     entry.get('maneuvers', []), entry.get('remarks'),
                     entry.get('safetyNotes'), entry.get('safetyRelevant', False),
-                    entry.get('status', 'draft'), json.dumps(entry.get('signature')),
+                    entry.get('status', 'DRAFT'), json.dumps(entry.get('signature')),
                     entry.get('isFlightReview', False)
                 ])
                 
@@ -144,7 +144,7 @@ def handler(event, context):
                 entry_data.get('maneuvers', []),
                 entry_data.get('remarks'), entry_data.get('safetyNotes'),
                 entry_data.get('safetyRelevant', False),
-                entry_data.get('status', 'draft'), json.dumps(entry_data.get('signature')),
+                entry_data.get('status', 'DRAFT'), json.dumps(entry_data.get('signature')),
                 entry_data.get('isFlightReview', False),
                 entry_id, user_id
             ])

@@ -173,7 +173,7 @@ def convert_db_entry_to_graphql(entry: Dict[str, Any]) -> Dict[str, Any]:
         'remarks': entry.get('remarks'),
         'safetyNotes': entry.get('safety_notes'),
         'safetyRelevant': entry.get('safety_relevant', False),
-        'status': entry.get('status', 'draft'),
+        'status': entry.get('status', 'DRAFT'),
         'signature': entry.get('signature'),
         'createdAt': entry['created_at'].isoformat() if isinstance(entry['created_at'], datetime) else str(entry['created_at']),
         'updatedAt': entry['updated_at'].isoformat() if isinstance(entry['updated_at'], datetime) else str(entry['updated_at']),
