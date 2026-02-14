@@ -266,6 +266,7 @@ def handle_semantic_search(user_id: str, arguments: Dict[str, Any]) -> List[Dict
             FROM logbook_entry_embeddings e
             JOIN logbook_entries le ON e.entry_id = le.entry_id
             WHERE le.user_id = %s
+              AND le.deleted_at IS NULL
             ORDER BY similarity DESC
             LIMIT %s
         """, (embedding_str, user_id, limit))
@@ -304,6 +305,7 @@ def handle_chat_query(user_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]
             FROM logbook_entries le
             LEFT JOIN logbook_entry_embeddings e ON le.entry_id = e.entry_id
             WHERE le.user_id = %s
+              AND le.deleted_at IS NULL
             ORDER BY le.date DESC
             LIMIT 50
         """, (user_id,))

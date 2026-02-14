@@ -31,7 +31,7 @@ def handler(event, context):
         
         print(f"[sync-pull] Fetching changes since {last_pulled_datetime} for user {user_id}")
         
-        # Get entries changed since lastPulledAt
+        # Query 1: Get active entries (created or updated) - EXCLUDE deleted entries
         cursor.execute("""
             SELECT 
                 entry_id, user_id, date, aircraft, tail_number,
@@ -44,43 +44,44 @@ def handler(event, context):
                 instructor, student, lesson_topic, ground_instruction,
                 maneuvers, remarks, safety_notes, safety_relevant,
                 status, signature, is_flight_review,
-                created_at, updated_at, deleted_at
+                created_at, updated_at
             FROM logbook_entries
             WHERE user_id = %s
-              AND (
-                created_at > %s
-                OR updated_at > %s
-                OR (deleted_at IS NOT NULL AND deleted_at > %s)
-              )
-            ORDER BY GREATEST(
-                created_at,
-                updated_at,
-                COALESCE(deleted_at, created_at)
-            )
+              AND deleted_at IS NULL
+              AND (created_at > %s OR updated_at > %s)
+            ORDER BY GREATEST(created_at, updated_at)
             LIMIT %s OFFSET %s
-        """, [user_id, last_pulled_datetime, last_pulled_datetime, last_pulled_datetime, limit, offset])
+        """, [user_id, last_pulled_datetime, last_pulled_datetime, limit, offset])
         
         rows = cursor.fetchall()
         
-        print(f"[sync-pull] Found {len(rows)} changed entries")
+        print(f"[sync-pull] Found {len(rows)} active entries")
         
         # Categorize changes
         created = []
         updated = []
-        deleted = []
         
         for row in rows:
             entry_id = row[0]
             created_at = int(row[38].timestamp() * 1000)
             updated_at = int(row[39].timestamp() * 1000) if row[39] else created_at
-            deleted_at = int(row[40].timestamp() * 1000) if row[40] else None
             
-            if deleted_at and deleted_at > last_pulled_at:
-                deleted.append(entry_id)
-            elif created_at > last_pulled_at:
+            if created_at > last_pulled_at:
                 created.append(format_entry(row))
             else:
                 updated.append(format_entry(row))
+        
+        # Query 2: Get deleted entry IDs only (don't send full entry data)
+        cursor.execute("""
+            SELECT entry_id
+            FROM logbook_entries
+            WHERE user_id = %s
+              AND deleted_at IS NOT NULL
+              AND deleted_at > %s
+            ORDER BY deleted_at
+        """, [user_id, last_pulled_datetime])
+        
+        deleted = [row[0] for row in cursor.fetchall()]
         
         result = {
             'changes': {
