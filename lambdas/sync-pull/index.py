@@ -72,9 +72,8 @@ def handler(event, context):
                 updated.append(format_entry(row))
         
         # Query 2: Get deleted entry IDs only (don't send full entry data)
-        print(f"[sync-pull] Querying for deleted entries since {last_pulled_datetime}")
         cursor.execute("""
-            SELECT entry_id, deleted_at, updated_at, date, status
+            SELECT entry_id
             FROM logbook_entries
             WHERE user_id = %s
               AND deleted_at IS NOT NULL
@@ -82,21 +81,7 @@ def handler(event, context):
             ORDER BY deleted_at
         """, [user_id, last_pulled_datetime])
         
-        deleted_rows = cursor.fetchall()
-        deleted = [row[0] for row in deleted_rows]
-        
-        # Log detailed info about each deleted entry
-        print(f"[sync-pull] Found {len(deleted)} deleted entries since last pull")
-        for row in deleted_rows:
-            print(f"[sync-pull] Deleted entry - entry_id: {row[0]}, deleted_at: {row[1]}, updated_at: {row[2]}, date: {row[3]}, status: {row[4]}")
-        
-        # Also query total count of all deleted entries for this user (for debugging)
-        cursor.execute("""
-            SELECT COUNT(*) FROM logbook_entries
-            WHERE user_id = %s AND deleted_at IS NOT NULL
-        """, [user_id])
-        total_deleted_count = cursor.fetchone()[0]
-        print(f"[sync-pull] Total deleted entries in DB for user: {total_deleted_count}")
+        deleted = [row[0] for row in cursor.fetchall()]
         
         result = {
             'changes': {
@@ -112,7 +97,6 @@ def handler(event, context):
         }
         
         print(f"[sync-pull] Returning {len(created)} created, {len(updated)} updated, {len(deleted)} deleted")
-        
         return result
     
     except Exception as e:

@@ -4,6 +4,7 @@ Outbox Processor Lambda - Process outbox events to DynamoDB (every 1 minute)
 import boto3
 import json
 import os
+import time
 from decimal import Decimal
 from db_utils import get_db_connection, return_db_connection
 
@@ -31,7 +32,6 @@ def handler(event, context):
     events_table = dynamodb.Table(events_table_name)
     
     print(f"[outbox-processor] Starting processing to table {events_table_name}")
-    
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -46,7 +46,10 @@ def handler(event, context):
         
         rows = cursor.fetchall()
         
-        print(f"[outbox-processor] Found {len(rows)} unprocessed events")
+        if len(rows) == 0:
+            return {'processed': 0, 'failed': 0, 'total': 0}
+        
+        print(f"[outbox-processor] Processing {len(rows)} events")
         
         successful_count = 0
         failed_count = 0
@@ -58,7 +61,8 @@ def handler(event, context):
                 # Convert payload floats to Decimal for DynamoDB
                 converted_payload = convert_floats_to_decimal(payload)
                 
-                print(f"[outbox-processor] Processing event {event_id}, type: {event_type}, user: {user_id}")
+                # Calculate TTL: 2 years from now (in seconds since epoch)
+                ttl = int(time.time()) + (2 * 365 * 24 * 60 * 60)
                 
                 # Write to DynamoDB for pub/sub
                 events_table.put_item(Item={
@@ -66,7 +70,8 @@ def handler(event, context):
                     'type': event_type,
                     'userId': user_id,
                     'payload': converted_payload,
-                    'timestamp': int(created_at.timestamp() * 1000)
+                    'timestamp': int(created_at.timestamp() * 1000),
+                    'ttl': ttl
                 })
                 
                 # Mark as processed
@@ -78,17 +83,15 @@ def handler(event, context):
                 """, [event_id])
                 
                 conn.commit()
-                
-                print(f"[outbox-processor] Successfully processed event {event_id}")
                 successful_count += 1
                 
             except Exception as e:
                 print(f"[outbox-processor] Error processing event {event_id}: {e}")
-                print(f"[outbox-processor] Event details - type: {event_type}, user: {user_id}")
                 failed_count += 1
                 conn.rollback()
         
-        print(f"[outbox-processor] Completed: {successful_count} successful, {failed_count} failed")
+        if failed_count > 0:
+            print(f"[outbox-processor] Completed: {successful_count} successful, {failed_count} failed")
         
         return {
             'processed': successful_count,

@@ -151,25 +151,8 @@ def handler(event, context):
         
         # Process deleted entries (soft delete)
         deleted_entry_ids = changes.get('logbookEntries', {}).get('deleted', [])
-        print(f"[sync-push] Processing {len(deleted_entry_ids)} deletions")
         
         for entry_id in deleted_entry_ids:
-            print(f"[sync-push] Soft deleting entry: {entry_id}")
-            
-            # First, check if entry exists and its current state
-            cursor.execute("""
-                SELECT entry_id, user_id, deleted_at, status, date
-                FROM logbook_entries
-                WHERE entry_id = %s AND user_id = %s
-            """, [entry_id, user_id])
-            
-            existing = cursor.fetchone()
-            if existing:
-                print(f"[sync-push] Entry found - entry_id: {existing[0]}, user_id: {existing[1]}, deleted_at: {existing[2]}, status: {existing[3]}, date: {existing[4]}")
-            else:
-                print(f"[sync-push] WARNING: Entry {entry_id} not found for user {user_id}")
-                continue
-            
             # Perform soft delete
             cursor.execute("""
                 UPDATE logbook_entries SET
@@ -178,23 +161,9 @@ def handler(event, context):
                 WHERE entry_id = %s AND user_id = %s AND deleted_at IS NULL
             """, [entry_id, user_id])
             
-            rows_affected = cursor.rowcount
-            print(f"[sync-push] Soft delete UPDATE affected {rows_affected} rows for entry {entry_id}")
-            
-            # Verify the deletion
-            cursor.execute("""
-                SELECT entry_id, deleted_at, updated_at
-                FROM logbook_entries
-                WHERE entry_id = %s AND user_id = %s
-            """, [entry_id, user_id])
-            
-            verification = cursor.fetchone()
-            if verification:
-                print(f"[sync-push] Verified deletion - entry_id: {verification[0]}, deleted_at: {verification[1]}, updated_at: {verification[2]}")
-            else:
-                print(f"[sync-push] ERROR: Could not verify deletion for entry {entry_id}")
-        
-        print(f"[sync-push] Completed processing {len(deleted_entry_ids)} deletions")
+            # Log only if update failed (critical error)
+            if cursor.rowcount == 0:
+                print(f"[sync-push] WARNING: Failed to delete entry {entry_id} - not found or already deleted")
         
         # Write to outbox for pub/sub
         cursor.execute("""
