@@ -112,49 +112,6 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Updated user object
     """
-    """
-    AppSync Lambda resolver handler for updateUser mutation.
-    
-    Event structure from AppSync:
-    {
-        "arguments": {
-            "input": {
-                "name": "string",
-                "email": "string",
-                "preferences": {
-                    "defaultAirport": "string",
-                    "defaultUnits": "string",
-                    "notificationEnabled": boolean,
-                    "criticalAlertThreshold": "string"
-                }
-            }
-        },
-        "identity": {
-            "sub": "user-id-uuid"
-        },
-        "info": {
-            "fieldName": "updateUser",
-            "parentTypeName": "Mutation"
-        }
-    }
-    """
-    try:
-        # Extract user ID from Cognito identity
-        identity = event.get('identity', {})
-        user_id = identity.get('sub')
-        
-        if not user_id:
-            raise ValueError("User ID (identity.sub) is required")
-    """
-    Update user profile and preferences
-    
-    Args:
-        user_id: User's Cognito sub ID
-        event: AppSync event with input data
-    
-    Returns:
-        Updated user object
-    """
     # Extract input data
     arguments = event.get('arguments', {})
     input_data = arguments.get('input', {})
@@ -250,7 +207,7 @@ def add_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     
     Args:
         user_id: User's Cognito sub ID
-        event: AppSync event with tailNumber and notes
+        event: AppSync event with tailNumber, notes, complex, and highPerformance
     
     Returns:
         Updated user object
@@ -258,18 +215,24 @@ def add_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     arguments = event.get('arguments', {})
     tail_number = arguments.get('tailNumber')
     notes = arguments.get('notes', '')
+    complex_aircraft = arguments.get('complex', False)
+    high_performance = arguments.get('highPerformance', False)
     
     if not tail_number:
         raise ValueError("tailNumber is required")
     
-    # Normalize tail number
-    tail_number = tail_number.upper().strip()
+    # Normalize tail number (uppercase, strip spaces, ensure N prefix)
+    tail_number = tail_number.upper().strip().replace(' ', '').replace('-', '')
+    if not tail_number.startswith('N'):
+        tail_number = f"N{tail_number}"
     
     # Create aircraft ref object
     aircraft_ref = {
         'tailNumber': tail_number,
         'notes': notes,
-        'addedAt': datetime.utcnow().isoformat()
+        'addedAt': datetime.utcnow().isoformat(),
+        'complex': complex_aircraft,
+        'highPerformance': high_performance
     }
     
     # Get table reference
@@ -307,11 +270,11 @@ def add_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
 
 def update_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Update notes for an aircraft in user's aircraft array
+    Update notes and characteristics for an aircraft in user's aircraft array with flexible tail number matching
     
     Args:
         user_id: User's Cognito sub ID
-        event: AppSync event with tailNumber and notes
+        event: AppSync event with tailNumber, notes, complex, and highPerformance
     
     Returns:
         Updated user object
@@ -319,12 +282,23 @@ def update_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     arguments = event.get('arguments', {})
     tail_number = arguments.get('tailNumber')
     notes = arguments.get('notes', '')
+    complex_aircraft = arguments.get('complex')
+    high_performance = arguments.get('highPerformance')
     
     if not tail_number:
         raise ValueError("tailNumber is required")
     
-    # Normalize tail number
-    tail_number = tail_number.upper().strip()
+    # Normalize tail number (uppercase, strip spaces/dashes)
+    original_tail_number = tail_number
+    tail_number_normalized = tail_number.upper().strip().replace(' ', '').replace('-', '')
+    
+    # Create variations to check: with and without 'N' prefix
+    tail_number_with_n = tail_number_normalized if tail_number_normalized.startswith('N') else f"N{tail_number_normalized}"
+    tail_number_without_n = tail_number_normalized[1:] if tail_number_normalized.startswith('N') else tail_number_normalized
+    
+    tail_number_variations = [tail_number_normalized, tail_number_with_n, tail_number_without_n]
+    # Remove duplicates while preserving order
+    tail_number_variations = list(dict.fromkeys(tail_number_variations))
     
     # Get table reference
     users_table = get_users_table()
@@ -334,16 +308,21 @@ def update_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     user_item = user_response.get('Item', {})
     aircraft_list = user_item.get('aircraft', [])
     
-    # Find and update the aircraft
+    # Find and update the aircraft - match against any variation
     found = False
     for i, aircraft in enumerate(aircraft_list):
-        if aircraft.get('tailNumber') == tail_number:
+        if aircraft.get('tailNumber') in tail_number_variations:
             aircraft_list[i]['notes'] = notes
+            # Only update if provided in arguments
+            if complex_aircraft is not None:
+                aircraft_list[i]['complex'] = complex_aircraft
+            if high_performance is not None:
+                aircraft_list[i]['highPerformance'] = high_performance
             found = True
             break
     
     if not found:
-        raise ValueError(f"Aircraft {tail_number} not found in your list")
+        raise ValueError(f"Aircraft {original_tail_number} not found in your list")
     
     # Update the entire aircraft list
     response = users_table.update_item(
@@ -366,7 +345,7 @@ def update_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
 
 def remove_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Remove aircraft from user's aircraft array
+    Remove aircraft from user's aircraft array with flexible tail number matching
     
     Args:
         user_id: User's Cognito sub ID
@@ -381,8 +360,18 @@ def remove_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     if not tail_number:
         raise ValueError("tailNumber is required")
     
-    # Normalize tail number
-    tail_number = tail_number.upper().strip()
+    # Normalize tail number (uppercase, strip spaces/dashes)
+    original_tail_number = tail_number
+    tail_number_normalized = tail_number.upper().strip().replace(' ', '').replace('-', '')
+    
+    # Create variations to check: with and without 'N' prefix
+    # This handles cases where aircraft might be stored with or without the prefix
+    tail_number_with_n = tail_number_normalized if tail_number_normalized.startswith('N') else f"N{tail_number_normalized}"
+    tail_number_without_n = tail_number_normalized[1:] if tail_number_normalized.startswith('N') else tail_number_normalized
+    
+    tail_number_variations = [tail_number_normalized, tail_number_with_n, tail_number_without_n]
+    # Remove duplicates while preserving order
+    tail_number_variations = list(dict.fromkeys(tail_number_variations))
     
     # Get table reference
     users_table = get_users_table()
@@ -392,11 +381,11 @@ def remove_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     user_item = user_response.get('Item', {})
     aircraft_list = user_item.get('aircraft', [])
     
-    # Filter out the aircraft
-    new_aircraft_list = [a for a in aircraft_list if a.get('tailNumber') != tail_number]
+    # Filter out the aircraft - match against any variation
+    new_aircraft_list = [a for a in aircraft_list if a.get('tailNumber') not in tail_number_variations]
     
     if len(new_aircraft_list) == len(aircraft_list):
-        raise ValueError(f"Aircraft {tail_number} not found in your list")
+        raise ValueError(f"Aircraft {original_tail_number} not found in your list")
     
     # Update the aircraft list
     response = users_table.update_item(

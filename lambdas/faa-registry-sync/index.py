@@ -41,29 +41,15 @@ TTL_DAYS = 365
 
 class FAAMasterParser:
     """
-    Parser for FAA MASTER.txt file (fixed-width CSV format)
+    Parser for FAA MASTER.txt file (CSV format)
     
-    Field positions per FAA documentation:
-    https://www.faa.gov/licenses_certificates/aircraft_certification/aircraft_registry/media/ardata.pdf
+    The FAA changed from fixed-width to CSV format.
+    CSV Column positions (0-indexed):
+    0: N-NUMBER, 1: SERIAL NUMBER, 2: MFR MDL CODE, 3: ENG MFR MDL, 4: YEAR MFR,
+    5: TYPE REGISTRANT, 6: NAME, 7-11: ADDRESS, 12: REGION, 13: COUNTY, 14: COUNTRY,
+    15: LAST ACTION DATE, 16: CERT ISSUE DATE, 17: CERTIFICATION,
+    18: TYPE AIRCRAFT, 19: TYPE ENGINE, 20: STATUS CODE, 21: MODE S CODE, etc.
     """
-    
-    # Field definitions: (start_pos - 1, end_pos) - positions are 1-indexed in docs
-    FIELDS = {
-        'N_NUMBER': (0, 5),              # N-Number (without 'N' prefix)
-        'SERIAL_NUMBER': (5, 35),        # Serial Number
-        'MFR_MDL_CODE': (35, 42),        # Manufacturer Model Code
-        'ENG_MFR_MDL': (42, 47),         # Engine Manufacturer Model
-        'YEAR_MFR': (47, 51),            # Year Manufactured
-        'TYPE_REGISTRANT': (51, 52),     # Type Registrant (1=Individual, 2=Partnership, etc)
-        'NAME': (52, 102),               # Owner Name
-        'TYPE_AIRCRAFT': (102, 103),     # Type Aircraft (1=Glider, 2=Balloon, 3=Blimp/Dirigible, 
-                                          # 4=Fixed wing single engine, 5=Fixed wing multi engine, 
-                                          # 6=Rotorcraft, 7=Weight-shift-control, 8=Powered Parachute, 9=Gyroplane)
-        'TYPE_ENGINE': (103, 105),       # Type Engine (0=None, 1=Reciprocating, 2=Turbo-prop, 
-                                          # 3=Turbo-shaft, 4=Turbo-jet, 5=Turbo-fan, 6=Ramjet, 
-                                          # 7=2 Cycle, 8=4 Cycle, 10=Electric, 11=Rotary)
-        'STATUS_CODE': (105, 106),       # Status Code (V=Valid, blank=others)
-    }
     
     # Aircraft type mappings
     AIRCRAFT_TYPE_MAP = {
@@ -95,22 +81,44 @@ class FAAMasterParser:
     
     @staticmethod
     def parse_line(line: str) -> Optional[Dict[str, str]]:
-        """Parse a single line from MASTER.txt"""
-        if len(line) < 106:
+        """Parse a single line from MASTER.txt (CSV format)"""
+        # Skip header line
+        if line.startswith('N-NUMBER,'):
             return None
         
-        data = {}
-        for field, (start, end) in FAAMasterParser.FIELDS.items():
-            value = line[start:end].strip()
-            data[field] = value
+        # Split by comma
+        fields = line.split(',')
+        
+        # Must have at least 21 fields
+        if len(fields) < 21:
+            return None
+        
+        # Extract fields
+        n_number = fields[0].strip()
+        serial_number = fields[1].strip()
+        mfr_mdl_code = fields[2].strip()
+        year_mfr = fields[4].strip()
+        type_aircraft = fields[18].strip()
+        type_engine = fields[19].strip()
+        status_code = fields[20].strip()
         
         # Only process valid registrations
-        if data['STATUS_CODE'] != 'V':
+        if status_code != 'V':
             return None
         
         # Must have N-Number
-        if not data['N_NUMBER']:
+        if not n_number:
             return None
+        
+        data = {
+            'N_NUMBER': n_number,
+            'SERIAL_NUMBER': serial_number,
+            'MFR_MDL_CODE': mfr_mdl_code,
+            'YEAR_MFR': year_mfr,
+            'TYPE_AIRCRAFT': type_aircraft,
+            'TYPE_ENGINE': type_engine,
+            'STATUS_CODE': status_code
+        }
         
         return data
 
@@ -126,18 +134,27 @@ class ACFTREFParser:
         """
         Parse ACFTREF.txt and return mapping of MFR_MDL_CODE -> {make, model}
         
-        Format: Fixed-width CSV
-        CODE (0-7), MFR (8-38), MODEL (39-59), TYPE-ACFT (60-61), TYPE-ENG (62-63), AC-CAT (64-64), ...
+        Format: CSV
+        Columns: CODE, MFR, MODEL, TYPE-ACFT, TYPE-ENG, AC-CAT, etc.
         """
         mapping = {}
         
         for line in content.split('\n'):
-            if len(line) < 60:
+            # Skip header
+            if line.startswith('CODE,'):
+                continue
+                
+            # Skip empty lines
+            if not line.strip():
                 continue
             
-            code = line[0:7].strip()
-            mfr = line[8:38].strip()
-            model = line[39:59].strip()
+            fields = line.split(',')
+            if len(fields) < 3:
+                continue
+            
+            code = fields[0].strip()
+            mfr = fields[1].strip()
+            model = fields[2].strip()
             
             if code and (mfr or model):
                 mapping[code] = {
@@ -155,8 +172,8 @@ def download_faa_zip() -> bytes:
     req = urllib.request.Request(
         FAA_ZIP_URL,
         headers={
-            'User-Agent': 'SkyReady/1.0 (Flight Training App)',
-            'Accept': 'application/zip'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': '*/*'
         }
     )
     

@@ -113,9 +113,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
 
 def handle_get_user(user_id: str) -> Optional[Dict[str, Any]]:
-    """Get user by userId"""
+    """Get user by userId with strongly consistent read"""
     try:
-        response = users_table.get_item(Key={'userId': user_id})
+        # Use ConsistentRead=True to avoid eventual consistency issues
+        # This ensures we get the most up-to-date data, especially important after deletions
+        response = users_table.get_item(
+            Key={'userId': user_id},
+            ConsistentRead=True
+        )
         item = response.get('Item')
         
         if not item:
