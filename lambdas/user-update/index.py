@@ -72,6 +72,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             return update_user_aircraft(user_id, event)
         elif field_name == 'removeUserAircraft':
             return remove_user_aircraft(user_id, event)
+        elif field_name == 'archiveUserAircraft':
+            return archive_user_aircraft(user_id, event)
+        elif field_name == 'unarchiveUserAircraft':
+            return unarchive_user_aircraft(user_id, event)
         else:
             raise ValueError(f"Unknown field name: {field_name}")
     
@@ -207,16 +211,21 @@ def add_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     
     Args:
         user_id: User's Cognito sub ID
-        event: AppSync event with tailNumber, notes, complex, and highPerformance
+        event: AppSync event with tailNumber, make, model, category, class, notes, complex, highPerformance, and isManual
     
     Returns:
         Updated user object
     """
     arguments = event.get('arguments', {})
     tail_number = arguments.get('tailNumber')
+    make = arguments.get('make', '')
+    model = arguments.get('model', '')
+    category = arguments.get('category', '')
+    class_type = arguments.get('class', '')
     notes = arguments.get('notes', '')
     complex_aircraft = arguments.get('complex', False)
     high_performance = arguments.get('highPerformance', False)
+    is_manual = arguments.get('isManual', False)
     
     if not tail_number:
         raise ValueError("tailNumber is required")
@@ -229,24 +238,34 @@ def add_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     # Create aircraft ref object
     aircraft_ref = {
         'tailNumber': tail_number,
+        'make': make,
+        'model': model,
+        'category': category,
+        'class': class_type,
         'notes': notes,
         'addedAt': datetime.utcnow().isoformat(),
         'complex': complex_aircraft,
-        'highPerformance': high_performance
+        'highPerformance': high_performance,
+        'isManual': is_manual,
+        'usageCount': 0,        # Initialize to 0, will be updated when used in logbook
+        'isArchived': False     # New aircraft are always active
     }
     
     # Get table reference
     users_table = get_users_table()
     
-    # First, check if aircraft already exists
+    # First, check if aircraft already exists (including archived)
     user_response = users_table.get_item(Key={'userId': user_id})
     user_item = user_response.get('Item', {})
     existing_aircraft = user_item.get('aircraft', [])
     
-    # Check for duplicate
+    # Check for duplicate (including archived aircraft)
     for aircraft in existing_aircraft:
         if aircraft.get('tailNumber') == tail_number:
-            raise ValueError(f"Aircraft {tail_number} already in your list")
+            if aircraft.get('isArchived', False):
+                raise ValueError(f"Aircraft {tail_number} is archived. Please unarchive it instead of adding again.")
+            else:
+                raise ValueError(f"Aircraft {tail_number} already in your list")
     
     # Append to aircraft list
     response = users_table.update_item(
@@ -270,18 +289,22 @@ def add_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
 
 def update_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Update notes and characteristics for an aircraft in user's aircraft array with flexible tail number matching
+    Update aircraft details in user's aircraft array with usage-based edit locking
     
     Args:
         user_id: User's Cognito sub ID
-        event: AppSync event with tailNumber, notes, complex, and highPerformance
+        event: AppSync event with tailNumber, make, model, category, class, notes, complex, and highPerformance
     
     Returns:
         Updated user object
     """
     arguments = event.get('arguments', {})
     tail_number = arguments.get('tailNumber')
-    notes = arguments.get('notes', '')
+    make = arguments.get('make')
+    model = arguments.get('model')
+    category = arguments.get('category')
+    class_type = arguments.get('class')
+    notes = arguments.get('notes')
     complex_aircraft = arguments.get('complex')
     high_performance = arguments.get('highPerformance')
     
@@ -312,12 +335,38 @@ def update_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     found = False
     for i, aircraft in enumerate(aircraft_list):
         if aircraft.get('tailNumber') in tail_number_variations:
-            aircraft_list[i]['notes'] = notes
-            # Only update if provided in arguments
-            if complex_aircraft is not None:
-                aircraft_list[i]['complex'] = complex_aircraft
-            if high_performance is not None:
-                aircraft_list[i]['highPerformance'] = high_performance
+            usage_count = aircraft.get('usageCount', 0)
+            is_manual = aircraft.get('isManual', False)
+            
+            # USAGE-BASED EDIT LOCKING: If aircraft is used in entries, only allow notes to be edited
+            if usage_count > 0:
+                # Only notes can be edited when aircraft is used in logbook entries
+                if notes is not None:
+                    aircraft_list[i]['notes'] = notes
+                # Silently ignore other field updates to maintain historical accuracy
+            else:
+                # Aircraft not yet used - allow full editing
+                # For FAA aircraft (isManual=False), don't allow editing make/model/category/class
+                # For manual aircraft (isManual=True), allow all edits
+                
+                if notes is not None:
+                    aircraft_list[i]['notes'] = notes
+                if complex_aircraft is not None:
+                    aircraft_list[i]['complex'] = complex_aircraft
+                if high_performance is not None:
+                    aircraft_list[i]['highPerformance'] = high_performance
+                
+                # Only update make/model/category/class for manual aircraft
+                if is_manual:
+                    if make is not None:
+                        aircraft_list[i]['make'] = make
+                    if model is not None:
+                        aircraft_list[i]['model'] = model
+                    if category is not None:
+                        aircraft_list[i]['category'] = category
+                    if class_type is not None:
+                        aircraft_list[i]['class'] = class_type
+            
             found = True
             break
     
@@ -345,7 +394,25 @@ def update_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
 
 def remove_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Remove aircraft from user's aircraft array with flexible tail number matching
+    DEPRECATED: Archive aircraft instead of removing (maintains backward compatibility)
+    
+    This function now calls archive_user_aircraft to implement soft delete pattern.
+    Keeping this for backward compatibility with existing clients.
+    
+    Args:
+        user_id: User's Cognito sub ID
+        event: AppSync event with tailNumber
+    
+    Returns:
+        Updated user object
+    """
+    # Delegate to archive function for backward compatibility
+    return archive_user_aircraft(user_id, event)
+
+
+def archive_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Archive aircraft (soft delete) in user's aircraft array
     
     Args:
         user_id: User's Cognito sub ID
@@ -365,7 +432,6 @@ def remove_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     tail_number_normalized = tail_number.upper().strip().replace(' ', '').replace('-', '')
     
     # Create variations to check: with and without 'N' prefix
-    # This handles cases where aircraft might be stored with or without the prefix
     tail_number_with_n = tail_number_normalized if tail_number_normalized.startswith('N') else f"N{tail_number_normalized}"
     tail_number_without_n = tail_number_normalized[1:] if tail_number_normalized.startswith('N') else tail_number_normalized
     
@@ -381,10 +447,15 @@ def remove_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     user_item = user_response.get('Item', {})
     aircraft_list = user_item.get('aircraft', [])
     
-    # Filter out the aircraft - match against any variation
-    new_aircraft_list = [a for a in aircraft_list if a.get('tailNumber') not in tail_number_variations]
+    # Find and archive the aircraft
+    found = False
+    for i, aircraft in enumerate(aircraft_list):
+        if aircraft.get('tailNumber') in tail_number_variations:
+            aircraft_list[i]['isArchived'] = True
+            found = True
+            break
     
-    if len(new_aircraft_list) == len(aircraft_list):
+    if not found:
         raise ValueError(f"Aircraft {original_tail_number} not found in your list")
     
     # Update the aircraft list
@@ -392,7 +463,76 @@ def remove_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         Key={'userId': user_id},
         UpdateExpression="SET aircraft = :aircraft, updatedAt = :updatedAt",
         ExpressionAttributeValues={
-            ':aircraft': new_aircraft_list,
+            ':aircraft': aircraft_list,
+            ':updatedAt': datetime.utcnow().isoformat()
+        },
+        ReturnValues='ALL_NEW'
+    )
+    
+    # Get the updated item
+    updated_item = response.get('Attributes', {})
+    if 'id' not in updated_item:
+        updated_item['id'] = updated_item.get('userId', user_id)
+    
+    return convert_item(updated_item)
+
+
+def unarchive_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Unarchive aircraft in user's aircraft array
+    
+    Args:
+        user_id: User's Cognito sub ID
+        event: AppSync event with tailNumber
+    
+    Returns:
+        Updated user object
+    """
+    arguments = event.get('arguments', {})
+    tail_number = arguments.get('tailNumber')
+    
+    if not tail_number:
+        raise ValueError("tailNumber is required")
+    
+    # Normalize tail number (uppercase, strip spaces/dashes)
+    original_tail_number = tail_number
+    tail_number_normalized = tail_number.upper().strip().replace(' ', '').replace('-', '')
+    
+    # Create variations to check: with and without 'N' prefix
+    tail_number_with_n = tail_number_normalized if tail_number_normalized.startswith('N') else f"N{tail_number_normalized}"
+    tail_number_without_n = tail_number_normalized[1:] if tail_number_normalized.startswith('N') else tail_number_normalized
+    
+    tail_number_variations = [tail_number_normalized, tail_number_with_n, tail_number_without_n]
+    # Remove duplicates while preserving order
+    tail_number_variations = list(dict.fromkeys(tail_number_variations))
+    
+    # Get table reference
+    users_table = get_users_table()
+    
+    # Get current user item
+    user_response = users_table.get_item(Key={'userId': user_id})
+    user_item = user_response.get('Item', {})
+    aircraft_list = user_item.get('aircraft', [])
+    
+    # Find and unarchive the aircraft
+    found = False
+    for i, aircraft in enumerate(aircraft_list):
+        if aircraft.get('tailNumber') in tail_number_variations:
+            if not aircraft.get('isArchived', False):
+                raise ValueError(f"Aircraft {original_tail_number} is not archived")
+            aircraft_list[i]['isArchived'] = False
+            found = True
+            break
+    
+    if not found:
+        raise ValueError(f"Aircraft {original_tail_number} not found in your list")
+    
+    # Update the aircraft list
+    response = users_table.update_item(
+        Key={'userId': user_id},
+        UpdateExpression="SET aircraft = :aircraft, updatedAt = :updatedAt",
+        ExpressionAttributeValues={
+            ':aircraft': aircraft_list,
             ':updatedAt': datetime.utcnow().isoformat()
         },
         ReturnValues='ALL_NEW'
