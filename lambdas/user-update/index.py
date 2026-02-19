@@ -5,6 +5,8 @@ Handles conditional updates to user profile and preferences.
 import json
 import os
 import boto3
+import secrets
+import string
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Any, Optional
@@ -12,6 +14,16 @@ from typing import Dict, Any, Optional
 # Lazy initialization - DynamoDB resources created on first use to reduce cold start time
 _dynamodb_resource = None
 _users_table = None
+
+
+def generate_invite_code() -> str:
+    """
+    Generate a unique 8-character alphanumeric invite code (uppercase).
+    Uses cryptographically secure random number generator.
+    Format: ABCD1234
+    """
+    alphabet = string.ascii_uppercase + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(8))
 
 
 def get_users_table():
@@ -161,6 +173,61 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         if 'criticalAlertThreshold' in preferences and preferences['criticalAlertThreshold'] is not None:
             update_expression_parts.append("preferences.criticalAlertThreshold = :criticalAlertThreshold")
             expression_values[":criticalAlertThreshold"] = preferences['criticalAlertThreshold']
+    
+    # Conditionally update pilotInfo if provided
+    pilot_info = input_data.get('pilotInfo')
+    if pilot_info is not None:
+        # Student/pilot fields
+        if 'licenseNumber' in pilot_info and pilot_info['licenseNumber'] is not None:
+            update_expression_parts.append("pilotInfo.licenseNumber = :licenseNumber")
+            expression_values[":licenseNumber"] = pilot_info['licenseNumber']
+        
+        if 'certificateType' in pilot_info and pilot_info['certificateType'] is not None:
+            update_expression_parts.append("pilotInfo.certificateType = :certificateType")
+            expression_values[":certificateType"] = pilot_info['certificateType']
+        
+        if 'aircraftRatings' in pilot_info and pilot_info['aircraftRatings'] is not None:
+            update_expression_parts.append("pilotInfo.aircraftRatings = :aircraftRatings")
+            expression_values[":aircraftRatings"] = pilot_info['aircraftRatings']
+        
+        if 'medicalCertificateDate' in pilot_info and pilot_info['medicalCertificateDate'] is not None:
+            update_expression_parts.append("pilotInfo.medicalCertificateDate = :medicalCertificateDate")
+            expression_values[":medicalCertificateDate"] = pilot_info['medicalCertificateDate']
+        
+        if 'medicalCertificateClass' in pilot_info and pilot_info['medicalCertificateClass'] is not None:
+            update_expression_parts.append("pilotInfo.medicalCertificateClass = :medicalCertificateClass")
+            expression_values[":medicalCertificateClass"] = pilot_info['medicalCertificateClass']
+        
+        if 'dateOfBirth' in pilot_info and pilot_info['dateOfBirth'] is not None:
+            update_expression_parts.append("pilotInfo.dateOfBirth = :dateOfBirth")
+            expression_values[":dateOfBirth"] = pilot_info['dateOfBirth']
+        
+        # Instructor fields
+        if 'instructorCertificates' in pilot_info and pilot_info['instructorCertificates'] is not None:
+            update_expression_parts.append("pilotInfo.instructorCertificates = :instructorCertificates")
+            expression_values[":instructorCertificates"] = pilot_info['instructorCertificates']
+        
+        if 'instructorCertificateNumber' in pilot_info and pilot_info['instructorCertificateNumber'] is not None:
+            update_expression_parts.append("pilotInfo.instructorCertificateNumber = :instructorCertificateNumber")
+            expression_values[":instructorCertificateNumber"] = pilot_info['instructorCertificateNumber']
+        
+        if 'instructorCertificateExpiration' in pilot_info and pilot_info['instructorCertificateExpiration'] is not None:
+            update_expression_parts.append("pilotInfo.instructorCertificateExpiration = :instructorCertificateExpiration")
+            expression_values[":instructorCertificateExpiration"] = pilot_info['instructorCertificateExpiration']
+        
+        # Auto-generate inviteCode if instructor certificates are set and inviteCode doesn't exist
+        # Need to check if inviteCode already exists first
+        users_table = get_users_table()
+        user_response = users_table.get_item(Key={'userId': user_id})
+        existing_user = user_response.get('Item', {})
+        existing_pilot_info = existing_user.get('pilotInfo', {})
+        existing_invite_code = existing_pilot_info.get('inviteCode')
+        
+        # If user is setting instructor certificates and doesn't have an invite code, generate one
+        if 'instructorCertificates' in pilot_info and pilot_info['instructorCertificates'] and not existing_invite_code:
+            new_invite_code = generate_invite_code()
+            update_expression_parts.append("pilotInfo.inviteCode = :inviteCode")
+            expression_values[":inviteCode"] = new_invite_code
     
     # Conditionally update aircraft array if provided (bulk update)
     aircraft = input_data.get('aircraft')

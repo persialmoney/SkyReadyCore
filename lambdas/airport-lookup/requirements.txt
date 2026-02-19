@@ -1,1 +1,1 @@
-glide-py==1.0.0
+valkey-glide>=1.0.0

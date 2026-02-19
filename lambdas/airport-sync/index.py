@@ -9,14 +9,15 @@ import logging
 import os
 from typing import List, Dict, Any
 from datetime import datetime
-from glide import GlideClusterClient, GlideClusterClientConfiguration
+from glide import GlideClusterClient, GlideClusterClientConfiguration, NodeAddress
 import httpx
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 AIRPORTS_CSV_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
-VALKEY_ENDPOINT = os.environ.get('VALKEY_ENDPOINT', '')
+ELASTICACHE_ENDPOINT = os.environ.get('ELASTICACHE_ENDPOINT', '')
+ELASTICACHE_PORT = int(os.environ.get('ELASTICACHE_PORT', 6379))
 TTL_AIRPORTS = 86400 * 7  # 7 days
 
 async def download_airports() -> List[Dict[str, Any]]:
@@ -56,11 +57,12 @@ async def download_airports() -> List[Dict[str, Any]]:
 
 async def sync_to_valkey(airports: List[Dict[str, Any]]):
     """Sync airports to Valkey cache"""
-    logger.info(f"[Airport Sync] Connecting to Valkey at {VALKEY_ENDPOINT}")
+    logger.info(f"[Airport Sync] Connecting to Valkey at {ELASTICACHE_ENDPOINT}:{ELASTICACHE_PORT}")
     
     config = GlideClusterClientConfiguration(
-        addresses=[VALKEY_ENDPOINT],
+        addresses=[NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)],
         use_tls=True,
+        request_timeout=10000,
     )
     client = await GlideClusterClient.create(config)
     

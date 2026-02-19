@@ -7,12 +7,13 @@ import json
 import logging
 import os
 from typing import Optional, Dict, Any
-from glide import GlideClusterClient, GlideClusterClientConfiguration
+from glide import GlideClusterClient, GlideClusterClientConfiguration, NodeAddress
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-VALKEY_ENDPOINT = os.environ.get('VALKEY_ENDPOINT', '')
+ELASTICACHE_ENDPOINT = os.environ.get('ELASTICACHE_ENDPOINT', '')
+ELASTICACHE_PORT = int(os.environ.get('ELASTICACHE_PORT', 6379))
 
 # Glide client (reused across invocations)
 glide_client = None
@@ -34,8 +35,9 @@ async def get_glide_client() -> Optional[GlideClusterClient]:
     
     try:
         config = GlideClusterClientConfiguration(
-            addresses=[VALKEY_ENDPOINT],
+            addresses=[NodeAddress(ELASTICACHE_ENDPOINT, ELASTICACHE_PORT)],
             use_tls=True,
+            request_timeout=10000,
         )
         glide_client = await GlideClusterClient.create(config)
         logger.info("[Airport Lookup] Glide client connected")
