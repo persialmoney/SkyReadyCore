@@ -41,7 +41,9 @@ def handler(event, context):
                 day_takeoffs, day_landings, night_takeoffs, night_landings,
                 day_full_stop_landings, night_full_stop_landings,
                 approaches, holds, tracking,
-                instructor, student, lesson_topic, ground_instruction,
+                instructor_user_id, instructor_snapshot, student_user_id, student_snapshot,
+                mirrored_from_entry_id, mirrored_from_user_id,
+                lesson_topic, ground_instruction,
                 maneuvers, remarks, safety_notes, safety_relevant,
                 status, signature, is_flight_review,
                 created_at, updated_at
@@ -63,8 +65,8 @@ def handler(event, context):
         
         for row in rows:
             entry_id = row[0]
-            created_at = int(row[38].timestamp() * 1000)
-            updated_at = int(row[39].timestamp() * 1000) if row[39] else created_at
+            created_at = int(row[42].timestamp() * 1000)
+            updated_at = int(row[43].timestamp() * 1000) if row[43] else created_at
             
             if created_at > last_pulled_at:
                 created.append(format_entry(row))
@@ -136,17 +138,21 @@ def format_entry(row):
         'approaches': int(row[24]) if row[24] else 0,
         'holds': bool(row[25]) if row[25] is not None else False,
         'tracking': bool(row[26]) if row[26] is not None else False,
-        'instructor': row[27],
-        'student': row[28],
-        'lessonTopic': row[29],
-        'groundInstruction': float(row[30]) if row[30] else 0,
-        'maneuvers': row[31] if row[31] else [],
-        'remarks': row[32],
-        'safetyNotes': row[33],
-        'safetyRelevant': bool(row[34]) if row[34] is not None else False,
-        'status': row[35],
-        'signature': row[36],
-        'isFlightReview': bool(row[37]) if row[37] is not None else False,
-        'createdAt': int(row[38].timestamp() * 1000),
-        'updatedAt': int(row[39].timestamp() * 1000) if row[39] else int(row[38].timestamp() * 1000),
+        'instructorUserId': row[27],
+        'instructorSnapshot': row[28],
+        'studentUserId': row[29],
+        'studentSnapshot': row[30],
+        'mirroredFromEntryId': row[31],
+        'mirroredFromUserId': row[32],
+        'lessonTopic': row[33],
+        'groundInstruction': float(row[34]) if row[34] else 0,
+        'maneuvers': row[35] if row[35] else [],
+        'remarks': row[36],
+        'safetyNotes': row[37],
+        'safetyRelevant': bool(row[38]) if row[38] is not None else False,
+        'status': row[39],
+        'signature': row[40],
+        'isFlightReview': bool(row[41]) if row[41] is not None else False,
+        'createdAt': int(row[42].timestamp() * 1000),
+        'updatedAt': int(row[43].timestamp() * 1000) if row[43] else int(row[42].timestamp() * 1000),
     }
