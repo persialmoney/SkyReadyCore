@@ -151,7 +151,7 @@ def handle_request_otp(user_id: str) -> Dict[str, Any]:
     if existing:
         request_count = existing.get('requestCount', 0)
         last_request = existing.get('lastRequestAt', 0)
-        if now - last_request < 3600 and request_count >= OTP_RATE_LIMIT_PER_HOUR:
+        if now - last_request < 300 and request_count >= OTP_RATE_LIMIT_PER_HOUR:
             raise ValueError("Too many OTP requests. Please try again later.")
 
     otp = ''.join([str(secrets.randbelow(10)) for _ in range(6)])
