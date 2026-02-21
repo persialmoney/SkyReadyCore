@@ -292,6 +292,7 @@ def add_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     notes = arguments.get('notes', '')
     complex_aircraft = arguments.get('complex', False)
     high_performance = arguments.get('highPerformance', False)
+    tailwheel = arguments.get('tailwheel', False)
     is_manual = arguments.get('isManual', False)
     
     if not tail_number:
@@ -313,6 +314,7 @@ def add_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         'addedAt': datetime.utcnow().isoformat(),
         'complex': complex_aircraft,
         'highPerformance': high_performance,
+        'tailwheel': tailwheel,
         'isManual': is_manual,
         'usageCount': 0,        # Initialize to 0, will be updated when used in logbook
         'isArchived': False     # New aircraft are always active
@@ -374,6 +376,7 @@ def update_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     notes = arguments.get('notes')
     complex_aircraft = arguments.get('complex')
     high_performance = arguments.get('highPerformance')
+    tailwheel = arguments.get('tailwheel')
     
     if not tail_number:
         raise ValueError("tailNumber is required")
@@ -422,6 +425,8 @@ def update_user_aircraft(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
                     aircraft_list[i]['complex'] = complex_aircraft
                 if high_performance is not None:
                     aircraft_list[i]['highPerformance'] = high_performance
+                if tailwheel is not None:
+                    aircraft_list[i]['tailwheel'] = tailwheel
                 
                 # Only update make/model/category/class for manual aircraft
                 if is_manual:
