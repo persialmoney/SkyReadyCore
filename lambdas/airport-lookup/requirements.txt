@@ -1,1 +1,2 @@
-valkey-glide>=1.0.0
+# valkey-glide is provided by the valkey_glide_layer (Docker-bundled for x86_64)
+# No additional dependencies to bundle

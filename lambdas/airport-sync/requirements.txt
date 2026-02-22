@@ -1,2 +1,3 @@
-valkey-glide>=1.0.0
+# valkey-glide is provided by the valkey_glide_layer (Docker-bundled for x86_64)
+# httpx is bundled directly into the Lambda package via CDK BundlingOptions
 httpx>=0.27.0

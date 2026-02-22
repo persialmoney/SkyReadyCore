@@ -1,2 +1,3 @@
-boto3>=1.34.0
-psycopg2-binary>=2.9.9
+# psycopg2-binary is provided by the psycopg2_layer (Docker-bundled for x86_64)
+# boto3 is pre-installed in the Lambda runtime
+# No additional dependencies to bundle
