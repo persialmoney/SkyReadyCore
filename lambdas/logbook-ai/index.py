@@ -5,9 +5,9 @@ Handles semantic search and conversational AI queries using AWS Bedrock.
 import json
 import os
 import boto3
-import psycopg2
-from psycopg2.extras import RealDictCursor, Json
-from psycopg2.pool import ThreadedConnectionPool
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
@@ -16,7 +16,7 @@ secrets_client = boto3.client('secretsmanager')
 bedrock_client = boto3.client('bedrock-runtime', region_name=os.environ.get('BEDROCK_REGION', 'us-east-1'))
 
 # Database connection pool (initialized lazily)
-db_pool: Optional[ThreadedConnectionPool] = None
+db_pool: Optional[ConnectionPool] = None
 
 # Environment variables
 DB_SECRET_ARN = os.environ.get('DB_SECRET_ARN')
@@ -26,40 +26,33 @@ EMBEDDING_MODEL_ID = os.environ.get('EMBEDDING_MODEL_ID', 'amazon.titan-embed-te
 CHAT_MODEL_ID = os.environ.get('CHAT_MODEL_ID', 'anthropic.claude-sonnet-4-20250517-v1:0')
 
 
-def get_db_credentials() -> Dict[str, str]:
-    """Retrieve database credentials from Secrets Manager"""
+def get_db_conninfo() -> str:
+    """Retrieve database credentials from Secrets Manager and return a conninfo string."""
     try:
         response = secrets_client.get_secret_value(SecretId=DB_SECRET_ARN)
         secret = json.loads(response['SecretString'])
-        return {
-            'host': DB_ENDPOINT,
-            'port': 5432,
-            'database': DB_NAME,
-            'user': secret['username'],
-            'password': secret['password']
-        }
+        return (
+            f"host={DB_ENDPOINT} port=5432 dbname={DB_NAME} "
+            f"user={secret['username']} password={secret['password']}"
+        )
     except Exception as e:
         print(f"Error retrieving DB credentials: {str(e)}")
         raise
 
 
 def get_db_connection():
-    """Get database connection from pool"""
+    """Get database connection from pool."""
     global db_pool
-    
+
     if db_pool is None:
-        credentials = get_db_credentials()
-        db_pool = ThreadedConnectionPool(
-            minconn=1,
-            maxconn=5,
-            **credentials
-        )
-    
+        conninfo = get_db_conninfo()
+        db_pool = ConnectionPool(conninfo=conninfo, min_size=1, max_size=5, open=True)
+
     return db_pool.getconn()
 
 
 def return_db_connection(conn):
-    """Return connection to pool"""
+    """Return connection to pool."""
     if db_pool:
         db_pool.putconn(conn)
 
@@ -252,7 +245,7 @@ def handle_semantic_search(user_id: str, arguments: Dict[str, Any]) -> List[Dict
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor(row_factory=dict_row)
         
         # Use pgvector cosine similarity search
         # The <=> operator computes cosine distance (lower = more similar)
@@ -273,7 +266,13 @@ def handle_semantic_search(user_id: str, arguments: Dict[str, Any]) -> List[Dict
         
         results = [dict(row) for row in cur.fetchall()]
         cur.close()
-        
+
+        # Commit the read-only transaction so the connection is in a clean
+        # state when returned to the pool. psycopg3 starts a transaction on
+        # every statement; returning an INTRANS connection causes the pool to
+        # warn and roll back.
+        conn.commit()
+
         # Convert to GraphQL format
         entries = [convert_db_entry_to_graphql(entry) for entry in results]
         
@@ -297,7 +296,7 @@ def handle_chat_query(user_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor(row_factory=dict_row)
         
         # Get user's logbook entries for context
         cur.execute("""
@@ -312,7 +311,12 @@ def handle_chat_query(user_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]
         
         entries = [dict(row) for row in cur.fetchall()]
         cur.close()
-        
+
+        # Commit the read-only transaction before the Bedrock call so the
+        # connection is returned to the pool in a clean state if an exception
+        # occurs during inference.
+        conn.commit()
+
         # Build context from entries
         context_parts = []
         for entry in entries[:20]:  # Use top 20 entries for context

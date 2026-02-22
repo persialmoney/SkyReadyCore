@@ -84,7 +84,13 @@ def handler(event, context):
         """, [user_id, last_pulled_datetime])
         
         deleted = [row[0] for row in cursor.fetchall()]
-        
+
+        # Commit the read-only transaction so the connection is clean when
+        # returned to the pool. psycopg3 starts a transaction on every statement;
+        # returning a connection in INTRANS state causes the pool to warn and
+        # roll back.
+        conn.commit()
+
         result = {
             'changes': {
                 'logbookEntries': {
@@ -97,12 +103,13 @@ def handler(event, context):
             'hasMore': len(rows) == limit,
             'timestamp': timestamp
         }
-        
+
         print(f"[sync-pull] Returning {len(created)} created, {len(updated)} updated, {len(deleted)} deleted")
         return result
-    
+
     except Exception as e:
         print(f"[sync-pull] Error: {e}")
+        conn.rollback()
         raise e
     finally:
         cursor.close()

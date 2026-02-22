@@ -34,7 +34,7 @@ def handler(event, context):
     print(f"[outbox-processor] Starting processing to table {events_table_name}")
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     try:
         cursor.execute("""
             SELECT id, event_type, user_id, payload, created_at
@@ -43,27 +43,33 @@ def handler(event, context):
             ORDER BY created_at
             LIMIT 100
         """)
-        
+
         rows = cursor.fetchall()
-        
+
+        # Commit the read so the connection is in a clean state before any
+        # per-row write transactions. psycopg3 starts a transaction on every
+        # statement; not committing leaves the connection in INTRANS state,
+        # which causes the pool to warn and roll back on return.
+        conn.commit()
+
         if len(rows) == 0:
             return {'processed': 0, 'failed': 0, 'total': 0}
-        
+
         print(f"[outbox-processor] Processing {len(rows)} events")
-        
+
         successful_count = 0
         failed_count = 0
-        
+
         for row in rows:
             event_id, event_type, user_id, payload, created_at = row
-            
+
             try:
                 # Convert payload floats to Decimal for DynamoDB
                 converted_payload = convert_floats_to_decimal(payload)
-                
+
                 # Calculate TTL: 2 years from now (in seconds since epoch)
                 ttl = int(time.time()) + (2 * 365 * 24 * 60 * 60)
-                
+
                 # Write to DynamoDB for pub/sub
                 events_table.put_item(Item={
                     'id': str(event_id),
@@ -73,34 +79,35 @@ def handler(event, context):
                     'timestamp': int(created_at.timestamp() * 1000),
                     'ttl': ttl
                 })
-                
-                # Mark as processed
+
+                # Mark as processed and commit this row's transaction
                 cursor.execute("""
                     UPDATE outbox SET
                         processed = true,
                         processed_at = NOW()
                     WHERE id = %s
                 """, [event_id])
-                
+
                 conn.commit()
                 successful_count += 1
-                
+
             except Exception as e:
                 print(f"[outbox-processor] Error processing event {event_id}: {e}")
                 failed_count += 1
                 conn.rollback()
-        
+
         if failed_count > 0:
             print(f"[outbox-processor] Completed: {successful_count} successful, {failed_count} failed")
-        
+
         return {
             'processed': successful_count,
             'failed': failed_count,
             'total': len(rows)
         }
-    
+
     except Exception as e:
         print(f"[outbox-processor] Error: {e}")
+        conn.rollback()
         raise e
     finally:
         cursor.close()

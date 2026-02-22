@@ -9,7 +9,7 @@ import os
 import uuid
 import hashlib
 from db_utils import get_db_connection, return_db_connection
-import psycopg2
+import psycopg
 
 
 def validate_signature_hash(entry):
@@ -107,8 +107,8 @@ def create_cfi_mirror_entry(cursor, student_entry, student_user_id):
         )
     """, [
         mirror_entry_id, cfi_user_id, student_entry['date'],
-        json.dumps(student_entry.get('aircraft')), student_entry.get('tailNumber'),
-        student_entry.get('route'), json.dumps(student_entry.get('routeLegs', [])),
+        student_entry.get('aircraft'), student_entry.get('tailNumber'),
+        student_entry.get('route'), student_entry.get('routeLegs', []),
         student_entry.get('flightTypes', []),
         total_time,  # Total time same
         total_time,  # CFI logs PIC time while instructing
@@ -121,7 +121,7 @@ def create_cfi_mirror_entry(cursor, student_entry, student_user_id):
         student_entry.get('approaches', 0), student_entry.get('holds', False),
         student_entry.get('tracking', False),
         student_user_id,  # Link to student's account
-        json.dumps(student_snapshot),
+        student_snapshot,
         student_entry.get('lessonTopic'), student_entry.get('groundInstruction', 0),
         student_entry.get('maneuvers', []),
         student_entry.get('remarks'),
@@ -147,8 +147,6 @@ def handler(event, context):
     cursor = conn.cursor()
     
     try:
-        cursor.execute('BEGIN')
-        
         conflicts = []
         timestamp = int(time.time() * 1000)
         
@@ -185,8 +183,8 @@ def handler(event, context):
                     )
                 """, [
                     entry['entryId'], user_id, entry['date'],
-                    json.dumps(entry.get('aircraft')), entry.get('tailNumber'),
-                    entry.get('route'), json.dumps(entry.get('routeLegs', [])),
+                    entry.get('aircraft'), entry.get('tailNumber'),
+                    entry.get('route'), entry.get('routeLegs', []),
                     entry.get('flightTypes', []), entry.get('totalTime', 0),
                     entry.get('pic', 0), entry.get('sic', 0),
                     entry.get('dualReceived', 0), entry.get('dualGiven', 0),
@@ -198,12 +196,12 @@ def handler(event, context):
                     entry.get('dayFullStopLandings', 0),
                     entry.get('nightFullStopLandings', 0), entry.get('approaches', 0),
                     entry.get('holds', False), entry.get('tracking', False),
-                    entry.get('instructorUserId'), json.dumps(entry.get('instructorSnapshot')),
-                    entry.get('studentUserId'), json.dumps(entry.get('studentSnapshot')),
+                    entry.get('instructorUserId'), entry.get('instructorSnapshot'),
+                    entry.get('studentUserId'), entry.get('studentSnapshot'),
                     entry.get('lessonTopic'), entry.get('groundInstruction', 0),
                     entry.get('maneuvers', []), entry.get('remarks'),
                     entry.get('safetyNotes'), entry.get('safetyRelevant', False),
-                    entry.get('status', 'DRAFT'), json.dumps(entry.get('signature')),
+                    entry.get('status', 'DRAFT'), entry.get('signature'),
                     entry.get('isFlightReview', False),
                     entry.get('mirroredFromEntryId'), entry.get('mirroredFromUserId')
                 ])
@@ -212,7 +210,10 @@ def handler(event, context):
                 if entry.get('status') == 'SIGNED' and entry.get('instructorUserId'):
                     create_cfi_mirror_entry(cursor, entry, user_id)
                 
-            except psycopg2.IntegrityError as e:
+            except psycopg.errors.UniqueViolation as e:
+                # psycopg3 puts the connection in an error state on any exception;
+                # must rollback before continuing to process remaining entries.
+                conn.rollback()
                 print(f"[sync-push] Conflict creating entry {entry['entryId']}: {e}")
                 conflicts.append({
                     'entryId': entry['entryId'],
@@ -286,8 +287,8 @@ def handler(event, context):
                 WHERE entry_id = %s AND user_id = %s AND deleted_at IS NULL
             """, [
                 entry_data['date'],
-                json.dumps(entry_data.get('aircraft')), entry_data.get('tailNumber'),
-                entry_data.get('route'), json.dumps(entry_data.get('routeLegs', [])),
+                entry_data.get('aircraft'), entry_data.get('tailNumber'),
+                entry_data.get('route'), entry_data.get('routeLegs', []),
                 entry_data.get('flightTypes', []),
                 entry_data.get('totalTime', 0),
                 entry_data.get('pic', 0), entry_data.get('sic', 0),
@@ -301,13 +302,13 @@ def handler(event, context):
                 entry_data.get('nightFullStopLandings', 0),
                 entry_data.get('approaches', 0), entry_data.get('holds', False),
                 entry_data.get('tracking', False),
-                entry_data.get('instructorUserId'), json.dumps(entry_data.get('instructorSnapshot')),
-                entry_data.get('studentUserId'), json.dumps(entry_data.get('studentSnapshot')),
+                entry_data.get('instructorUserId'), entry_data.get('instructorSnapshot'),
+                entry_data.get('studentUserId'), entry_data.get('studentSnapshot'),
                 entry_data.get('lessonTopic'), entry_data.get('groundInstruction', 0),
                 entry_data.get('maneuvers', []),
                 entry_data.get('remarks'), entry_data.get('safetyNotes'),
                 entry_data.get('safetyRelevant', False),
-                entry_data.get('status', 'DRAFT'), json.dumps(entry_data.get('signature')),
+                entry_data.get('status', 'DRAFT'), entry_data.get('signature'),
                 entry_data.get('isFlightReview', False),
                 entry_id, user_id
             ])
@@ -338,20 +339,17 @@ def handler(event, context):
             VALUES (%s, %s, %s, NOW())
         """, ['sync_push', user_id, json.dumps(changes)])
         
-        cursor.execute('COMMIT')
-        
+        conn.commit()
+
         print(f"[sync-push] Success: {len(conflicts)} conflicts")
-        
+
         return {
             'timestamp': timestamp,
             'conflicts': conflicts
         }
-    
+
     except Exception as e:
-        try:
-            cursor.execute('ROLLBACK')
-        except:
-            pass  # Connection might already be closed
+        conn.rollback()
         print(f"[sync-push] Error: {e}")
         raise e
     finally:

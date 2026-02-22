@@ -174,17 +174,17 @@ def hard_delete_postgres_data(user_id: str) -> Dict:
         print("[DeletionProcessor] PostgreSQL not configured, skipping")
         return result
 
-    import psycopg2
+    import psycopg
 
     secrets_client = boto3.client('secretsmanager')
     secret = json.loads(
         secrets_client.get_secret_value(SecretId=db_secret_arn)['SecretString']
     )
 
-    conn = psycopg2.connect(
+    conn = psycopg.connect(
         host=db_endpoint,
         port=5432,
-        database=db_name,
+        dbname=db_name,
         user=secret['username'],
         password=secret['password'],
     )
