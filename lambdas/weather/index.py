@@ -1257,27 +1257,56 @@ async def fetch_airmets(airport_code: str) -> list:
             data = json.loads(response.read().decode())
 
         results = []
-        for report in data.get("results", []):
+        # API returns either "reports" or "results" depending on the response shape
+        raw_reports = data.get("reports") or data.get("results") or []
+        for report in raw_reports:
             bulletin = report.get("bulletin") or {}
             report_type = (bulletin.get("type") or {}).get("value", "")
 
-            start_time_obj = report.get("start_time") or {}
-            end_time_obj = report.get("end_time") or {}
-
+            # start_time / end_time at the report level are often null;
+            # prefer the observation window, fall back to forecast window
             obs = report.get("observation") or {}
-            obs_type_obj = obs.get("type") or {}
-            floor_obj = obs.get("floor") or {}
-            ceiling_obj = obs.get("ceiling") or {}
+            forecast = report.get("forecast") or {}
+
+            def _dt(obj):
+                """Safely pull the ISO datetime string from a time object."""
+                if not obj:
+                    return None
+                return obj.get("dt")
+
+            start_time = (
+                _dt(report.get("start_time"))
+                or _dt(obs.get("start_time"))
+                or _dt(forecast.get("start_time"))
+            )
+            end_time = (
+                _dt(report.get("end_time"))
+                or _dt(obs.get("end_time"))
+                or _dt(forecast.get("end_time"))
+            )
+
+            def _alt(obj):
+                """Extract altitude value from either an int or an {repr, value} object."""
+                if obj is None:
+                    return None
+                if isinstance(obj, dict):
+                    return obj.get("value")
+                return int(obj)  # already a plain number
+
+            floor_val = _alt(obs.get("floor")) if obs.get("floor") is not None else _alt((forecast or {}).get("floor"))
+            ceiling_val = _alt(obs.get("ceiling")) if obs.get("ceiling") is not None else _alt((forecast or {}).get("ceiling"))
+
+            obs_type = (obs.get("type") or {}).get("value") or (forecast.get("type") or {}).get("value")
 
             results.append({
                 "reportType": report_type,
                 "type": report.get("type", ""),
                 "area": report.get("area"),
-                "startTime": start_time_obj.get("dt"),
-                "endTime": end_time_obj.get("dt"),
-                "observationType": obs_type_obj.get("value"),
-                "floor": floor_obj.get("value"),
-                "ceiling": ceiling_obj.get("value"),
+                "startTime": start_time,
+                "endTime": end_time,
+                "observationType": obs_type,
+                "floor": floor_val,
+                "ceiling": ceiling_val,
                 "raw": report.get("raw", ""),
             })
 
