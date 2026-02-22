@@ -40,6 +40,25 @@ METAR_URL = f"{AWC_BASE_URL}/metar"
 TAF_URL = f"{AWC_BASE_URL}/taf"
 NOTAM_URL = f"{AWC_BASE_URL}/notam"
 
+# AVWX API for AIR/SIGMET advisories
+AVWX_BASE_URL = "https://avwx.rest/api"
+_AVWX_SECRET_NAME = os.environ.get('AVWX_SECRET_NAME', 'sky-ready/avwx-token')
+_avwx_token_cache: str = ''  # module-level cache — reused across warm invocations
+
+def _get_avwx_token() -> str:
+    """Fetch the AVWX token from Secrets Manager, caching it for the lifetime of the container."""
+    global _avwx_token_cache
+    if _avwx_token_cache:
+        return _avwx_token_cache
+    try:
+        sm = boto3.client('secretsmanager')
+        resp = sm.get_secret_value(SecretId=_AVWX_SECRET_NAME)
+        _avwx_token_cache = resp.get('SecretString', '')
+        return _avwx_token_cache
+    except Exception as e:
+        logger.error(f"[AIRMET] Failed to fetch AVWX token from Secrets Manager: {e}")
+        return ''
+
 # Glide client (lazy initialization)
 glide_client = None
 
@@ -1217,6 +1236,66 @@ def _create_fallback_forecast(taf_data: Dict) -> list:
     }]
 
 
+async def fetch_airmets(airport_code: str) -> list:
+    """
+    Fetch active AIRMET and SIGMET advisories that contain the given airport
+    using the AVWX REST API /airsigmet/{location} endpoint.
+    Returns an empty list on error or when no advisories are active.
+    """
+    airport_code = airport_code.upper()
+
+    token = _get_avwx_token()
+    if not token:
+        logger.warning("[AIRMET] AVWX token not available, skipping advisory fetch")
+        return []
+
+    url = f"{AVWX_BASE_URL}/airsigmet/{airport_code}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Token {token}"})
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+
+        results = []
+        for report in data.get("results", []):
+            bulletin = report.get("bulletin") or {}
+            report_type = (bulletin.get("type") or {}).get("value", "")
+
+            start_time_obj = report.get("start_time") or {}
+            end_time_obj = report.get("end_time") or {}
+
+            obs = report.get("observation") or {}
+            obs_type_obj = obs.get("type") or {}
+            floor_obj = obs.get("floor") or {}
+            ceiling_obj = obs.get("ceiling") or {}
+
+            results.append({
+                "reportType": report_type,
+                "type": report.get("type", ""),
+                "area": report.get("area"),
+                "startTime": start_time_obj.get("dt"),
+                "endTime": end_time_obj.get("dt"),
+                "observationType": obs_type_obj.get("value"),
+                "floor": floor_obj.get("value"),
+                "ceiling": ceiling_obj.get("value"),
+                "raw": report.get("raw", ""),
+            })
+
+        logger.info(f"[AIRMET] Fetched {len(results)} active advisories for {airport_code}")
+        return results
+
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # No advisories found for this airport — normal, not an error
+            logger.info(f"[AIRMET] No active advisories for {airport_code} (404)")
+            return []
+        logger.error(f"[AIRMET] HTTP error fetching for {airport_code}: {e.code} {e.reason}")
+        return []
+    except Exception as e:
+        logger.error(f"[AIRMET] Error fetching for {airport_code}: {str(e)}")
+        return []
+
+
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Lambda handler for AppSync resolver.
@@ -1263,7 +1342,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 if not airport_code:
                     raise ValueError("airportCode is required")
                 return fetch_notams(airport_code)  # This function is not async
-            
+
+            elif field_name == "getAirSigmets":
+                airport_code = arguments.get("airportCode")
+                if not airport_code:
+                    raise ValueError("airportCode is required")
+                return await fetch_airmets(airport_code)
+
             elif field_name == "getDistance":
                 # Calculate distance between airports
                 source = arguments.get("sourceAirport", "").upper()
