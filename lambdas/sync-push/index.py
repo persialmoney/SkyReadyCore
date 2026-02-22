@@ -109,7 +109,7 @@ def create_cfi_mirror_entry(cursor, student_entry, student_user_id):
     """, [
         mirror_entry_id, cfi_user_id, student_entry['date'],
         Jsonb(student_entry.get('aircraft')), student_entry.get('tailNumber'),
-        student_entry.get('route'), student_entry.get('routeLegs', []),
+        student_entry.get('route'), Jsonb(student_entry.get('routeLegs', [])),
         student_entry.get('flightTypes', []),
         total_time,  # Total time same
         total_time,  # CFI logs PIC time while instructing
@@ -185,7 +185,7 @@ def handler(event, context):
                 """, [
                     entry['entryId'], user_id, entry['date'],
                     Jsonb(entry.get('aircraft')), entry.get('tailNumber'),
-                    entry.get('route'), entry.get('routeLegs', []),
+                    entry.get('route'), Jsonb(entry.get('routeLegs', [])),
                     entry.get('flightTypes', []), entry.get('totalTime', 0),
                     entry.get('pic', 0), entry.get('sic', 0),
                     entry.get('dualReceived', 0), entry.get('dualGiven', 0),
@@ -289,7 +289,7 @@ def handler(event, context):
             """, [
                 entry_data['date'],
                 Jsonb(entry_data.get('aircraft')), entry_data.get('tailNumber'),
-                entry_data.get('route'), entry_data.get('routeLegs', []),
+                entry_data.get('route'), Jsonb(entry_data.get('routeLegs', [])),
                 entry_data.get('flightTypes', []),
                 entry_data.get('totalTime', 0),
                 entry_data.get('pic', 0), entry_data.get('sic', 0),

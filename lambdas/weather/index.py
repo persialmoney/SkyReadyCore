@@ -898,32 +898,56 @@ async def fetch_pireps(airport_code: str, radius: int = 100) -> list:
 
         data = json.loads(raw.decode())
         raw_reports = data.get("data") or data.get("reports") or data.get("results") or []
-        logger.info(f"[PIREP] {airport_code}: {len(raw_reports)} raw reports from API")
+        logger.info(f"[PIREP] {airport_code}: {len(raw_reports)} raw reports from API (top-level keys: {list(data.keys())})")
+        if raw_reports:
+            first = raw_reports[0]
+            logger.info(f"[PIREP] {airport_code}: first report type={type(first).__name__} keys={list(first.keys()) if isinstance(first, dict) else repr(first)[:120]}")
+
+        def _field(obj, key, fallback=None):
+            """Safely get a key from obj only if obj is a dict."""
+            if isinstance(obj, dict):
+                return obj.get(key, fallback)
+            return fallback
 
         results = []
         for report in raw_reports:
-            time_obj = report.get("time") or {}
-            turb = report.get("turbulence") or {}
-            icing = report.get("icing") or {}
-            temp_obj = report.get("temperature") or {}
+            if not isinstance(report, dict):
+                logger.debug(f"[PIREP] {airport_code}: skipping non-dict report: {type(report)}")
+                continue
 
-            turb_sev = turb.get("severity") if turb else None
-            icing_sev = icing.get("severity") if icing else None
-            loc = (report.get("location") or {}).get("repr")
-            alt = report.get("altitude")
+            time_obj = report.get("time")
+            turb = report.get("turbulence")
+            icing = report.get("icing")
+            temp_obj = report.get("temperature")
+            location = report.get("location")
+            aircraft = report.get("aircraft")
+            clouds = report.get("clouds") or []
+
+            turb_sev = _field(turb, "severity")
+            icing_sev = _field(icing, "severity")
+            loc = _field(location, "repr")
+            alt_raw = report.get("altitude")
+            alt = _field(alt_raw, "repr") if isinstance(alt_raw, dict) else (str(alt_raw) if alt_raw is not None else None)
+            aircraft_code = _field(aircraft, "code")
+            time_dt = _field(time_obj, "dt")
+            temp_val = _field(temp_obj, "value")
+
+            # clouds may be a list of dicts or a list of strings — normalise for _summarise_clouds
+            safe_clouds = [c for c in clouds if isinstance(c, dict)]
+
             logger.debug(f"[PIREP] {airport_code}: loc={loc} alt={alt} turb={turb_sev} icing={icing_sev}")
 
             results.append({
                 "raw": report.get("raw", ""),
                 "reportType": report.get("type", "UA"),
-                "time": time_obj.get("dt"),
+                "time": time_dt,
                 "location": loc,
                 "altitude": alt,
-                "aircraftType": (report.get("aircraft") or {}).get("code"),
+                "aircraftType": aircraft_code,
                 "turbulenceSeverity": turb_sev,
                 "icingSeverity": icing_sev,
-                "skyConditions": _summarise_clouds(report.get("clouds") or []),
-                "temperature": temp_obj.get("value") if isinstance(temp_obj, dict) else None,
+                "skyConditions": _summarise_clouds(safe_clouds),
+                "temperature": temp_val,
                 "remarks": report.get("remarks"),
             })
 

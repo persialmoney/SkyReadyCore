@@ -83,7 +83,7 @@ def handler(event, context):
             ORDER BY deleted_at
         """, [user_id, last_pulled_datetime])
         
-        deleted = [row[0] for row in cursor.fetchall()]
+        deleted = [str(row[0]) for row in cursor.fetchall()]
 
         # Commit the read-only transaction so the connection is clean when
         # returned to the pool. psycopg3 starts a transaction on every statement;
@@ -116,16 +116,24 @@ def handler(event, context):
         return_db_connection(conn)
 
 def format_entry(row):
-    """Format database row to GraphQL entry"""
+    """Format database row to GraphQL entry.
+
+    psycopg3 returns native Python types for PostgreSQL types:
+    - UUID columns  → uuid.UUID  (must str() before JSON serialization)
+    - JSONB columns → dict/list  (already JSON-serializable)
+    - DATE columns  → datetime.date (use .isoformat())
+    - TIMESTAMP     → datetime.datetime (use .timestamp())
+    - Decimal       → must float()
+    """
     return {
-        'entryId': str(row[0]),
-        'userId': row[1],
+        'entryId': str(row[0]),        # UUID → str
+        'userId': row[1],              # VARCHAR — already str
         'date': row[2].isoformat() if row[2] else None,
-        'aircraft': row[3],
+        'aircraft': row[3],            # JSONB → dict (JSON-serializable)
         'tailNumber': row[4],
         'route': row[5],
-        'routeLegs': row[6] if row[6] else [],
-        'flightTypes': row[7] if row[7] else [],
+        'routeLegs': row[6] if row[6] else [],   # JSONB → list
+        'flightTypes': row[7] if row[7] else [],  # TEXT[] → list
         'totalTime': float(row[8]) if row[8] else 0,
         'pic': float(row[9]) if row[9] else 0,
         'sic': float(row[10]) if row[10] else 0,
@@ -145,20 +153,20 @@ def format_entry(row):
         'approaches': int(row[24]) if row[24] else 0,
         'holds': bool(row[25]) if row[25] is not None else False,
         'tracking': bool(row[26]) if row[26] is not None else False,
-        'instructorUserId': row[27],
-        'instructorSnapshot': row[28],
-        'studentUserId': row[29],
-        'studentSnapshot': row[30],
-        'mirroredFromEntryId': row[31],
+        'instructorUserId': row[27],   # TEXT — already str or None
+        'instructorSnapshot': row[28], # JSONB → dict or None
+        'studentUserId': row[29],      # TEXT — already str or None
+        'studentSnapshot': row[30],    # JSONB → dict or None
+        'mirroredFromEntryId': str(row[31]) if row[31] else None,  # TEXT, but guard None
         'mirroredFromUserId': row[32],
         'lessonTopic': row[33],
         'groundInstruction': float(row[34]) if row[34] else 0,
-        'maneuvers': row[35] if row[35] else [],
+        'maneuvers': row[35] if row[35] else [],  # TEXT[] → list
         'remarks': row[36],
         'safetyNotes': row[37],
         'safetyRelevant': bool(row[38]) if row[38] is not None else False,
         'status': row[39],
-        'signature': row[40],
+        'signature': row[40],          # JSONB → dict or None
         'isFlightReview': bool(row[41]) if row[41] is not None else False,
         'createdAt': int(row[42].timestamp() * 1000),
         'updatedAt': int(row[43].timestamp() * 1000) if row[43] else int(row[42].timestamp() * 1000),
