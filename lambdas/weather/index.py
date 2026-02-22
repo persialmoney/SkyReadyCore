@@ -732,6 +732,33 @@ def transform_taf_from_cache(taf_data: Dict[str, Any], airport_code: str) -> Dic
     }
 
 
+def _dt(obj) -> Optional[str]:
+    """Safely pull the ISO datetime string from a time object."""
+    if not obj:
+        return None
+    return obj.get("dt")
+
+
+def _is_expired(end_time_str: Optional[str]) -> bool:
+    """Return True if the advisory/NOTAM end time is in the past."""
+    if not end_time_str:
+        return False
+    try:
+        end_dt = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
+        return end_dt < datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def _alt(obj) -> Optional[int]:
+    """Extract altitude value from either an int or an {repr, value} object."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get("value")
+    return int(obj)
+
+
 def _map_notam_category(report: dict) -> str:
     """Map AVWX NOTAM type/subject to a frontend category slug."""
     subject = (report.get("subject") or {}).get("value", "").lower()
@@ -776,6 +803,7 @@ async def fetch_notams(airport_code: str) -> list:
     Returns an empty list on error or when no NOTAMs are active.
     """
     airport_code = airport_code.upper()
+    logger.info(f"[NOTAM] Fetching for {airport_code}")
     token = _get_avwx_token()
     if not token:
         logger.warning("[NOTAM] AVWX token not available, skipping NOTAM fetch")
@@ -789,6 +817,7 @@ async def fetch_notams(airport_code: str) -> list:
             data = json.loads(response.read().decode())
 
         raw_reports = data.get("reports") or data.get("results") or data.get("data") or []
+        logger.info(f"[NOTAM] {airport_code}: {len(raw_reports)} raw reports from API")
         results = []
         skipped = 0
         for report in raw_reports:
@@ -798,29 +827,33 @@ async def fetch_notams(airport_code: str) -> list:
                 continue
 
             body = report.get("body") or report.get("raw") or ""
+            notam_id = report.get("number") or report.get("id") or ""
+            category = _map_notam_category(report)
+            severity = _derive_notam_severity(body)
+            logger.debug(f"[NOTAM] {airport_code}: id={notam_id} cat={category} sev={severity} end={end_time}")
             results.append({
-                "id": report.get("number") or report.get("id") or "",
+                "id": notam_id,
                 "title": report.get("title") or _derive_notam_title(report),
                 "description": body,
-                "category": _map_notam_category(report),
-                "severity": _derive_notam_severity(body),
+                "category": category,
+                "severity": severity,
                 "effectiveStart": _dt(report.get("start_time")),
                 "effectiveEnd": end_time,
                 "rawText": report.get("raw") or body,
                 "whyShown": report.get("reason"),
             })
 
-        logger.info(f"[NOTAM] Fetched {len(results)} active NOTAMs for {airport_code} (skipped {skipped} expired)")
+        logger.info(f"[NOTAM] {airport_code}: returning {len(results)} active, {skipped} expired skipped")
         return results
 
     except urllib.error.HTTPError as e:
         if e.code in (404, 204):
-            logger.info(f"[NOTAM] No active NOTAMs for {airport_code}")
+            logger.info(f"[NOTAM] {airport_code}: no NOTAMs (HTTP {e.code})")
             return []
-        logger.error(f"[NOTAM] HTTP error for {airport_code}: {e.code} {e.reason}")
+        logger.error(f"[NOTAM] {airport_code}: HTTP {e.code} {e.reason}")
         return []
     except Exception as e:
-        logger.error(f"[NOTAM] Error for {airport_code}: {str(e)}")
+        logger.error(f"[NOTAM] {airport_code}: {type(e).__name__}: {e}")
         return []
 
 
@@ -846,6 +879,7 @@ async def fetch_pireps(airport_code: str, radius: int = 100) -> list:
     Returns an empty list on error or when no PIREPs are available.
     """
     airport_code = airport_code.upper()
+    logger.info(f"[PIREP] Fetching for {airport_code} radius={radius}nm")
     token = _get_avwx_token()
     if not token:
         logger.warning("[PIREP] AVWX token not available, skipping PIREP fetch")
@@ -859,11 +893,12 @@ async def fetch_pireps(airport_code: str, radius: int = 100) -> list:
             raw = response.read()
 
         if not raw.strip():
-            logger.info(f"[PIREP] No PIREPs near {airport_code}")
+            logger.info(f"[PIREP] {airport_code}: empty response body")
             return []
 
         data = json.loads(raw.decode())
         raw_reports = data.get("data") or data.get("reports") or data.get("results") or []
+        logger.info(f"[PIREP] {airport_code}: {len(raw_reports)} raw reports from API")
 
         results = []
         for report in raw_reports:
@@ -872,31 +907,37 @@ async def fetch_pireps(airport_code: str, radius: int = 100) -> list:
             icing = report.get("icing") or {}
             temp_obj = report.get("temperature") or {}
 
+            turb_sev = turb.get("severity") if turb else None
+            icing_sev = icing.get("severity") if icing else None
+            loc = (report.get("location") or {}).get("repr")
+            alt = report.get("altitude")
+            logger.debug(f"[PIREP] {airport_code}: loc={loc} alt={alt} turb={turb_sev} icing={icing_sev}")
+
             results.append({
                 "raw": report.get("raw", ""),
                 "reportType": report.get("type", "UA"),
                 "time": time_obj.get("dt"),
-                "location": (report.get("location") or {}).get("repr"),
-                "altitude": report.get("altitude"),
+                "location": loc,
+                "altitude": alt,
                 "aircraftType": (report.get("aircraft") or {}).get("code"),
-                "turbulenceSeverity": turb.get("severity") if turb else None,
-                "icingSeverity": icing.get("severity") if icing else None,
+                "turbulenceSeverity": turb_sev,
+                "icingSeverity": icing_sev,
                 "skyConditions": _summarise_clouds(report.get("clouds") or []),
                 "temperature": temp_obj.get("value") if isinstance(temp_obj, dict) else None,
                 "remarks": report.get("remarks"),
             })
 
-        logger.info(f"[PIREP] Fetched {len(results)} PIREPs near {airport_code} (radius={radius}nm)")
+        logger.info(f"[PIREP] {airport_code}: returning {len(results)} PIREPs")
         return results
 
     except urllib.error.HTTPError as e:
         if e.code in (404, 204):
-            logger.info(f"[PIREP] No PIREPs near {airport_code}")
+            logger.info(f"[PIREP] {airport_code}: no PIREPs (HTTP {e.code})")
             return []
-        logger.error(f"[PIREP] HTTP error for {airport_code}: {e.code} {e.reason}")
+        logger.error(f"[PIREP] {airport_code}: HTTP {e.code} {e.reason}")
         return []
     except Exception as e:
-        logger.error(f"[PIREP] Error for {airport_code}: {str(e)}")
+        logger.error(f"[PIREP] {airport_code}: {type(e).__name__}: {e}")
         return []
 
 
@@ -1376,6 +1417,7 @@ async def fetch_airmets(airport_code: str) -> list:
     Returns an empty list on error or when no advisories are active.
     """
     airport_code = airport_code.upper()
+    logger.info(f"[AIRMET] Fetching AIRMETs/SIGMETs for {airport_code}")
 
     token = _get_avwx_token()
     if not token:
@@ -1389,32 +1431,9 @@ async def fetch_airmets(airport_code: str) -> list:
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode())
 
-        def _dt(obj):
-            """Safely pull the ISO datetime string from a time object."""
-            if not obj:
-                return None
-            return obj.get("dt")
-
-        def _alt(obj):
-            """Extract altitude value from either an int or an {repr, value} object."""
-            if obj is None:
-                return None
-            if isinstance(obj, dict):
-                return obj.get("value")
-            return int(obj)
-
-        def _is_expired(end_time_str):
-            """Return True if the advisory end time is in the past."""
-            if not end_time_str:
-                return False  # no end time — assume still active
-            try:
-                end_dt = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
-                return end_dt < datetime.now(timezone.utc)
-            except Exception:
-                return False
-
         # API returns either "reports" or "results" depending on the response shape
         raw_reports = data.get("reports") or data.get("results") or []
+        logger.info(f"[AIRMET] {airport_code}: {len(raw_reports)} raw reports from API")
         results = []
         skipped = 0
         for report in raw_reports:
@@ -1447,6 +1466,7 @@ async def fetch_airmets(airport_code: str) -> list:
             ceiling_val = _alt(obs.get("ceiling")) if obs.get("ceiling") is not None else _alt((forecast or {}).get("ceiling"))
             obs_type = (obs.get("type") or {}).get("value") or (forecast.get("type") or {}).get("value")
 
+            logger.debug(f"[AIRMET] {airport_code}: type={report_type} obsType={obs_type} start={start_time} end={end_time} fl={floor_val}-{ceiling_val}")
             results.append({
                 "reportType": report_type,
                 "type": report.get("type", ""),
@@ -1459,18 +1479,21 @@ async def fetch_airmets(airport_code: str) -> list:
                 "raw": report.get("raw", ""),
             })
 
-        logger.info(f"[AIRMET] Fetched {len(results)} active advisories for {airport_code} (skipped {skipped} expired)")
+        type_counts = {}
+        for r in results:
+            k = r["reportType"] or "UNKNOWN"
+            type_counts[k] = type_counts.get(k, 0) + 1
+        logger.info(f"[AIRMET] {airport_code}: returning {len(results)} active, {skipped} expired skipped | breakdown={type_counts}")
         return results
 
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            # No advisories found for this airport — normal, not an error
-            logger.info(f"[AIRMET] No active advisories for {airport_code} (404)")
+            logger.info(f"[AIRMET] {airport_code}: no advisories (HTTP 404)")
             return []
-        logger.error(f"[AIRMET] HTTP error fetching for {airport_code}: {e.code} {e.reason}")
+        logger.error(f"[AIRMET] {airport_code}: HTTP {e.code} {e.reason}")
         return []
     except Exception as e:
-        logger.error(f"[AIRMET] Error fetching for {airport_code}: {str(e)}")
+        logger.error(f"[AIRMET] {airport_code}: {type(e).__name__}: {e}")
         return []
 
 
@@ -1519,20 +1542,26 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 airport_code = arguments.get("airportCode")
                 if not airport_code:
                     raise ValueError("airportCode is required")
-                return await fetch_notams(airport_code)
+                result = await fetch_notams(airport_code)
+                logger.info(f"[Handler] getNOTAMs {airport_code}: {len(result)} NOTAMs in {time.time()-start_time:.2f}s")
+                return result
 
             elif field_name == "getPireps":
                 airport_code = arguments.get("airportCode")
                 if not airport_code:
                     raise ValueError("airportCode is required")
                 radius = arguments.get("radius", 100)
-                return await fetch_pireps(airport_code, radius)
+                result = await fetch_pireps(airport_code, radius)
+                logger.info(f"[Handler] getPireps {airport_code}: {len(result)} PIREPs in {time.time()-start_time:.2f}s")
+                return result
 
             elif field_name == "getAirSigmets":
                 airport_code = arguments.get("airportCode")
                 if not airport_code:
                     raise ValueError("airportCode is required")
-                return await fetch_airmets(airport_code)
+                result = await fetch_airmets(airport_code)
+                logger.info(f"[Handler] getAirSigmets {airport_code}: {len(result)} advisories in {time.time()-start_time:.2f}s")
+                return result
 
             elif field_name == "getDistance":
                 # Calculate distance between airports
