@@ -820,14 +820,16 @@ async def fetch_notams(airport_code: str) -> list:
         logger.info(f"[NOTAM] {airport_code}: {len(raw_reports)} raw reports from API")
         results = []
         skipped = 0
-        for report in raw_reports:
+        for idx, report in enumerate(raw_reports):
             end_time = _dt(report.get("end_time"))
             if _is_expired(end_time):
                 skipped += 1
                 continue
 
             body = report.get("body") or report.get("raw") or ""
-            notam_id = report.get("number") or report.get("id") or ""
+            raw_id = report.get("number") or report.get("id") or ""
+            # Guarantee a unique, non-empty id so the frontend can use it as a React key
+            notam_id = raw_id if raw_id else f"{airport_code}-{idx}-{abs(hash(body)) % 100000}"
             category = _map_notam_category(report)
             severity = _derive_notam_severity(body)
             logger.debug(f"[NOTAM] {airport_code}: id={notam_id} cat={category} sev={severity} end={end_time}")
