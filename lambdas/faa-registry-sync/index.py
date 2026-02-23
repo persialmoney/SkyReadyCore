@@ -42,28 +42,39 @@ TTL_DAYS = 365
 class FAAMasterParser:
     """
     Parser for FAA MASTER.txt file (CSV format)
-    
-    The FAA changed from fixed-width to CSV format.
+
     CSV Column positions (0-indexed):
     0: N-NUMBER, 1: SERIAL NUMBER, 2: MFR MDL CODE, 3: ENG MFR MDL, 4: YEAR MFR,
-    5: TYPE REGISTRANT, 6: NAME, 7-11: ADDRESS, 12: REGION, 13: COUNTY, 14: COUNTRY,
+    5: TYPE REGISTRANT, 6: NAME, 7-11: ADDRESS fields, 12: REGION, 13: COUNTY, 14: COUNTRY,
     15: LAST ACTION DATE, 16: CERT ISSUE DATE, 17: CERTIFICATION,
-    18: TYPE AIRCRAFT, 19: TYPE ENGINE, 20: STATUS CODE, 21: MODE S CODE, etc.
+    18: TYPE AIRCRAFT, 19: TYPE ENGINE, 20: STATUS CODE, 21: MODE S CODE,
+    22: FRACT OWNER, 23: AIR WORTH DATE
     """
-    
-    # Aircraft type mappings
+
+    # Maps TYPE AIRCRAFT code -> category name only.
+    # Class (Land/Sea/Amphibian) comes from AC-CAT in ACFTREF, so categories
+    # that vary by AC-CAT are left blank here and filled in at store time.
     AIRCRAFT_TYPE_MAP = {
         '1': ('Glider', ''),
         '2': ('Lighter-than-Air', 'Balloon'),
         '3': ('Lighter-than-Air', 'Airship'),
-        '4': ('Airplane', 'Single-Engine Land'),
-        '5': ('Airplane', 'Multi-Engine Land'),
+        '4': ('Airplane', ''),           # class resolved via AC-CAT (Land/Sea/Amphibian)
+        '5': ('Airplane', 'Multi-Engine'),  # engine count known; AC-CAT adds Land/Sea
         '6': ('Rotorcraft', 'Helicopter'),
-        '7': ('Weight-Shift Control', ''),
-        '8': ('Powered Parachute', ''),
+        '7': ('Weight-Shift Control', ''),  # class resolved via AC-CAT
+        '8': ('Powered Parachute', ''),     # class resolved via AC-CAT
         '9': ('Rotorcraft', 'Gyroplane'),
+        'H': ('Powered Lift', ''),
+        'O': ('Other', ''),
     }
-    
+
+    # AC-CAT from ACFTREF: 1=Land, 2=Sea, 3=Amphibian
+    AC_CAT_MAP = {
+        '1': 'Land',
+        '2': 'Sea',
+        '3': 'Amphibian',
+    }
+
     # Engine type mappings
     ENGINE_TYPE_MAP = {
         '0': 'None',
@@ -75,25 +86,30 @@ class FAAMasterParser:
         '6': 'Ramjet',
         '7': '2 Cycle',
         '8': '4 Cycle',
+        '9': 'Unknown',
         '10': 'Electric',
         '11': 'Rotary',
     }
-    
+
+    # Builder certification codes from ACFTREF BUILD-CERT-IND
+    BUILD_CERT_MAP = {
+        '0': 'Type Certificated',
+        '1': 'Not Type Certificated',
+        '2': 'Light Sport',
+    }
+
     @staticmethod
     def parse_line(line: str) -> Optional[Dict[str, str]]:
         """Parse a single line from MASTER.txt (CSV format)"""
-        # Skip header line
         if line.startswith('N-NUMBER,'):
             return None
-        
-        # Split by comma
+
         fields = line.split(',')
-        
-        # Must have at least 21 fields
-        if len(fields) < 21:
+
+        # Need at least up to AIR WORTH DATE (col 23)
+        if len(fields) < 24:
             return None
-        
-        # Extract fields
+
         n_number = fields[0].strip()
         serial_number = fields[1].strip()
         mfr_mdl_code = fields[2].strip()
@@ -101,67 +117,69 @@ class FAAMasterParser:
         type_aircraft = fields[18].strip()
         type_engine = fields[19].strip()
         status_code = fields[20].strip()
-        
+        air_worth_date = fields[23].strip()
+
         # Only process valid registrations
         if status_code != 'V':
             return None
-        
-        # Must have N-Number
+
         if not n_number:
             return None
-        
-        data = {
+
+        return {
             'N_NUMBER': n_number,
             'SERIAL_NUMBER': serial_number,
             'MFR_MDL_CODE': mfr_mdl_code,
             'YEAR_MFR': year_mfr,
             'TYPE_AIRCRAFT': type_aircraft,
             'TYPE_ENGINE': type_engine,
-            'STATUS_CODE': status_code
+            'STATUS_CODE': status_code,
+            'AIR_WORTH_DATE': air_worth_date,
         }
-        
-        return data
 
 
 class ACFTREFParser:
     """
     Parser for ACFTREF.txt file (aircraft reference)
-    Maps MFR_MDL_CODE to Make/Model names
+
+    CSV columns (0-indexed):
+    0: CODE, 1: MFR, 2: MODEL, 3: TYPE-ACFT, 4: TYPE-ENG,
+    5: AC-CAT (1=Land, 2=Sea, 3=Amphibian),
+    6: BUILD-CERT-IND (0=Type Cert, 1=Not Type Cert, 2=Light Sport)
     """
-    
+
     @staticmethod
     def parse_file(content: str) -> Dict[str, Dict[str, str]]:
         """
-        Parse ACFTREF.txt and return mapping of MFR_MDL_CODE -> {make, model}
-        
-        Format: CSV
-        Columns: CODE, MFR, MODEL, TYPE-ACFT, TYPE-ENG, AC-CAT, etc.
+        Parse ACFTREF.txt and return mapping of MFR_MDL_CODE ->
+        {make, model, acCat, buildCertInd}
         """
         mapping = {}
-        
+
         for line in content.split('\n'):
-            # Skip header
             if line.startswith('CODE,'):
                 continue
-                
-            # Skip empty lines
             if not line.strip():
                 continue
-            
+
             fields = line.split(',')
             if len(fields) < 3:
                 continue
-            
+
             code = fields[0].strip()
             mfr = fields[1].strip()
             model = fields[2].strip()
-            
+            ac_cat = fields[5].strip() if len(fields) > 5 else ''
+            build_cert_ind = fields[6].strip() if len(fields) > 6 else ''
+
             if code and (mfr or model):
                 mapping[code] = {
                     'make': mfr,
-                    'model': model
+                    'model': model,
+                    'acCat': ac_cat,
+                    'buildCertInd': build_cert_ind,
                 }
-        
+
         return mapping
 
 
@@ -245,28 +263,59 @@ def parse_and_store(master_content: str, acftref_content: str) -> Dict[str, int]
         stats['valid'] += 1
         
         try:
-            # Get make/model from reference file
+            # Get make/model/acCat/buildCertInd from reference file
             mfr_mdl_code = data['MFR_MDL_CODE']
             make = ''
             model = ''
-            
+            ac_cat = ''
+            build_cert_ind = ''
+
             if mfr_mdl_code in acftref_mapping:
-                make = acftref_mapping[mfr_mdl_code].get('make', '')
-                model = acftref_mapping[mfr_mdl_code].get('model', '')
-            
-            # Map aircraft type and engine type
+                ref = acftref_mapping[mfr_mdl_code]
+                make = ref.get('make', '')
+                model = ref.get('model', '')
+                ac_cat = ref.get('acCat', '')
+                build_cert_ind = ref.get('buildCertInd', '')
+
+            # Map aircraft type → category and base class
             aircraft_type_code = data['TYPE_AIRCRAFT']
-            category, aircraft_class = FAAMasterParser.AIRCRAFT_TYPE_MAP.get(
-                aircraft_type_code, 
+            category, base_class = FAAMasterParser.AIRCRAFT_TYPE_MAP.get(
+                aircraft_type_code,
                 ('Unknown', '')
             )
-            
-            engine_type_code = data['TYPE_ENGINE']
+
+            # Resolve final class using AC-CAT from ACFTREF where applicable.
+            # For types that carry Land/Sea distinction (Airplane, Weight-Shift
+            # Control, Powered Parachute) AC-CAT overrides the base class.
+            # Rotorcraft/Glider/LTA have fixed classes from the type map.
+            ac_cat_label = FAAMasterParser.AC_CAT_MAP.get(ac_cat, '')
+            if aircraft_type_code in ('4', '7', '8') and ac_cat_label:
+                # Single-engine airplane: prefix with "Single-Engine"
+                if aircraft_type_code == '4':
+                    aircraft_class = f"Single-Engine {ac_cat_label}"
+                else:
+                    aircraft_class = ac_cat_label
+            elif aircraft_type_code == '5' and ac_cat_label:
+                # Multi-engine airplane
+                aircraft_class = f"Multi-Engine {ac_cat_label}"
+            else:
+                aircraft_class = base_class
+
+            engine_type_code = data['TYPE_ENGINE'].strip()
             engine_type = FAAMasterParser.ENGINE_TYPE_MAP.get(engine_type_code, 'Unknown')
-            
+
+            builder_certification = FAAMasterParser.BUILD_CERT_MAP.get(build_cert_ind, '')
+
+            # Format airworthiness date from YYYYMMDD → YYYY-MM-DD
+            raw_aw_date = data.get('AIR_WORTH_DATE', '').strip()
+            if len(raw_aw_date) == 8 and raw_aw_date.isdigit():
+                airworthiness_date = f"{raw_aw_date[:4]}-{raw_aw_date[4:6]}-{raw_aw_date[6:]}"
+            else:
+                airworthiness_date = None
+
             # Build DynamoDB item
             item = {
-                'tailNumber': f"N{data['N_NUMBER']}",  # Add N prefix
+                'tailNumber': f"N{data['N_NUMBER']}",
                 'make': make,
                 'model': model,
                 'year': data['YEAR_MFR'] if data['YEAR_MFR'] else None,
@@ -274,6 +323,8 @@ def parse_and_store(master_content: str, acftref_content: str) -> Dict[str, int]
                 'class': aircraft_class,
                 'serialNumber': data['SERIAL_NUMBER'],
                 'engineType': engine_type,
+                'builderCertification': builder_certification,
+                'airworthinessDate': airworthiness_date,
                 'cachedAt': now,
                 'ttl': ttl
             }
