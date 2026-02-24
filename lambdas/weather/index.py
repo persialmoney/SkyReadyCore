@@ -17,6 +17,8 @@ from glide import (
     GlideClusterClient,
     GlideClusterClientConfiguration,
     NodeAddress,
+    ExpirySet,
+    ExpiryType,
 )
 import logging
 
@@ -627,12 +629,15 @@ async def fetch_taf(airport_code: str) -> Dict[str, Any]:
                 "forecast": parsed_forecast if parsed_forecast else []  # Ensure it's always a list
             }
             
-            # Write-through: Store in cache for next request
+            # Write-through: Store in cache for next request with TTL atomically
             if glide_client:
                 try:
                     cache_key = f"taf:{airport_code}"
-                    await glide_client.set(cache_key, json.dumps(taf))
-                    await glide_client.expire(cache_key, 3600)  # 1 hour
+                    await glide_client.set(
+                        cache_key,
+                        json.dumps(taf),
+                        expiry=ExpirySet(ExpiryType.SEC, 3600)  # 1 hour
+                    )
                 except Exception:
                     pass
             

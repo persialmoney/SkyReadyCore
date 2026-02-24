@@ -16,6 +16,8 @@ from glide import (
     GlideClusterClient,
     GlideClusterClientConfiguration,
     NodeAddress,
+    ExpirySet,
+    ExpiryType,
 )
 import boto3
 import logging
@@ -731,22 +733,35 @@ async def store_metar(glide_client: GlideClusterClient, records: List[Dict[str, 
         if len(station_ids) < 5:
             logger.info(f"[Cache Store] Storing METAR - station_id: {station_id}, icaoId: {icao_id}, stationId: {station_id_field}, key: {key}")
         
-        # Store METAR data with TTL
-        operations.append(glide_client.set(key, json.dumps(record)))
-        operations.append(glide_client.expire(key, TTL_METAR))
+        # Store METAR data with TTL atomically using SET with expiry
+        operations.append(
+            glide_client.set(
+                key,
+                json.dumps(record),
+                expiry=ExpirySet(ExpiryType.SEC, TTL_METAR)
+            )
+        )
         station_ids.add(station_id)
     
     # Execute all operations concurrently with error logging
     await execute_operations_with_error_logging(operations, "METAR")
     
-    # Update station set and updated ZSET
+    # Update station set and updated ZSET with atomic TTL
     if station_ids:
         try:
-            await glide_client.delete("metar:stations")
-            await glide_client.delete("metar:updated")
+            # Delete old indexes
+            await glide_client.delete(["metar:stations", "metar:updated"])
+            
+            # Add all members to the sets in batch
+            index_operations = []
             for station_id in station_ids:
-                await glide_client.sadd("metar:stations", station_id)
-                await glide_client.zadd("metar:updated", {station_id: current_time})
+                index_operations.append(glide_client.sadd("metar:stations", [station_id]))
+                index_operations.append(glide_client.zadd("metar:updated", {station_id: current_time}))
+            
+            # Execute index operations
+            await execute_operations_with_error_logging(index_operations, "METAR indexes")
+            
+            # Set TTL on both indexes after they're populated
             await glide_client.expire("metar:stations", TTL_METAR)
             await glide_client.expire("metar:updated", TTL_METAR)
         except Exception as error:
@@ -795,8 +810,14 @@ async def store_taf(glide_client: GlideClusterClient, records: List[Dict[str, An
                     first_fcst = record['forecast'][0]
                     logger.info(f"[Cache Store] First forecast for {station_id}: skyc1={first_fcst.get('skyc1')}, skyl1={first_fcst.get('skyl1')}")
         
-        operations.append(glide_client.set(key, json.dumps(record)))
-        operations.append(glide_client.expire(key, TTL_TAF))
+        # Store TAF data with TTL atomically using SET with expiry
+        operations.append(
+            glide_client.set(
+                key,
+                json.dumps(record),
+                expiry=ExpirySet(ExpiryType.SEC, TTL_TAF)
+            )
+        )
         station_ids.add(station_id)
     
     # Execute all operations concurrently with error logging
@@ -804,11 +825,19 @@ async def store_taf(glide_client: GlideClusterClient, records: List[Dict[str, An
     
     if station_ids:
         try:
-            await glide_client.delete("taf:stations")
-            await glide_client.delete("taf:updated")
+            # Delete old indexes
+            await glide_client.delete(["taf:stations", "taf:updated"])
+            
+            # Add all members to the sets in batch
+            index_operations = []
             for station_id in station_ids:
-                await glide_client.sadd("taf:stations", station_id)
-                await glide_client.zadd("taf:updated", {station_id: current_time})
+                index_operations.append(glide_client.sadd("taf:stations", [station_id]))
+                index_operations.append(glide_client.zadd("taf:updated", {station_id: current_time}))
+            
+            # Execute index operations
+            await execute_operations_with_error_logging(index_operations, "TAF indexes")
+            
+            # Set TTL on both indexes after they're populated
             await glide_client.expire("taf:stations", TTL_TAF)
             await glide_client.expire("taf:updated", TTL_TAF)
         except Exception as error:
@@ -832,8 +861,14 @@ async def store_sigmet(glide_client: GlideClusterClient, records: List[Dict[str,
             continue
         
         key = f"sigmet:{sigmet_id}"
-        operations.append(glide_client.set(key, json.dumps(record)))
-        operations.append(glide_client.expire(key, TTL_SIGMET))
+        # Store SIGMET data with TTL atomically
+        operations.append(
+            glide_client.set(
+                key,
+                json.dumps(record),
+                expiry=ExpirySet(ExpiryType.SEC, TTL_SIGMET)
+            )
+        )
         sigmet_ids.add(sigmet_id)
         
         # Index by hazard type
@@ -847,19 +882,41 @@ async def store_sigmet(glide_client: GlideClusterClient, records: List[Dict[str,
     
     # Update indexes
     if sigmet_ids:
-        await glide_client.delete("sigmet:all")
-        for sigmet_id in sigmet_ids:
-            await glide_client.sadd("sigmet:all", sigmet_id)
-        # Set TTL on index key
-        await glide_client.expire("sigmet:all", TTL_SIGMET)
+        try:
+            # Delete old index
+            await glide_client.delete(["sigmet:all"])
+            
+            # Add all members in batch
+            index_operations = []
+            for sigmet_id in sigmet_ids:
+                index_operations.append(glide_client.sadd("sigmet:all", [sigmet_id]))
+            
+            # Execute index operations
+            await execute_operations_with_error_logging(index_operations, "SIGMET indexes")
+            
+            # Set TTL on index key
+            await glide_client.expire("sigmet:all", TTL_SIGMET)
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update SIGMET indexes: {type(error).__name__}: {str(error)}")
     
+    # Update hazard type indexes
     for hazard, ids in hazard_types.items():
-        hazard_key = f"sigmet:hazard:{hazard}"
-        await glide_client.delete(hazard_key)
-        for sigmet_id in ids:
-            await glide_client.sadd(hazard_key, sigmet_id)
-        # Set TTL on hazard index key
-        await glide_client.expire(hazard_key, TTL_SIGMET)
+        try:
+            hazard_key = f"sigmet:hazard:{hazard}"
+            await glide_client.delete([hazard_key])
+            
+            # Add all members for this hazard type
+            hazard_operations = []
+            for sigmet_id in ids:
+                hazard_operations.append(glide_client.sadd(hazard_key, [sigmet_id]))
+            
+            # Execute hazard operations
+            await execute_operations_with_error_logging(hazard_operations, f"SIGMET hazard:{hazard}")
+            
+            # Set TTL on hazard index key
+            await glide_client.expire(hazard_key, TTL_SIGMET)
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update SIGMET hazard index {hazard}: {type(error).__name__}: {str(error)}")
     
     logger.info(f"Stored {len(sigmet_ids)} SIGMET records")
 
@@ -876,8 +933,14 @@ async def store_airmet(glide_client: GlideClusterClient, records: List[Dict[str,
             continue
         
         key = f"airmet:{airmet_id}"
-        operations.append(glide_client.set(key, json.dumps(record)))
-        operations.append(glide_client.expire(key, TTL_AIRMET))
+        # Store AIRMET data with TTL atomically
+        operations.append(
+            glide_client.set(
+                key,
+                json.dumps(record),
+                expiry=ExpirySet(ExpiryType.SEC, TTL_AIRMET)
+            )
+        )
         airmet_ids.add(airmet_id)
         
         hazard = record.get('hazard', 'UNKNOWN')
@@ -889,19 +952,41 @@ async def store_airmet(glide_client: GlideClusterClient, records: List[Dict[str,
     await execute_operations_with_error_logging(operations, "AIRMET")
     
     if airmet_ids:
-        await glide_client.delete("airmet:all")
-        for airmet_id in airmet_ids:
-            await glide_client.sadd("airmet:all", airmet_id)
-        # Set TTL on index key
-        await glide_client.expire("airmet:all", TTL_AIRMET)
+        try:
+            # Delete old index
+            await glide_client.delete(["airmet:all"])
+            
+            # Add all members in batch
+            index_operations = []
+            for airmet_id in airmet_ids:
+                index_operations.append(glide_client.sadd("airmet:all", [airmet_id]))
+            
+            # Execute index operations
+            await execute_operations_with_error_logging(index_operations, "AIRMET indexes")
+            
+            # Set TTL on index key
+            await glide_client.expire("airmet:all", TTL_AIRMET)
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update AIRMET indexes: {type(error).__name__}: {str(error)}")
     
+    # Update hazard type indexes
     for hazard, ids in hazard_types.items():
-        hazard_key = f"airmet:hazard:{hazard}"
-        await glide_client.delete(hazard_key)
-        for airmet_id in ids:
-            await glide_client.sadd(hazard_key, airmet_id)
-        # Set TTL on hazard index key
-        await glide_client.expire(hazard_key, TTL_AIRMET)
+        try:
+            hazard_key = f"airmet:hazard:{hazard}"
+            await glide_client.delete([hazard_key])
+            
+            # Add all members for this hazard type
+            hazard_operations = []
+            for airmet_id in ids:
+                hazard_operations.append(glide_client.sadd(hazard_key, [airmet_id]))
+            
+            # Execute hazard operations
+            await execute_operations_with_error_logging(hazard_operations, f"AIRMET hazard:{hazard}")
+            
+            # Set TTL on hazard index key
+            await glide_client.expire(hazard_key, TTL_AIRMET)
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update AIRMET hazard index {hazard}: {type(error).__name__}: {str(error)}")
     
     logger.info(f"Stored {len(airmet_ids)} G-AIRMET records")
 
@@ -912,33 +997,65 @@ async def store_pirep(glide_client: GlideClusterClient, records: List[Dict[str, 
     current_time = int(datetime.utcnow().timestamp())
     operations = []
     
+    # CRITICAL FIX: Ensure pirep:recent exists with TTL before any ZADD operations
+    # This prevents unbounded growth of the sorted set
+    try:
+        pirep_recent_exists = await glide_client.exists(["pirep:recent"])
+        if not pirep_recent_exists:
+            # Create the key with a dummy entry and TTL
+            await glide_client.zadd("pirep:recent", {"__init__": 0})
+            await glide_client.expire("pirep:recent", TTL_PIREP)
+            logger.info("[Cache Store] Initialized pirep:recent with TTL")
+    except Exception as e:
+        logger.error(f"[Cache Store] Failed to initialize pirep:recent: {str(e)}")
+    
     for record in records:
         pirep_id = record.get('aircraftReportId') or record.get('id')
         if not pirep_id:
             continue
         
         key = f"pirep:{pirep_id}"
-        operations.append(glide_client.set(key, json.dumps(record)))
-        operations.append(glide_client.expire(key, TTL_PIREP))
+        # Store PIREP data with TTL atomically
+        operations.append(
+            glide_client.set(
+                key,
+                json.dumps(record),
+                expiry=ExpirySet(ExpiryType.SEC, TTL_PIREP)
+            )
+        )
         pirep_ids.add(pirep_id)
         
-        # Add to recent sorted set
+        # Add to recent sorted set (key now has TTL from initialization above)
         operations.append(glide_client.zadd("pirep:recent", {pirep_id: current_time}))
     
     # Execute all operations concurrently with error logging
     await execute_operations_with_error_logging(operations, "PIREP")
     
     if pirep_ids:
-        await glide_client.delete("pirep:all")
-        for pirep_id in pirep_ids:
-            await glide_client.sadd("pirep:all", pirep_id)
-        # Set TTL on index key
-        await glide_client.expire("pirep:all", TTL_PIREP)
+        try:
+            # Delete and recreate pirep:all index
+            await glide_client.delete(["pirep:all"])
+            
+            # Add all members in batch
+            index_operations = []
+            for pirep_id in pirep_ids:
+                index_operations.append(glide_client.sadd("pirep:all", [pirep_id]))
+            
+            # Execute index operations
+            await execute_operations_with_error_logging(index_operations, "PIREP indexes")
+            
+            # Set TTL on index
+            await glide_client.expire("pirep:all", TTL_PIREP)
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update PIREP indexes: {type(error).__name__}: {str(error)}")
     
     # Keep only last 1000 PIREPs in recent set
-    await glide_client.zremrangebyrank("pirep:recent", 0, -1001)
-    # Set TTL on recent sorted set
-    await glide_client.expire("pirep:recent", TTL_PIREP)
+    try:
+        await glide_client.zremrangebyrank("pirep:recent", 0, -1001)
+        # Refresh TTL on recent sorted set
+        await glide_client.expire("pirep:recent", TTL_PIREP)
+    except Exception as e:
+        logger.error(f"[Cache Store] Failed to trim pirep:recent: {str(e)}")
     
     logger.info(f"Stored {len(pirep_ids)} PIREP records")
 
@@ -957,8 +1074,14 @@ async def store_stations(glide_client: GlideClusterClient, records: List[Dict[st
         
         station_code = station_code.upper()
         key = f"station:{station_code}"
-        operations.append(glide_client.set(key, json.dumps(record)))
-        operations.append(glide_client.expire(key, TTL_STATION))
+        # Store station data with TTL atomically
+        operations.append(
+            glide_client.set(
+                key,
+                json.dumps(record),
+                expiry=ExpirySet(ExpiryType.SEC, TTL_STATION)
+            )
+        )
         station_codes.add(station_code)
         
         # Index by name
@@ -979,27 +1102,54 @@ async def store_stations(glide_client: GlideClusterClient, records: List[Dict[st
     
     # Update indexes
     if station_codes:
-        await glide_client.delete("station:all")
-        for station_code in station_codes:
-            await glide_client.sadd("station:all", station_code)
-        # Set TTL on index key
-        await glide_client.expire("station:all", TTL_STATION)
+        try:
+            # Delete old station:all index
+            await glide_client.delete(["station:all"])
+            
+            # Add all station codes in batch
+            index_operations = []
+            for station_code in station_codes:
+                index_operations.append(glide_client.sadd("station:all", [station_code]))
+            
+            # Execute index operations
+            await execute_operations_with_error_logging(index_operations, "STATION indexes")
+            
+            # Set TTL on index key
+            await glide_client.expire("station:all", TTL_STATION)
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update station:all index: {type(error).__name__}: {str(error)}")
     
     # Update name index
     for name, codes in name_index.items():
-        name_key = f"station:name:{name}"
-        await glide_client.delete(name_key)
-        for code in codes:
-            await glide_client.sadd(name_key, code)
-        # Set TTL on name index key
-        await glide_client.expire(name_key, TTL_STATION)
+        try:
+            name_key = f"station:name:{name}"
+            await glide_client.delete([name_key])
+            
+            # Add all codes for this name
+            name_operations = []
+            for code in codes:
+                name_operations.append(glide_client.sadd(name_key, [code]))
+            
+            # Execute name operations
+            await execute_operations_with_error_logging(name_operations, f"STATION name:{name}")
+            
+            # Set TTL on name index key
+            await glide_client.expire(name_key, TTL_STATION)
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update station name index {name}: {type(error).__name__}: {str(error)}")
     
     # Update IATA index
     for iata, icao in iata_index.items():
-        iata_key = f"station:iata:{iata}"
-        await glide_client.set(iata_key, icao)
-        # Set TTL on IATA index key
-        await glide_client.expire(iata_key, TTL_STATION)
+        try:
+            iata_key = f"station:iata:{iata}"
+            # Store IATA->ICAO mapping with TTL atomically
+            await glide_client.set(
+                iata_key,
+                icao,
+                expiry=ExpirySet(ExpiryType.SEC, TTL_STATION)
+            )
+        except Exception as error:
+            logger.error(f"[Cache Store] Failed to update station IATA index {iata}: {type(error).__name__}: {str(error)}")
     
     logger.info(f"Stored {len(station_codes)} station records")
 
