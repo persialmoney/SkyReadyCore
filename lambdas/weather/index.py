@@ -826,22 +826,26 @@ async def fetch_notams(airport_code: str) -> list:
                 skipped += 1
                 continue
 
-            body = report.get("body") or report.get("raw") or ""
+            raw_text = report.get("raw") or ""
+            body = report.get("body") or ""
+            # For NOTAMs where AVWX couldn't parse a structured body, fall back to
+            # the full raw text for display, categorization, and severity scoring.
+            effective_body = body if body.strip() else raw_text
             raw_id = report.get("number") or report.get("id") or ""
             # Guarantee a unique, non-empty id so the frontend can use it as a React key
-            notam_id = raw_id if raw_id else f"{airport_code}-{idx}-{abs(hash(body)) % 100000}"
-            category = _map_notam_category(report)
-            severity = _derive_notam_severity(body)
+            notam_id = raw_id if raw_id else f"{airport_code}-{idx}-{abs(hash(raw_text)) % 100000}"
+            category = _map_notam_category({**report, "body": effective_body})
+            severity = _derive_notam_severity(effective_body)
             logger.debug(f"[NOTAM] {airport_code}: id={notam_id} cat={category} sev={severity} end={end_time}")
             results.append({
                 "id": notam_id,
                 "title": report.get("title") or _derive_notam_title(report),
-                "description": body,
+                "description": effective_body,
                 "category": category,
                 "severity": severity,
                 "effectiveStart": _dt(report.get("start_time")),
                 "effectiveEnd": end_time,
-                "rawText": report.get("raw") or body,
+                "rawText": raw_text or effective_body,
                 "whyShown": report.get("reason"),
             })
 

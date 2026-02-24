@@ -81,7 +81,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'defaultUnits': 'imperial',  # Default to imperial for aviation
                 'notificationEnabled': True,
                 'criticalAlertThreshold': 'moderate',
-                'defaultAirport': 'KSFO'
+                'defaultAirport': 'KSFO',
+                'enabledCurrencies': ['flight-review', 'medical', 'general-ASEL']  # Default enabled currencies
             }
         }
         

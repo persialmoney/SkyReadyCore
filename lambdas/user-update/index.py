@@ -173,6 +173,10 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         if 'criticalAlertThreshold' in preferences and preferences['criticalAlertThreshold'] is not None:
             update_expression_parts.append("preferences.criticalAlertThreshold = :criticalAlertThreshold")
             expression_values[":criticalAlertThreshold"] = preferences['criticalAlertThreshold']
+        
+        if 'enabledCurrencies' in preferences and preferences['enabledCurrencies'] is not None:
+            update_expression_parts.append("preferences.enabledCurrencies = :enabledCurrencies")
+            expression_values[":enabledCurrencies"] = preferences['enabledCurrencies']
     
     # Conditionally update pilotInfo if provided
     pilot_info = input_data.get('pilotInfo')
