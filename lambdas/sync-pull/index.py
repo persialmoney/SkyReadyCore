@@ -120,7 +120,7 @@ def handler(event, context):
         profiles_deleted = []
         
         if user_data_changed:
-            personal_minimums = user_item.get('personalMinimumsProfiles', [])
+            personal_minimums = user_item.get('personalMinimumsProfiles', []) or []
             for profile in personal_minimums:
                 # Check if profile was created or updated since last pull
                 profile_created_at = parse_timestamp(profile.get('createdAt', ''))
@@ -141,7 +141,7 @@ def handler(event, context):
         aircraft_deleted = []
         
         if user_data_changed:
-            aircraft_list = user_item.get('aircraft', [])
+            aircraft_list = user_item.get('aircraft', []) or []
             for aircraft in aircraft_list:
                 added_at_ts = parse_timestamp(aircraft.get('addedAt', ''))
                 # For aircraft, we treat any change as "created" since we don't track individual updates
@@ -153,7 +153,7 @@ def handler(event, context):
         prefs_updated = []
         
         if user_data_changed:
-            preferences = user_item.get('preferences', {})
+            preferences = user_item.get('preferences', {}) or {}
             if preferences:
                 # For preferences, we only send if user object was updated
                 prefs_updated.append(format_preferences(user_id, preferences))

@@ -357,10 +357,31 @@ def handler(event, context):
         for update in changes.get('personalMinimumsProfiles', {}).get('updated', []):
             profile_id = update['id']
             profile_data = update['data']
+            client_updated_at = update.get('clientUpdatedAt', 0)  # Timestamp from client
+            
             print(f"[sync-push] Updating personal minimums profile: {profile_id}")
             
             for i, profile in enumerate(personal_minimums):
                 if profile.get('id') == profile_id:
+                    # Check for conflict: is server version newer than client?
+                    server_updated_at_str = profile.get('updatedAt', '')
+                    try:
+                        server_updated_at = datetime.fromisoformat(server_updated_at_str.replace('Z', '+00:00'))
+                        server_timestamp_ms = int(server_updated_at.timestamp() * 1000)
+                        
+                        # Conflict: server is newer than client's version
+                        if server_timestamp_ms > client_updated_at:
+                            print(f"[sync-push] Conflict detected for profile {profile_id}: server={server_timestamp_ms} > client={client_updated_at}")
+                            conflicts.append({
+                                'entryId': profile_id,
+                                'type': 'SERVER_NEWER',
+                                'serverTimestamp': server_timestamp_ms
+                            })
+                            continue  # Skip update, server wins
+                    except:
+                        pass  # If can't parse, proceed with update (first update case)
+                    
+                    # No conflict, apply update
                     personal_minimums[i].update({
                         'name': profile_data['name'],
                         'kind': profile_data['kind'],
@@ -377,7 +398,7 @@ def handler(event, context):
                         'comfortCrosswindKt': profile_data.get('comfortCrosswindKt'),
                         'comfortGustSpreadKt': profile_data.get('comfortGustSpreadKt'),
                         'updatedAt': datetime.utcnow().isoformat() + 'Z',
-                        'version': profile_data.get('version', 0)
+                        'version': profile_data.get('version', 0) + 1  # Increment version
                     })
                     user_updated = True
                     break

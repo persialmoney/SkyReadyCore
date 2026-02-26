@@ -1,16 +1,112 @@
 """
 Cognito Post-Confirmation Lambda Trigger.
 Automatically creates user profile in DynamoDB when user confirms their email.
+Includes default Personal Minimums profiles (VFR, Night VFR, IFR).
 """
 import json
 import os
 import boto3
+import uuid
 from datetime import datetime
 from typing import Dict, Any
 
 # Initialize DynamoDB client
 dynamodb = boto3.resource('dynamodb')
 users_table = dynamodb.Table(os.environ.get('USERS_TABLE', 'sky-ready-users-dev'))
+
+
+def create_default_minimums_profiles(user_id: str) -> list:
+    """
+    Create default personal minimums profiles matching the React Native app's DEFAULT_PROFILES.
+    
+    From: SkyReady/src/types/personalMinimums.ts
+    
+    Visibility is stored as tenths of statute miles (e.g., 3.0 SM = 30 tenths)
+    """
+    now = datetime.utcnow().isoformat()
+    
+    profiles = [
+        {
+            'id': str(uuid.uuid4()),
+            'userId': user_id,
+            'name': 'Default VFR',
+            'kind': 'VFR',
+            'isDefault': True,
+            # Permissions
+            'nightAllowed': True,
+            'ifrAllowed': False,
+            'passengersAllowed': True,
+            # Recency
+            'maxDaysSinceLastFlight': 30,
+            # Weather limits
+            'minCeilingFt': 2000,
+            'minVisibilityTenthsSm': 30,  # 3.0 SM * 10
+            'maxWindKt': 20,
+            'maxCrosswindKt': 12,
+            'maxGustSpreadKt': 10,
+            # Comfort thresholds
+            'comfortCrosswindKt': 8,
+            'comfortGustSpreadKt': 6,
+            # Metadata
+            'createdAt': now,
+            'updatedAt': now,
+            'version': 0
+        },
+        {
+            'id': str(uuid.uuid4()),
+            'userId': user_id,
+            'name': 'Night VFR',
+            'kind': 'NIGHT_VFR',
+            'isDefault': False,
+            # Permissions
+            'nightAllowed': True,
+            'ifrAllowed': False,
+            'passengersAllowed': True,
+            # Recency
+            'maxDaysSinceLastFlight': 21,
+            # Weather limits
+            'minCeilingFt': 3000,
+            'minVisibilityTenthsSm': 50,  # 5.0 SM * 10
+            'maxWindKt': 15,
+            'maxCrosswindKt': 10,
+            'maxGustSpreadKt': 8,
+            # Comfort thresholds
+            'comfortCrosswindKt': 7,
+            'comfortGustSpreadKt': 5,
+            # Metadata
+            'createdAt': now,
+            'updatedAt': now,
+            'version': 0
+        },
+        {
+            'id': str(uuid.uuid4()),
+            'userId': user_id,
+            'name': 'IFR Conservative',
+            'kind': 'IFR',
+            'isDefault': False,
+            # Permissions
+            'nightAllowed': True,
+            'ifrAllowed': True,
+            'passengersAllowed': True,
+            # Recency
+            'maxDaysSinceLastFlight': 30,
+            # Weather limits
+            'minCeilingFt': 1000,
+            'minVisibilityTenthsSm': 20,  # 2.0 SM * 10
+            'maxWindKt': 20,
+            'maxCrosswindKt': 12,
+            'maxGustSpreadKt': 10,
+            # Comfort thresholds
+            'comfortCrosswindKt': 8,
+            'comfortGustSpreadKt': 6,
+            # Metadata
+            'createdAt': now,
+            'updatedAt': now,
+            'version': 0
+        }
+    ]
+    
+    return profiles
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -64,6 +160,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         certificate_type = user_attributes.get('custom:certificate_type', '')
         aircraft_ratings = user_attributes.get('custom:aircraft_ratings', '')
         
+        # Create default personal minimums profiles
+        default_profiles = create_default_minimums_profiles(user_id)
+        
         # Create user profile in DynamoDB with pilot information
         user_item = {
             'userId': user_id,
@@ -82,13 +181,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'notificationEnabled': True,
                 'criticalAlertThreshold': 'moderate',
                 'defaultAirport': 'KSFO',
-                'enabledCurrencies': ['flight-review', 'medical', 'general-ASEL']  # Default enabled currencies
-            }
+                'enabledCurrencies': ['flight-review', 'medical', 'general-ASEL'],  # Default enabled currencies
+                'createdAt': datetime.utcnow().isoformat(),
+                'updatedAt': datetime.utcnow().isoformat()
+            },
+            'aircraft': [],  # Initialize empty aircraft list for sync
+            'personalMinimumsProfiles': default_profiles  # Pre-populated with VFR, Night VFR, IFR
         }
         
         users_table.put_item(Item=user_item)
         
-        print(f"Successfully created user profile for {user_id} ({email})")
+        print(f"Successfully created user profile for {user_id} ({email}) with {len(default_profiles)} default personal minimums profiles")
         
         return event
         
