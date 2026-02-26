@@ -99,10 +99,29 @@ def handler(event, context):
         if failed_count > 0:
             print(f"[outbox-processor] Completed: {successful_count} successful, {failed_count} failed")
 
+        # Clean up old processed records (7+ days)
+        deleted_count = 0
+        try:
+            cursor.execute("""
+                DELETE FROM outbox 
+                WHERE processed_at IS NOT NULL 
+                AND processed_at < NOW() - INTERVAL '7 days'
+            """)
+            deleted_count = cursor.rowcount
+            conn.commit()
+            
+            if deleted_count > 0:
+                print(f"[outbox-processor] Cleaned up {deleted_count} old processed records")
+        except Exception as e:
+            print(f"[outbox-processor] Cleanup warning: {e}")
+            # Don't fail the Lambda if cleanup fails
+            conn.rollback()
+
         return {
             'processed': successful_count,
             'failed': failed_count,
-            'total': len(rows)
+            'total': len(rows),
+            'deleted': deleted_count
         }
 
     except Exception as e:

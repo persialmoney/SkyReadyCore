@@ -1,6 +1,7 @@
 """
 Sync Push Lambda - Process bulk changes from client (outbox pattern)
-Clean implementation - no old CRUD fallbacks
+- Logbook entries: PostgreSQL
+- User data (preferences, aircraft, personal minimums): DynamoDB
 Includes: server-side signature hash validation, CFI auto-copy mirror logic
 """
 import json
@@ -8,24 +9,27 @@ import time
 import os
 import uuid
 import hashlib
+import boto3
+from datetime import datetime
 from db_utils import get_db_connection, return_db_connection
 import psycopg
 from psycopg.types.json import Jsonb
+
+# Initialize DynamoDB
+dynamodb = boto3.resource('dynamodb')
+users_table = dynamodb.Table(os.environ.get('USERS_TABLE', 'sky-ready-users-dev'))
 
 
 def validate_signature_hash(entry):
     """
     Re-verify signature hash to prevent tampering.
-    Hash must include: entry fields + instructor snapshot + signature image
-    Returns True if valid, raises ValueError if invalid.
     """
     signature = entry.get('signature')
     if not signature:
-        return True  # No signature to validate
+        return True
     
     instructor_snapshot = entry.get('instructorSnapshot', {})
     
-    # Build hash input string (must match client-side algorithm)
     hash_input = '|'.join([
         str(entry.get('entryId', '')),
         str(entry.get('date', '')),
@@ -38,12 +42,10 @@ def validate_signature_hash(entry):
         signature.get('timestamp', '')
     ])
     
-    # Compute expected hash
     expected_hash = hashlib.sha256(hash_input.encode()).hexdigest()
     
-    # Compare with provided hash
     if signature.get('hash') != expected_hash:
-        raise ValueError(f"Signature hash mismatch for entry {entry.get('entryId')} - possible tampering detected")
+        raise ValueError(f"Signature hash mismatch for entry {entry.get('entryId')}")
     
     return True
 
@@ -51,13 +53,10 @@ def validate_signature_hash(entry):
 def create_cfi_mirror_entry(cursor, student_entry, student_user_id):
     """
     Create a mirrored entry in the CFI's logbook when a student's entry is signed.
-    Transforms: dualReceived -> dualGiven, PIC = totalTime, student snapshot populated.
-    Idempotent: skips if mirror already exists for this (mirroredFromEntryId, cfiUserId).
     """
     cfi_user_id = student_entry.get('instructorUserId')
     
     if not cfi_user_id:
-        print(f"[cfi-mirror] No instructorUserId in entry {student_entry.get('entryId')}, skipping mirror")
         return
     
     original_entry_id = student_entry.get('entryId')
@@ -69,26 +68,20 @@ def create_cfi_mirror_entry(cursor, student_entry, student_user_id):
     """, [original_entry_id, cfi_user_id])
     
     if cursor.fetchone():
-        print(f"[cfi-mirror] Mirror already exists for entry {original_entry_id}, CFI {cfi_user_id}")
+        print(f"[cfi-mirror] Mirror already exists for entry {original_entry_id}")
         return
     
-    # Generate new mirror entry ID
     mirror_entry_id = str(uuid.uuid4())
     
-    # Build student snapshot from student's profile (or use provided data)
-    # For now, use basic name from the entry (student's name would come from their user profile)
-    # TODO: Look up student's full profile to populate certificateNumber and certificateType
     student_snapshot = {
-        'name': student_entry.get('studentName', 'Student'),  # Frontend should provide this
-        'certificateNumber': None,  # Would need to lookup from student's user profile
+        'name': student_entry.get('studentName', 'Student'),
+        'certificateNumber': None,
         'certificateType': None
     }
     
-    # Transform times: dualReceived -> dualGiven, PIC = totalTime
     total_time = student_entry.get('totalTime', 0)
     dual_given = student_entry.get('dualReceived', 0)
     
-    # Create mirror entry
     cursor.execute("""
         INSERT INTO logbook_entries (
             entry_id, user_id, date, aircraft, tail_number, route, route_legs,
@@ -111,9 +104,7 @@ def create_cfi_mirror_entry(cursor, student_entry, student_user_id):
         Jsonb(student_entry.get('aircraft')), student_entry.get('tailNumber'),
         student_entry.get('route'), Jsonb(student_entry.get('routeLegs', [])),
         student_entry.get('flightTypes', []),
-        total_time,  # Total time same
-        total_time,  # CFI logs PIC time while instructing
-        dual_given,  # Dual given (was dual received for student)
+        total_time, total_time, dual_given,
         student_entry.get('crossCountry', 0), student_entry.get('night', 0),
         student_entry.get('actualImc', 0), student_entry.get('simulatedInstrument', 0),
         student_entry.get('dayTakeoffs', 0), student_entry.get('dayLandings', 0),
@@ -121,17 +112,14 @@ def create_cfi_mirror_entry(cursor, student_entry, student_user_id):
         student_entry.get('dayFullStopLandings', 0), student_entry.get('nightFullStopLandings', 0),
         student_entry.get('approaches', 0), student_entry.get('holds', False),
         student_entry.get('tracking', False),
-        student_user_id,  # Link to student's account
-        Jsonb(student_snapshot),
+        student_user_id, Jsonb(student_snapshot),
         student_entry.get('lessonTopic'), student_entry.get('groundInstruction', 0),
         student_entry.get('maneuvers', []),
         student_entry.get('remarks'),
-        'SAVED',  # CFI's mirror is automatically saved (not pending signature)
-        original_entry_id,  # Link back to student's original entry
-        student_user_id
+        'SAVED', original_entry_id, student_user_id
     ])
     
-    print(f"[cfi-mirror] Created mirror entry {mirror_entry_id} for CFI {cfi_user_id} from student entry {original_entry_id}")
+    print(f"[cfi-mirror] Created mirror entry {mirror_entry_id}")
 
 
 def handler(event, context):
@@ -151,12 +139,13 @@ def handler(event, context):
         conflicts = []
         timestamp = int(time.time() * 1000)
         
+        # ========== LOGBOOK ENTRIES (PostgreSQL) ==========
+        
         # Process created entries
         for entry in changes.get('logbookEntries', {}).get('created', []):
             try:
                 print(f"[sync-push] Creating entry: {entry.get('entryId')}")
                 
-                # Validate signature hash if entry is signed
                 if entry.get('status') == 'SIGNED':
                     validate_signature_hash(entry)
                 
@@ -207,13 +196,10 @@ def handler(event, context):
                     entry.get('mirroredFromEntryId'), entry.get('mirroredFromUserId')
                 ])
                 
-                # If entry is signed and has an instructor, create CFI mirror
                 if entry.get('status') == 'SIGNED' and entry.get('instructorUserId'):
                     create_cfi_mirror_entry(cursor, entry, user_id)
                 
             except psycopg.errors.UniqueViolation as e:
-                # psycopg3 puts the connection in an error state on any exception;
-                # must rollback before continuing to process remaining entries.
                 conn.rollback()
                 print(f"[sync-push] Conflict creating entry {entry['entryId']}: {e}")
                 conflicts.append({
@@ -222,8 +208,7 @@ def handler(event, context):
                     'serverTimestamp': timestamp
                 })
             except ValueError as e:
-                # Signature validation error
-                print(f"[sync-push] Signature validation failed for entry {entry['entryId']}: {e}")
+                print(f"[sync-push] Signature validation failed: {e}")
                 conflicts.append({
                     'entryId': entry['entryId'],
                     'type': 'SIGNATURE_INVALID',
@@ -237,12 +222,10 @@ def handler(event, context):
             
             print(f"[sync-push] Updating entry: {entry_id}")
             
-            # Validate signature hash if entry is signed
             if entry_data.get('status') == 'SIGNED':
                 try:
                     validate_signature_hash(entry_data)
                 except ValueError as e:
-                    print(f"[sync-push] Signature validation failed for entry {entry_id}: {e}")
                     conflicts.append({
                         'entryId': entry_id,
                         'type': 'SIGNATURE_INVALID',
@@ -250,7 +233,6 @@ def handler(event, context):
                     })
                     continue
             
-            # Check for conflicts (timestamp-based: server wins)
             cursor.execute("""
                 SELECT updated_at FROM logbook_entries
                 WHERE entry_id = %s AND user_id = %s AND deleted_at IS NULL
@@ -260,7 +242,6 @@ def handler(event, context):
             if row:
                 server_updated_at = int(row[0].timestamp() * 1000)
                 if server_updated_at > last_pulled_at:
-                    print(f"[sync-push] Conflict: server newer for {entry_id}")
                     conflicts.append({
                         'entryId': entry_id,
                         'type': 'SERVER_NEWER',
@@ -314,33 +295,172 @@ def handler(event, context):
                 entry_id, user_id
             ])
             
-            # If entry was just signed and has an instructor, create CFI mirror
             if entry_data.get('status') == 'SIGNED' and entry_data.get('instructorUserId'):
                 create_cfi_mirror_entry(cursor, entry_data, user_id)
         
         # Process deleted entries (soft delete)
-        deleted_entry_ids = changes.get('logbookEntries', {}).get('deleted', [])
-        
-        for entry_id in deleted_entry_ids:
-            # Perform soft delete
+        for entry_id in changes.get('logbookEntries', {}).get('deleted', []):
             cursor.execute("""
                 UPDATE logbook_entries SET
                     deleted_at = NOW(),
                     updated_at = NOW()
                 WHERE entry_id = %s AND user_id = %s AND deleted_at IS NULL
             """, [entry_id, user_id])
-            
-            # Log only if update failed (critical error)
-            if cursor.rowcount == 0:
-                print(f"[sync-push] WARNING: Failed to delete entry {entry_id} - not found or already deleted")
         
-        # Write to outbox for pub/sub
-        cursor.execute("""
-            INSERT INTO outbox (event_type, user_id, payload, created_at)
-            VALUES (%s, %s, %s, NOW())
-        """, ['sync_push', user_id, Jsonb(changes)])
+        # Write to outbox for pub/sub (logbook entries only)
+        # User data changes already tracked in DynamoDB updatedAt
+        if changes.get('logbookEntries'):
+            cursor.execute("""
+                INSERT INTO outbox (event_type, user_id, payload, created_at)
+                VALUES (%s, %s, %s, NOW())
+            """, ['sync_push', user_id, Jsonb({'logbookEntries': changes.get('logbookEntries')})])
         
         conn.commit()
+        
+        # ========== USER DATA (DynamoDB) ==========
+        
+        # Get current user object
+        user_response = users_table.get_item(Key={'userId': user_id})
+        user_item = user_response.get('Item', {})
+        
+        # Track if user object needs updating
+        user_updated = False
+        
+        # Process personal minimums profiles
+        personal_minimums = user_item.get('personalMinimumsProfiles', [])
+        
+        for profile in changes.get('personalMinimumsProfiles', {}).get('created', []):
+            print(f"[sync-push] Creating personal minimums profile: {profile.get('id')}")
+            personal_minimums.append({
+                'id': profile['id'],
+                'userId': user_id,
+                'name': profile['name'],
+                'kind': profile['kind'],
+                'isDefault': profile.get('isDefault', False),
+                'nightAllowed': profile.get('nightAllowed', True),
+                'ifrAllowed': profile.get('ifrAllowed', False),
+                'passengersAllowed': profile.get('passengersAllowed', True),
+                'maxDaysSinceLastFlight': profile.get('maxDaysSinceLastFlight'),
+                'minCeilingFt': profile.get('minCeilingFt'),
+                'minVisibilityTenthsSm': profile.get('minVisibilityTenthsSm'),
+                'maxWindKt': profile.get('maxWindKt'),
+                'maxCrosswindKt': profile.get('maxCrosswindKt'),
+                'maxGustSpreadKt': profile.get('maxGustSpreadKt'),
+                'comfortCrosswindKt': profile.get('comfortCrosswindKt'),
+                'comfortGustSpreadKt': profile.get('comfortGustSpreadKt'),
+                'createdAt': datetime.utcnow().isoformat() + 'Z',
+                'updatedAt': datetime.utcnow().isoformat() + 'Z',
+                'version': profile.get('version', 0)
+            })
+            user_updated = True
+        
+        for update in changes.get('personalMinimumsProfiles', {}).get('updated', []):
+            profile_id = update['id']
+            profile_data = update['data']
+            print(f"[sync-push] Updating personal minimums profile: {profile_id}")
+            
+            for i, profile in enumerate(personal_minimums):
+                if profile.get('id') == profile_id:
+                    personal_minimums[i].update({
+                        'name': profile_data['name'],
+                        'kind': profile_data['kind'],
+                        'isDefault': profile_data.get('isDefault', False),
+                        'nightAllowed': profile_data.get('nightAllowed', True),
+                        'ifrAllowed': profile_data.get('ifrAllowed', False),
+                        'passengersAllowed': profile_data.get('passengersAllowed', True),
+                        'maxDaysSinceLastFlight': profile_data.get('maxDaysSinceLastFlight'),
+                        'minCeilingFt': profile_data.get('minCeilingFt'),
+                        'minVisibilityTenthsSm': profile_data.get('minVisibilityTenthsSm'),
+                        'maxWindKt': profile_data.get('maxWindKt'),
+                        'maxCrosswindKt': profile_data.get('maxCrosswindKt'),
+                        'maxGustSpreadKt': profile_data.get('maxGustSpreadKt'),
+                        'comfortCrosswindKt': profile_data.get('comfortCrosswindKt'),
+                        'comfortGustSpreadKt': profile_data.get('comfortGustSpreadKt'),
+                        'updatedAt': datetime.utcnow().isoformat() + 'Z',
+                        'version': profile_data.get('version', 0)
+                    })
+                    user_updated = True
+                    break
+        
+        for profile_id in changes.get('personalMinimumsProfiles', {}).get('deleted', []):
+            print(f"[sync-push] Deleting personal minimums profile: {profile_id}")
+            for i, profile in enumerate(personal_minimums):
+                if profile.get('id') == profile_id:
+                    personal_minimums[i]['deletedAt'] = datetime.utcnow().isoformat() + 'Z'
+                    user_updated = True
+                    break
+        
+        # Process aircraft
+        aircraft_list = user_item.get('aircraft', [])
+        
+        for aircraft in changes.get('userAircraft', {}).get('created', []):
+            print(f"[sync-push] Creating aircraft: {aircraft.get('tailNumber')}")
+            aircraft_list.append({
+                'tailNumber': aircraft['tailNumber'],
+                'make': aircraft.get('make'),
+                'model': aircraft.get('model'),
+                'category': aircraft.get('category'),
+                'class': aircraft.get('class'),
+                'notes': aircraft.get('notes'),
+                'complex': aircraft.get('complex', False),
+                'highPerformance': aircraft.get('highPerformance', False),
+                'tailwheel': aircraft.get('tailwheel', False),
+                'isManual': aircraft.get('isManual', False),
+                'builderCertification': aircraft.get('builderCertification'),
+                'airworthinessDate': aircraft.get('airworthinessDate'),
+                'usageCount': aircraft.get('usageCount', 0),
+                'isArchived': aircraft.get('isArchived', False),
+                'addedAt': datetime.utcnow().isoformat() + 'Z'
+            })
+            user_updated = True
+        
+        for update in changes.get('userAircraft', {}).get('updated', []):
+            tail_number = update['tailNumber']
+            aircraft_data = update['data']
+            print(f"[sync-push] Updating aircraft: {tail_number}")
+            
+            for i, aircraft in enumerate(aircraft_list):
+                if aircraft.get('tailNumber') == tail_number:
+                    aircraft_list[i].update({
+                        'make': aircraft_data.get('make'),
+                        'model': aircraft_data.get('model'),
+                        'category': aircraft_data.get('category'),
+                        'class': aircraft_data.get('class'),
+                        'notes': aircraft_data.get('notes'),
+                        'complex': aircraft_data.get('complex', False),
+                        'highPerformance': aircraft_data.get('highPerformance', False),
+                        'tailwheel': aircraft_data.get('tailwheel', False),
+                        'usageCount': aircraft_data.get('usageCount', 0),
+                        'isArchived': aircraft_data.get('isArchived', False)
+                    })
+                    user_updated = True
+                    break
+        
+        for tail_number in changes.get('userAircraft', {}).get('deleted', []):
+            print(f"[sync-push] Deleting aircraft: {tail_number}")
+            aircraft_list = [a for a in aircraft_list if a.get('tailNumber') != tail_number]
+            user_updated = True
+        
+        # Process preferences
+        for prefs in changes.get('userPreferences', {}).get('created', []) + changes.get('userPreferences', {}).get('updated', []):
+            print(f"[sync-push] Updating preferences for user: {user_id}")
+            user_item['preferences'] = {
+                'defaultUnits': prefs.get('defaultUnits'),
+                'notificationEnabled': prefs.get('notificationEnabled', True),
+                'criticalAlertThreshold': prefs.get('criticalAlertThreshold'),
+                'defaultAirport': prefs.get('defaultAirport'),
+                'enabledCurrencies': prefs.get('enabledCurrencies', [])
+            }
+            user_updated = True
+        
+        # Update DynamoDB if any user data changed
+        if user_updated:
+            user_item['personalMinimumsProfiles'] = personal_minimums
+            user_item['aircraft'] = aircraft_list
+            user_item['updatedAt'] = datetime.utcnow().isoformat() + 'Z'
+            
+            users_table.put_item(Item=user_item)
+            print(f"[sync-push] Updated DynamoDB user object")
 
         print(f"[sync-push] Success: {len(conflicts)} conflicts")
 
