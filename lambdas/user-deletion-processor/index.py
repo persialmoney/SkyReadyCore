@@ -99,6 +99,9 @@ def process_hard_delete(user_id: str, request: Dict) -> Dict:
     summary = {
         'logbook_entries_deleted': 0,
         'outbox_entries_deleted': 0,
+        'missions_deleted': 0,
+        'mission_airports_deleted': 0,
+        'assessments_deleted': 0,
         'saved_airports_deleted': 0,
         'alerts_deleted': 0,
         'cognito_deleted': False,
@@ -106,7 +109,7 @@ def process_hard_delete(user_id: str, request: Dict) -> Dict:
     }
 
     # 1. PostgreSQL: Null out instructor/student references in OTHER users' entries
-    # 2. PostgreSQL: Hard delete logbook entries owned by this user
+    # 2. PostgreSQL: Hard delete logbook entries, missions, airports, assessments
     # 3. PostgreSQL: Delete outbox entries for this user
     pg_summary = hard_delete_postgres_data(user_id)
     summary.update(pg_summary)
@@ -168,7 +171,14 @@ def hard_delete_postgres_data(user_id: str) -> Dict:
     db_endpoint = os.environ.get('DB_ENDPOINT')
     db_name = os.environ.get('DB_NAME', 'logbook')
 
-    result = {'logbook_entries_deleted': 0, 'outbox_entries_deleted': 0, 'references_nulled': 0}
+    result = {
+        'logbook_entries_deleted': 0,
+        'outbox_entries_deleted': 0,
+        'references_nulled': 0,
+        'missions_deleted': 0,
+        'mission_airports_deleted': 0,
+        'assessments_deleted': 0,
+    }
 
     if not db_secret_arn or not db_endpoint:
         print("[DeletionProcessor] PostgreSQL not configured, skipping")
@@ -191,6 +201,10 @@ def hard_delete_postgres_data(user_id: str) -> Dict:
 
     try:
         with conn.cursor() as cur:
+            # ------------------------------------------------------------------
+            # LOGBOOK ENTRIES
+            # ------------------------------------------------------------------
+
             # Null out instructor/student/mirror references in OTHER users' entries
             cur.execute(
                 "UPDATE logbook_entries SET instructor_user_id = NULL "
@@ -221,7 +235,39 @@ def hard_delete_postgres_data(user_id: str) -> Dict:
             )
             result['logbook_entries_deleted'] = cur.rowcount
 
-            # Delete outbox entries
+            # ------------------------------------------------------------------
+            # MISSIONS, AIRPORTS, ASSESSMENTS
+            # Delete in dependency order: assessments → airports → missions
+            # ------------------------------------------------------------------
+
+            # Delete readiness assessments for all of this user's missions
+            cur.execute("""
+                DELETE FROM readiness_assessments
+                WHERE mission_id IN (
+                    SELECT id FROM missions WHERE user_id = %s
+                )
+            """, (user_id,))
+            result['assessments_deleted'] = cur.rowcount
+
+            # Delete mission airports for all of this user's missions
+            cur.execute("""
+                DELETE FROM mission_airports
+                WHERE mission_id IN (
+                    SELECT id FROM missions WHERE user_id = %s
+                )
+            """, (user_id,))
+            result['mission_airports_deleted'] = cur.rowcount
+
+            # Hard delete missions owned by this user
+            cur.execute(
+                "DELETE FROM missions WHERE user_id = %s",
+                (user_id,)
+            )
+            result['missions_deleted'] = cur.rowcount
+
+            # ------------------------------------------------------------------
+            # OUTBOX
+            # ------------------------------------------------------------------
             cur.execute(
                 "DELETE FROM outbox WHERE user_id = %s",
                 (user_id,)
