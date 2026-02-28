@@ -2,6 +2,7 @@
 Sync Pull Lambda - Send changes since lastPulledAt (cursor pattern)
 - Logbook entries: PostgreSQL
 - User data (preferences, aircraft, personal minimums): DynamoDB
+- Missions, mission airports, readiness assessments: PostgreSQL
 """
 import json
 import time
@@ -108,7 +109,7 @@ def handler(event, context):
         try:
             user_updated_datetime = datetime.fromisoformat(user_updated_at.replace('Z', '+00:00'))
             user_updated_timestamp = int(user_updated_datetime.timestamp() * 1000)
-        except:
+        except Exception as e:
             user_updated_timestamp = 0
         
         # Only return user data if it's been updated since last pull
@@ -158,6 +159,101 @@ def handler(event, context):
                 # For preferences, we only send if user object was updated
                 prefs_updated.append(format_preferences(user_id, preferences))
 
+        # ========== MISSIONS (PostgreSQL) ==========
+
+        cursor.execute("""
+            SELECT
+                id, mission_id, user_id, status, is_operational,
+                mission_type, scheduled_time_utc, time_precision,
+                tail_number, aircraft_label, notes, forecast_reviewed_at,
+                route_hash, latest_assessment_id, latest_result,
+                latest_checked_time, latest_reason_short, latest_reason_long,
+                created_at, updated_at, deleted_at
+            FROM missions
+            WHERE user_id = %s
+              AND (created_at > %s OR updated_at > %s)
+            ORDER BY GREATEST(created_at, updated_at)
+        """, [user_id, last_pulled_at, last_pulled_at])
+
+        missions_created = []
+        missions_updated = []
+        missions_deleted = []
+
+        for row in cursor.fetchall():
+            deleted_at = row[20]
+            created_at = row[18]
+            if deleted_at and deleted_at > last_pulled_at:
+                missions_deleted.append(str(row[0]))
+            elif created_at and created_at > last_pulled_at:
+                missions_created.append(format_mission(row))
+            else:
+                missions_updated.append(format_mission(row))
+
+        # ========== MISSION AIRPORTS (PostgreSQL) ==========
+
+        # Fetch airports for all missions belonging to this user that changed
+        cursor.execute("""
+            SELECT
+                ma.id, ma.mission_id, ma.icao, ma.role, ma.order_index, ma.display_name
+            FROM mission_airports ma
+            INNER JOIN missions m ON m.id = ma.mission_id
+            WHERE m.user_id = %s
+              AND (m.created_at > %s OR m.updated_at > %s)
+        """, [user_id, last_pulled_at, last_pulled_at])
+
+        airports_created = []
+        airports_deleted = []
+
+        for row in cursor.fetchall():
+            airports_created.append(format_mission_airport(row))
+
+        # Deletions: airports whose parent mission was soft-deleted
+        cursor.execute("""
+            SELECT ma.id
+            FROM mission_airports ma
+            INNER JOIN missions m ON m.id = ma.mission_id
+            WHERE m.user_id = %s
+              AND m.deleted_at IS NOT NULL
+              AND m.deleted_at > %s
+        """, [user_id, last_pulled_at])
+
+        airports_deleted = [str(row[0]) for row in cursor.fetchall()]
+
+        # ========== READINESS ASSESSMENTS (PostgreSQL) ==========
+
+        cursor.execute("""
+            SELECT
+                ra.id, ra.mission_id,
+                ra.assessment_time_utc, ra.target_time_utc, ra.target_time_kind,
+                ra.route_hash, ra.route_airports_json,
+                ra.minimums_profile_id, ra.minimums_profile_name, ra.data_source,
+                ra.aggregate_result, ra.aggregate_reason_short, ra.aggregate_reason_long,
+                ra.dominant_factor, ra.dominant_message, ra.margin_message,
+                ra.airports_evaluated_count, ra.airports_missing_data_count,
+                ra.flags_summary, ra.max_severity_score,
+                ra.near_limit_airport_count, ra.no_go_airport_count,
+                ra.airport_checks_json, ra.stale_threshold_minutes,
+                ra.created_at, ra.deleted_at
+            FROM readiness_assessments ra
+            INNER JOIN missions m ON m.id = ra.mission_id
+            WHERE m.user_id = %s
+              AND (ra.created_at > %s OR ra.deleted_at > %s)
+            ORDER BY ra.created_at
+        """, [user_id, last_pulled_at, last_pulled_at])
+
+        assessments_created = []
+        assessments_deleted = []
+
+        for row in cursor.fetchall():
+            deleted_at = row[25]
+            created_at = row[24]
+            if deleted_at and deleted_at > last_pulled_at:
+                assessments_deleted.append(str(row[0]))
+            else:
+                assessments_created.append(format_assessment(row))
+
+        conn.commit()
+
         result = {
             'changes': {
                 'logbookEntries': {
@@ -178,14 +274,36 @@ def handler(event, context):
                 'userPreferences': {
                     'created': prefs_created,
                     'updated': prefs_updated
-                }
+                },
+                'missions': {
+                    'created': missions_created,
+                    'updated': missions_updated,
+                    'deleted': missions_deleted
+                },
+                'missionAirports': {
+                    'created': airports_created,
+                    'updated': [],
+                    'deleted': airports_deleted
+                },
+                'readinessAssessments': {
+                    'created': assessments_created,
+                    'updated': [],
+                    'deleted': assessments_deleted
+                },
             },
             'cursor': str(offset + len(rows)),
             'hasMore': len(rows) == limit,
             'timestamp': timestamp
         }
 
-        print(f"[sync-pull] Returning logbook({len(created)} created, {len(updated)} updated, {len(deleted)} deleted) profiles({len(profiles_created)} created, {len(profiles_updated)} updated) aircraft({len(aircraft_created)} created) preferences({len(prefs_updated)} updated)")
+        print(
+            f"[sync-pull] logbook({len(created)}c/{len(updated)}u/{len(deleted)}d) "
+            f"profiles({len(profiles_created)}c/{len(profiles_updated)}u) "
+            f"aircraft({len(aircraft_created)}c) "
+            f"missions({len(missions_created)}c/{len(missions_updated)}u/{len(missions_deleted)}d) "
+            f"airports({len(airports_created)}c/{len(airports_deleted)}d) "
+            f"assessments({len(assessments_created)}c/{len(assessments_deleted)}d)"
+        )
         return result
 
     except Exception as e:
@@ -310,4 +428,102 @@ def format_preferences(user_id, prefs):
         'enabledCurrencies': prefs.get('enabledCurrencies', []),
         'createdAt': parse_timestamp(prefs.get('createdAt', '')),
         'updatedAt': parse_timestamp(prefs.get('updatedAt', '')),
+    }
+
+
+def format_mission(row):
+    """Format missions DB row to GraphQL Mission type.
+
+    Column order matches the SELECT in sync-pull:
+      0:id 1:mission_id 2:user_id 3:status 4:is_operational
+      5:mission_type 6:scheduled_time_utc 7:time_precision
+      8:tail_number 9:aircraft_label 10:notes 11:forecast_reviewed_at
+      12:route_hash 13:latest_assessment_id 14:latest_result
+      15:latest_checked_time 16:latest_reason_short 17:latest_reason_long
+      18:created_at 19:updated_at 20:deleted_at
+    """
+    return {
+        'id': str(row[0]),
+        'missionId': str(row[1]) if row[1] else str(row[0]),
+        'userId': row[2],
+        'status': row[3],
+        'isOperational': bool(row[4]) if row[4] is not None else False,
+        'missionType': row[5],
+        'scheduledTimeUtc': int(row[6]) if row[6] is not None else None,
+        'timePrecision': row[7],
+        'tailNumber': row[8],
+        'aircraftLabel': row[9],
+        'notes': row[10],
+        'forecastReviewedAt': int(row[11]) if row[11] is not None else None,
+        'routeHash': row[12],
+        'latestAssessmentId': row[13],
+        'latestResult': row[14],
+        'latestCheckedTime': int(row[15]) if row[15] is not None else None,
+        'latestReasonShort': row[16],
+        'latestReasonLong': row[17],
+        'createdAt': int(row[18]) if row[18] is not None else None,
+        'updatedAt': int(row[19]) if row[19] is not None else None,
+        'deletedAt': int(row[20]) if row[20] is not None else None,
+    }
+
+
+def format_mission_airport(row):
+    """Format mission_airports DB row to GraphQL MissionAirport type.
+
+    Column order:
+      0:id 1:mission_id 2:icao 3:role 4:order_index 5:display_name
+    """
+    return {
+        'id': str(row[0]),
+        'missionId': str(row[1]),
+        'icao': row[2],
+        'role': row[3],
+        'orderIndex': int(row[4]) if row[4] is not None else 0,
+        'displayName': row[5],
+    }
+
+
+def format_assessment(row):
+    """Format readiness_assessments DB row to GraphQL ReadinessAssessment type.
+
+    Column order matches SELECT in sync-pull:
+      0:id 1:mission_id
+      2:assessment_time_utc 3:target_time_utc 4:target_time_kind
+      5:route_hash 6:route_airports_json
+      7:minimums_profile_id 8:minimums_profile_name 9:data_source
+      10:aggregate_result 11:aggregate_reason_short 12:aggregate_reason_long
+      13:dominant_factor 14:dominant_message 15:margin_message
+      16:airports_evaluated_count 17:airports_missing_data_count
+      18:flags_summary 19:max_severity_score
+      20:near_limit_airport_count 21:no_go_airport_count
+      22:airport_checks_json 23:stale_threshold_minutes
+      24:created_at 25:deleted_at
+    """
+    return {
+        'id': str(row[0]),
+        'missionId': str(row[1]),
+        'assessmentTimeUtc': int(row[2]) if row[2] is not None else None,
+        'targetTimeUtc': int(row[3]) if row[3] is not None else None,
+        'targetTimeKind': row[4],
+        'routeHash': row[5],
+        'routeAirportsJson': row[6],          # already parsed JSONB from psycopg
+        'minimumsProfileId': row[7],
+        'minimumsProfileName': row[8],
+        'dataSource': row[9],
+        'aggregateResult': row[10],
+        'aggregateReasonShort': row[11],
+        'aggregateReasonLong': row[12],
+        'dominantFactor': row[13],
+        'dominantMessage': row[14],
+        'marginMessage': row[15],
+        'airportsEvaluatedCount': int(row[16]) if row[16] is not None else 0,
+        'airportsMissingDataCount': int(row[17]) if row[17] is not None else 0,
+        'flagsSummary': row[18],
+        'maxSeverityScore': int(row[19]) if row[19] is not None else 0,
+        'nearLimitAirportCount': int(row[20]) if row[20] is not None else 0,
+        'noGoAirportCount': int(row[21]) if row[21] is not None else 0,
+        'airportChecksJson': row[22],         # already parsed JSONB from psycopg
+        'staleThresholdMinutes': int(row[23]) if row[23] is not None else 360,
+        'createdAt': int(row[24]) if row[24] is not None else None,
+        'deletedAt': int(row[25]) if row[25] is not None else None,
     }

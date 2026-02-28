@@ -2,6 +2,7 @@
 Sync Push Lambda - Process bulk changes from client (outbox pattern)
 - Logbook entries: PostgreSQL
 - User data (preferences, aircraft, personal minimums): DynamoDB
+- Missions, mission airports, readiness assessments: PostgreSQL
 Includes: server-side signature hash validation, CFI auto-copy mirror logic
 """
 import json
@@ -330,7 +331,12 @@ def handler(event, context):
         personal_minimums = user_item.get('personalMinimumsProfiles', [])
         
         for profile in changes.get('personalMinimumsProfiles', {}).get('created', []):
-            print(f"[sync-push] Creating personal minimums profile: {profile.get('id')}")
+            profile_id = profile.get('id')
+            
+            # Check if profile already exists (prevent duplicates)
+            if any(p.get('id') == profile_id for p in personal_minimums):
+                continue
+            
             personal_minimums.append({
                 'id': profile['id'],
                 'userId': user_id,
@@ -359,10 +365,11 @@ def handler(event, context):
             profile_data = update['data']
             client_updated_at = update.get('clientUpdatedAt', 0)  # Timestamp from client
             
-            print(f"[sync-push] Updating personal minimums profile: {profile_id}")
-            
+            # Find the profile in the list
+            profile_found = False
             for i, profile in enumerate(personal_minimums):
                 if profile.get('id') == profile_id:
+                    profile_found = True
                     # Check for conflict: is server version newer than client?
                     server_updated_at_str = profile.get('updatedAt', '')
                     try:
@@ -371,14 +378,13 @@ def handler(event, context):
                         
                         # Conflict: server is newer than client's version
                         if server_timestamp_ms > client_updated_at:
-                            print(f"[sync-push] Conflict detected for profile {profile_id}: server={server_timestamp_ms} > client={client_updated_at}")
                             conflicts.append({
                                 'entryId': profile_id,
                                 'type': 'SERVER_NEWER',
                                 'serverTimestamp': server_timestamp_ms
                             })
                             continue  # Skip update, server wins
-                    except:
+                    except Exception as e:
                         pass  # If can't parse, proceed with update (first update case)
                     
                     # No conflict, apply update
@@ -482,6 +488,211 @@ def handler(event, context):
             
             users_table.put_item(Item=user_item)
             print(f"[sync-push] Updated DynamoDB user object")
+
+        # ========== MISSIONS (PostgreSQL) ==========
+
+        for mission in changes.get('missions', {}).get('created', []):
+            mission_id = mission.get('id')
+            print(f"[sync-push] Creating mission: {mission_id}")
+            try:
+                cursor.execute("""
+                    INSERT INTO missions (
+                        id, mission_id, user_id, status, is_operational,
+                        mission_type, scheduled_time_utc, time_precision,
+                        tail_number, aircraft_label, notes, forecast_reviewed_at,
+                        route_hash, latest_assessment_id, latest_result,
+                        latest_checked_time, latest_reason_short, latest_reason_long,
+                        created_at, updated_at, deleted_at, _sync_pending
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                """, [
+                    mission_id, mission.get('missionId', mission_id), user_id,
+                    mission.get('status', 'SCHEDULED'),
+                    mission.get('isOperational', False),
+                    mission.get('missionType', 'LOCAL'),
+                    mission.get('scheduledTimeUtc'),
+                    mission.get('timePrecision'),
+                    mission.get('tailNumber'),
+                    mission.get('aircraftLabel'),
+                    mission.get('notes'),
+                    mission.get('forecastReviewedAt'),
+                    mission.get('routeHash'),
+                    mission.get('latestAssessmentId'),
+                    mission.get('latestResult'),
+                    mission.get('latestCheckedTime'),
+                    mission.get('latestReasonShort'),
+                    mission.get('latestReasonLong'),
+                    mission.get('createdAt', timestamp),
+                    mission.get('updatedAt', timestamp),
+                    mission.get('deletedAt'),
+                ])
+            except Exception as e:
+                conn.rollback()
+                print(f"[sync-push] Error creating mission {mission_id}: {e}")
+
+        for update in changes.get('missions', {}).get('updated', []):
+            mission_id = update.get('id')
+            data = update.get('data', update)  # flat update or wrapped in .data
+            print(f"[sync-push] Updating mission: {mission_id}")
+
+            # Conflict check: server newer than client's lastPulledAt?
+            cursor.execute("""
+                SELECT updated_at FROM missions
+                WHERE id = %s AND user_id = %s AND deleted_at IS NULL
+            """, [mission_id, user_id])
+            row = cursor.fetchone()
+            if row and row[0] and row[0] > last_pulled_at:
+                conflicts.append({
+                    'entryId': mission_id,
+                    'type': 'SERVER_NEWER',
+                    'serverTimestamp': row[0]
+                })
+                continue
+
+            cursor.execute("""
+                UPDATE missions SET
+                    status = %s, is_operational = %s, mission_type = %s,
+                    scheduled_time_utc = %s, time_precision = %s,
+                    tail_number = %s, aircraft_label = %s, notes = %s,
+                    forecast_reviewed_at = %s, route_hash = %s,
+                    latest_assessment_id = %s, latest_result = %s,
+                    latest_checked_time = %s, latest_reason_short = %s,
+                    latest_reason_long = %s, updated_at = %s, deleted_at = %s
+                WHERE id = %s AND user_id = %s
+            """, [
+                data.get('status'), data.get('isOperational', False),
+                data.get('missionType'), data.get('scheduledTimeUtc'),
+                data.get('timePrecision'), data.get('tailNumber'),
+                data.get('aircraftLabel'), data.get('notes'),
+                data.get('forecastReviewedAt'), data.get('routeHash'),
+                data.get('latestAssessmentId'), data.get('latestResult'),
+                data.get('latestCheckedTime'), data.get('latestReasonShort'),
+                data.get('latestReasonLong'),
+                data.get('updatedAt', timestamp),
+                data.get('deletedAt'),
+                mission_id, user_id,
+            ])
+
+        for mission_id in changes.get('missions', {}).get('deleted', []):
+            print(f"[sync-push] Soft-deleting mission: {mission_id}")
+            cursor.execute("""
+                UPDATE missions SET deleted_at = %s, updated_at = %s
+                WHERE id = %s AND user_id = %s AND deleted_at IS NULL
+            """, [timestamp, timestamp, mission_id, user_id])
+
+        # ========== MISSION AIRPORTS (PostgreSQL) ==========
+
+        for airport in changes.get('missionAirports', {}).get('created', []):
+            airport_id = airport.get('id')
+            print(f"[sync-push] Creating mission airport: {airport_id}")
+            try:
+                cursor.execute("""
+                    INSERT INTO mission_airports (
+                        id, mission_id, icao, role, order_index, display_name, _sync_pending
+                    ) VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+                    ON CONFLICT (id) DO NOTHING
+                """, [
+                    airport_id,
+                    airport.get('missionId'),
+                    airport.get('icao', '').upper(),
+                    airport.get('role', 'DEPARTURE'),
+                    airport.get('orderIndex', 0),
+                    airport.get('displayName'),
+                ])
+            except Exception as e:
+                conn.rollback()
+                print(f"[sync-push] Error creating mission airport {airport_id}: {e}")
+
+        for update in changes.get('missionAirports', {}).get('updated', []):
+            airport_id = update.get('id')
+            data = update.get('data', update)
+            cursor.execute("""
+                UPDATE mission_airports SET
+                    icao = %s, role = %s, order_index = %s, display_name = %s
+                WHERE id = %s
+            """, [
+                data.get('icao', '').upper(),
+                data.get('role'),
+                data.get('orderIndex', 0),
+                data.get('displayName'),
+                airport_id,
+            ])
+
+        for airport_id in changes.get('missionAirports', {}).get('deleted', []):
+            print(f"[sync-push] Deleting mission airport: {airport_id}")
+            cursor.execute("DELETE FROM mission_airports WHERE id = %s", [airport_id])
+
+        # ========== READINESS ASSESSMENTS (PostgreSQL) ==========
+        # Assessments are immutable events — only create and soft-delete, no updates.
+
+        for assessment in changes.get('readinessAssessments', {}).get('created', []):
+            assessment_id = assessment.get('id')
+            print(f"[sync-push] Creating readiness assessment: {assessment_id}")
+            try:
+                cursor.execute("""
+                    INSERT INTO readiness_assessments (
+                        id, mission_id,
+                        assessment_time_utc, target_time_utc, target_time_kind,
+                        route_hash, route_airports_json,
+                        minimums_profile_id, minimums_profile_name, data_source,
+                        aggregate_result, aggregate_reason_short, aggregate_reason_long,
+                        dominant_factor, dominant_message, margin_message,
+                        airports_evaluated_count, airports_missing_data_count,
+                        flags_summary, max_severity_score,
+                        near_limit_airport_count, no_go_airport_count,
+                        airport_checks_json, stale_threshold_minutes,
+                        created_at, deleted_at, _sync_pending
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, FALSE
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                """, [
+                    assessment_id,
+                    assessment.get('missionId'),
+                    assessment.get('assessmentTimeUtc'),
+                    assessment.get('targetTimeUtc'),
+                    assessment.get('targetTimeKind', 'NOW'),
+                    assessment.get('routeHash'),
+                    Jsonb(assessment.get('routeAirportsJson')) if assessment.get('routeAirportsJson') else None,
+                    assessment.get('minimumsProfileId'),
+                    assessment.get('minimumsProfileName'),
+                    assessment.get('dataSource'),
+                    assessment.get('aggregateResult', 'UNKNOWN'),
+                    assessment.get('aggregateReasonShort'),
+                    assessment.get('aggregateReasonLong'),
+                    assessment.get('dominantFactor'),
+                    assessment.get('dominantMessage'),
+                    assessment.get('marginMessage'),
+                    assessment.get('airportsEvaluatedCount', 0),
+                    assessment.get('airportsMissingDataCount', 0),
+                    assessment.get('flagsSummary'),
+                    assessment.get('maxSeverityScore', 0),
+                    assessment.get('nearLimitAirportCount', 0),
+                    assessment.get('noGoAirportCount', 0),
+                    Jsonb(assessment.get('airportChecksJson')) if assessment.get('airportChecksJson') else None,
+                    assessment.get('staleThresholdMinutes', 360),
+                    assessment.get('createdAt', timestamp),
+                    assessment.get('deletedAt'),
+                ])
+            except Exception as e:
+                conn.rollback()
+                print(f"[sync-push] Error creating assessment {assessment_id}: {e}")
+
+        # Assessments have no updates (immutable events)
+
+        for assessment_id in changes.get('readinessAssessments', {}).get('deleted', []):
+            print(f"[sync-push] Soft-deleting assessment: {assessment_id}")
+            cursor.execute("""
+                UPDATE readiness_assessments SET deleted_at = %s
+                WHERE id = %s AND deleted_at IS NULL
+            """, [timestamp, assessment_id])
+
+        conn.commit()
 
         print(f"[sync-push] Success: {len(conflicts)} conflicts")
 
