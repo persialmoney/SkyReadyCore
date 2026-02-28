@@ -16,31 +16,76 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 AIRPORTS_CSV_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
+RUNWAYS_CSV_URL = "https://davidmegginson.github.io/ourairports-data/runways.csv"
 ELASTICACHE_ENDPOINT = os.environ.get('ELASTICACHE_ENDPOINT', '')
 ELASTICACHE_PORT = int(os.environ.get('ELASTICACHE_PORT', 6379))
 TTL_AIRPORTS = 86400 * 7  # 7 days
 
+
+async def download_runways() -> Dict[str, List[Dict[str, Any]]]:
+    """Download OurAirports runways.csv and build a map keyed by ICAO code."""
+    logger.info(f"[Airport Sync] Downloading runways from {RUNWAYS_CSV_URL}")
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.get(RUNWAYS_CSV_URL)
+        response.raise_for_status()
+
+    lines = response.text.splitlines()
+    reader = csv.DictReader(lines)
+
+    runway_map: Dict[str, List[Dict[str, Any]]] = {}
+    for row in reader:
+        icao = row.get('airport_ident', '').upper().strip()
+        if not icao:
+            continue
+
+        def _float(val: str) -> float | None:
+            try:
+                return float(val) if val else None
+            except ValueError:
+                return None
+
+        def _int(val: str) -> int | None:
+            try:
+                return int(val) if val else None
+            except ValueError:
+                return None
+
+        runway = {
+            'leIdent': row.get('le_ident', '').strip(),
+            'heIdent': row.get('he_ident', '').strip(),
+            'leHeadingDegT': _float(row.get('le_heading_degT', '')),
+            'heHeadingDegT': _float(row.get('he_heading_degT', '')),
+            'lengthFt': _int(row.get('length_ft', '')),
+            'surface': row.get('surface', '').strip() or None,
+        }
+        # Only keep runways that have at least one usable heading
+        if runway['leHeadingDegT'] is not None or runway['heHeadingDegT'] is not None:
+            runway_map.setdefault(icao, []).append(runway)
+
+    logger.info(f"[Airport Sync] Loaded runway data for {len(runway_map)} airports")
+    return runway_map
+
+
 async def download_airports() -> List[Dict[str, Any]]:
-    """Download and parse OurAirports CSV"""
+    """Download airports.csv and runways.csv, merge runway data into each airport."""
     logger.info(f"[Airport Sync] Starting download from {AIRPORTS_CSV_URL}")
-    
+
     async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.get(AIRPORTS_CSV_URL)
         response.raise_for_status()
-        
-        # Parse CSV
+
         lines = response.text.splitlines()
         reader = csv.DictReader(lines)
-        
+
         airports = []
         for row in reader:
-            # ident is the ICAO code
             icao = row.get('ident', '').upper().strip()
             if not icao:
                 continue
-            
+
             airport = {
-                'icao': icao,  # ident IS the ICAO code
+                'icao': icao,
                 'name': row.get('name', ''),
                 'type': row.get('type', ''),
                 'latitude': float(row.get('latitude_deg', 0)) if row.get('latitude_deg') else None,
@@ -49,11 +94,22 @@ async def download_airports() -> List[Dict[str, Any]]:
                 'municipality': row.get('municipality', ''),
                 'region': row.get('iso_region', ''),
                 'country': row.get('iso_country', ''),
+                'runways': [],  # filled in after runway download
             }
             airports.append(airport)
-        
-        logger.info(f"[Airport Sync] Downloaded {len(airports)} airports from OurAirports")
-        return airports
+
+    logger.info(f"[Airport Sync] Downloaded {len(airports)} airports from OurAirports")
+
+    # Download runway data and embed into each airport
+    runway_map = await download_runways()
+    runway_count = 0
+    for airport in airports:
+        runways = runway_map.get(airport['icao'], [])
+        airport['runways'] = runways
+        runway_count += len(runways)
+
+    logger.info(f"[Airport Sync] Embedded {runway_count} runways across {len(airports)} airports")
+    return airports
 
 async def sync_to_valkey(airports: List[Dict[str, Any]]):
     """Sync airports to Valkey cache"""
@@ -149,6 +205,7 @@ def lambda_handler(event, context):
                     'airports_total': sync_result['total'],
                     'airports_updated': sync_result['updated'],
                     'airports_skipped': sync_result['skipped'],
+                    'runways_embedded': True,
                 })
             }
         except Exception as e:

@@ -131,14 +131,19 @@ def handler(event, context):
     
     user_id = event['identity']['claims']['sub']
     changes = event['arguments']['changes']
-    last_pulled_at = event['arguments'].get('lastPulledAt', 0)
-    
+    # lastPulledAt arrives as AWSTimestamp (epoch seconds). Convert to ms to match
+    # BIGINT columns in missions / readiness_assessments, and the existing logbook
+    # conflict check which also works in ms (via .timestamp() * 1000).
+    last_pulled_at_sec = event['arguments'].get('lastPulledAt', 0) or 0
+    last_pulled_at = last_pulled_at_sec * 1000
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     try:
         conflicts = []
-        timestamp = int(time.time() * 1000)
+        timestamp_ms = int(time.time() * 1000)   # epoch ms — used for DB BIGINT columns
+        timestamp = int(time.time())              # epoch seconds — returned as AWSTimestamp
         
         # ========== LOGBOOK ENTRIES (PostgreSQL) ==========
         
@@ -525,8 +530,8 @@ def handler(event, context):
                     mission.get('latestCheckedTime'),
                     mission.get('latestReasonShort'),
                     mission.get('latestReasonLong'),
-                    mission.get('createdAt', timestamp),
-                    mission.get('updatedAt', timestamp),
+                    mission.get('createdAt', timestamp_ms),
+                    mission.get('updatedAt', timestamp_ms),
                     mission.get('deletedAt'),
                 ])
             except Exception as e:
@@ -571,7 +576,7 @@ def handler(event, context):
                 data.get('latestAssessmentId'), data.get('latestResult'),
                 data.get('latestCheckedTime'), data.get('latestReasonShort'),
                 data.get('latestReasonLong'),
-                data.get('updatedAt', timestamp),
+                data.get('updatedAt', timestamp_ms),
                 data.get('deletedAt'),
                 mission_id, user_id,
             ])
@@ -581,7 +586,7 @@ def handler(event, context):
             cursor.execute("""
                 UPDATE missions SET deleted_at = %s, updated_at = %s
                 WHERE id = %s AND user_id = %s AND deleted_at IS NULL
-            """, [timestamp, timestamp, mission_id, user_id])
+            """, [timestamp_ms, timestamp_ms, mission_id, user_id])
 
         # ========== MISSION AIRPORTS (PostgreSQL) ==========
 
@@ -676,7 +681,7 @@ def handler(event, context):
                     assessment.get('noGoAirportCount', 0),
                     Jsonb(assessment.get('airportChecksJson')) if assessment.get('airportChecksJson') else None,
                     assessment.get('staleThresholdMinutes', 360),
-                    assessment.get('createdAt', timestamp),
+                    assessment.get('createdAt', timestamp_ms),
                     assessment.get('deletedAt'),
                 ])
             except Exception as e:
@@ -690,7 +695,7 @@ def handler(event, context):
             cursor.execute("""
                 UPDATE readiness_assessments SET deleted_at = %s
                 WHERE id = %s AND deleted_at IS NULL
-            """, [timestamp, assessment_id])
+            """, [timestamp_ms, assessment_id])
 
         conn.commit()
 

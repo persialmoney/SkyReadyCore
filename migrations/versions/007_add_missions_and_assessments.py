@@ -131,7 +131,7 @@ def upgrade():
             minimums_profile_name   TEXT,
 
             -- Data source
-            data_source             TEXT,               -- CURRENT_METAR | TAF_AT_SCHEDULED_TIME
+            data_source             TEXT,               -- TAF_AT_SCHEDULED_TIME | TAF_LAST_PERIOD | DATA_MISSING | CURRENT_METAR | MOS
 
             -- Aggregate result
             aggregate_result        TEXT NOT NULL,      -- GO | CAUTION | NO_GO | UNKNOWN

@@ -73,7 +73,7 @@ async def lookup_airport(code: str) -> Optional[Dict[str, Any]]:
         
         # Parse and return airport data
         airport = json.loads(cached_data)
-        logger.info(f"[Airport Lookup] Found: {code} -> {airport.get('name')}")
+        logger.info(f"[Airport Lookup] Found: {code} -> {airport.get('name')} ({len(airport.get('runways', []))} runways)")
         return {
             "code": code,
             "icao": airport.get("icao"),
@@ -84,6 +84,7 @@ async def lookup_airport(code: str) -> Optional[Dict[str, Any]]:
             "longitude": airport.get("longitude"),
             "elevation": airport.get("elevation"),
             "type": airport.get("type"),
+            "runways": airport.get("runways", []),
         }
                 
     except Exception as e:

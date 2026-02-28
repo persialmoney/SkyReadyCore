@@ -22,20 +22,25 @@ def handler(event, context):
     print(f"[sync-pull] Processing sync request: {json.dumps(event, default=str)}")
     
     user_id = event['identity']['claims']['sub']
-    last_pulled_at = event['arguments'].get('lastPulledAt', 0)
+    # lastPulledAt arrives as AWSTimestamp (epoch seconds). Convert to ms for BIGINT
+    # column comparisons (missions, assessments) and to a datetime for TIMESTAMPTZ
+    # column comparisons (logbook_entries, user data).
+    last_pulled_at_sec = event['arguments'].get('lastPulledAt', 0) or 0
+    last_pulled_at = last_pulled_at_sec * 1000  # epoch ms — used for BIGINT columns
     cursor_arg = event['arguments'].get('cursor')
-    
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     try:
         limit = 100
         # Handle None/null cursor (first request)
         offset = int(cursor_arg) if cursor_arg is not None else 0
-        timestamp = int(time.time() * 1000)
-        
-        # Convert timestamp to PostgreSQL timestamp
-        last_pulled_datetime = datetime.fromtimestamp(last_pulled_at / 1000.0)
+        timestamp = int(time.time())  # epoch seconds — returned as AWSTimestamp
+        timestamp_ms = timestamp * 1000  # epoch ms — used for internal BIGINT comparisons
+
+        # Convert to PostgreSQL timestamp for TIMESTAMPTZ columns (logbook, user data)
+        last_pulled_datetime = datetime.fromtimestamp(last_pulled_at_sec)
         
         print(f"[sync-pull] Fetching changes since {last_pulled_datetime} for user {user_id}")
         
