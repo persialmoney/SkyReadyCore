@@ -246,12 +246,12 @@ def handler(event, context):
             
             row = cursor.fetchone()
             if row:
-                server_updated_at = int(row[0].timestamp() * 1000)
-                if server_updated_at > last_pulled_at:
+                server_updated_at_ms = int(row[0].timestamp() * 1000)
+                if server_updated_at_ms > last_pulled_at:
                     conflicts.append({
                         'entryId': entry_id,
                         'type': 'SERVER_NEWER',
-                        'serverTimestamp': server_updated_at
+                        'serverTimestamp': int(row[0].timestamp()),  # epoch seconds for AWSTimestamp
                     })
                     continue
             
@@ -386,7 +386,7 @@ def handler(event, context):
                             conflicts.append({
                                 'entryId': profile_id,
                                 'type': 'SERVER_NEWER',
-                                'serverTimestamp': server_timestamp_ms
+                                'serverTimestamp': int(server_updated_at.timestamp()),  # epoch seconds for AWSTimestamp
                             })
                             continue  # Skip update, server wins
                     except Exception as e:
@@ -544,6 +544,7 @@ def handler(event, context):
             print(f"[sync-push] Updating mission: {mission_id}")
 
             # Conflict check: server newer than client's lastPulledAt?
+            # row[0] is epoch ms (BIGINT). serverTimestamp must be epoch seconds (AWSTimestamp).
             cursor.execute("""
                 SELECT updated_at FROM missions
                 WHERE id = %s AND user_id = %s AND deleted_at IS NULL
@@ -553,7 +554,7 @@ def handler(event, context):
                 conflicts.append({
                     'entryId': mission_id,
                     'type': 'SERVER_NEWER',
-                    'serverTimestamp': row[0]
+                    'serverTimestamp': row[0] // 1000  # convert ms → seconds for AWSTimestamp
                 })
                 continue
 
@@ -589,27 +590,57 @@ def handler(event, context):
             """, [timestamp_ms, timestamp_ms, mission_id, user_id])
 
         # ========== MISSION AIRPORTS (PostgreSQL) ==========
+        # Replace-all semantics: the client always pushes the complete airport set for a
+        # mission whenever the route changes (old rows are destroyPermanently() locally).
+        # We group incoming airports by mission_id, delete all existing rows for those
+        # missions, then insert the new set. This keeps server and client in sync even
+        # when airports are removed or reordered without an explicit delete signal.
 
-        for airport in changes.get('missionAirports', {}).get('created', []):
-            airport_id = airport.get('id')
-            print(f"[sync-push] Creating mission airport: {airport_id}")
-            try:
-                cursor.execute("""
-                    INSERT INTO mission_airports (
-                        id, mission_id, icao, role, order_index, display_name, _sync_pending
-                    ) VALUES (%s, %s, %s, %s, %s, %s, FALSE)
-                    ON CONFLICT (id) DO NOTHING
-                """, [
-                    airport_id,
-                    airport.get('missionId'),
-                    airport.get('icao', '').upper(),
-                    airport.get('role', 'DEPARTURE'),
-                    airport.get('orderIndex', 0),
-                    airport.get('displayName'),
-                ])
-            except Exception as e:
-                conn.rollback()
-                print(f"[sync-push] Error creating mission airport {airport_id}: {e}")
+        created_airports = changes.get('missionAirports', {}).get('created', [])
+        if created_airports:
+            # Collect unique mission_ids in this batch
+            affected_mission_ids = list({a.get('missionId') for a in created_airports if a.get('missionId')})
+            if affected_mission_ids:
+                # Verify missions belong to this user before touching their airports
+                placeholders = ','.join(['%s'] * len(affected_mission_ids))
+                cursor.execute(
+                    f"SELECT id FROM missions WHERE id IN ({placeholders}) AND user_id = %s",
+                    affected_mission_ids + [user_id]
+                )
+                verified_ids = {row[0] for row in cursor.fetchall()}
+
+                for mission_id in verified_ids:
+                    print(f"[sync-push] Replacing airports for mission: {mission_id}")
+                    cursor.execute("DELETE FROM mission_airports WHERE mission_id = %s", [mission_id])
+
+            for airport in created_airports:
+                airport_id = airport.get('id')
+                mission_id = airport.get('missionId')
+                if mission_id not in verified_ids:
+                    print(f"[sync-push] Skipping airport for unverified mission: {mission_id}")
+                    continue
+                print(f"[sync-push] Inserting mission airport: {airport_id}")
+                try:
+                    cursor.execute("""
+                        INSERT INTO mission_airports (
+                            id, mission_id, icao, role, order_index, display_name, _sync_pending
+                        ) VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+                        ON CONFLICT (id) DO UPDATE SET
+                            icao = EXCLUDED.icao,
+                            role = EXCLUDED.role,
+                            order_index = EXCLUDED.order_index,
+                            display_name = EXCLUDED.display_name
+                    """, [
+                        airport_id,
+                        mission_id,
+                        airport.get('icao', '').upper(),
+                        airport.get('role', 'DEPARTURE'),
+                        airport.get('orderIndex', 0),
+                        airport.get('displayName'),
+                    ])
+                except Exception as e:
+                    conn.rollback()
+                    print(f"[sync-push] Error inserting mission airport {airport_id}: {e}")
 
         for update in changes.get('missionAirports', {}).get('updated', []):
             airport_id = update.get('id')

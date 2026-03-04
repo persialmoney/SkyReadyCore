@@ -195,24 +195,34 @@ def handler(event, context):
                 missions_updated.append(format_mission(row))
 
         # ========== MISSION AIRPORTS (PostgreSQL) ==========
+        # Sync strategy:
+        #   • "created" list = all current airports for missions that changed since last pull.
+        #     The client applies these as a replace-all (same semantics as sync-push), so the
+        #     client will upsert new airports and ignore any that it already has.
+        #   • "deleted" list = airport IDs whose parent mission was soft-deleted AND whose IDs
+        #     the client would still have locally (mission soft-deleted since last pull).
+        #
+        # We intentionally do NOT try to diff individual airport rows server-side; the client
+        # always reconciles by replacing the full set for any mission that changed.
 
-        # Fetch airports for all missions belonging to this user that changed
         cursor.execute("""
             SELECT
                 ma.id, ma.mission_id, ma.icao, ma.role, ma.order_index, ma.display_name
             FROM mission_airports ma
             INNER JOIN missions m ON m.id = ma.mission_id
             WHERE m.user_id = %s
+              AND m.deleted_at IS NULL
               AND (m.created_at > %s OR m.updated_at > %s)
+            ORDER BY ma.mission_id, ma.order_index
         """, [user_id, last_pulled_at, last_pulled_at])
 
         airports_created = []
-        airports_deleted = []
 
         for row in cursor.fetchall():
             airports_created.append(format_mission_airport(row))
 
-        # Deletions: airports whose parent mission was soft-deleted
+        # Deletions: airports whose parent mission was soft-deleted since last pull.
+        # The client will destroy all airports linked to any deleted mission.
         cursor.execute("""
             SELECT ma.id
             FROM mission_airports ma
