@@ -3,6 +3,7 @@ Sync Pull Lambda - Send changes since lastPulledAt (cursor pattern)
 - Logbook entries: PostgreSQL
 - User data (preferences, aircraft, personal minimums): DynamoDB
 - Missions, mission airports, readiness assessments: PostgreSQL
+- Proficiency snapshots: PostgreSQL (last 90 days, incremental via computed_at)
 """
 import json
 import time
@@ -22,11 +23,12 @@ def handler(event, context):
     print(f"[sync-pull] Processing sync request: {json.dumps(event, default=str)}")
     
     user_id = event['identity']['claims']['sub']
-    # lastPulledAt arrives as AWSTimestamp (epoch seconds). Convert to ms for BIGINT
-    # column comparisons (missions, assessments) and to a datetime for TIMESTAMPTZ
-    # column comparisons (logbook_entries, user data).
-    last_pulled_at_sec = event['arguments'].get('lastPulledAt', 0) or 0
-    last_pulled_at = last_pulled_at_sec * 1000  # epoch ms — used for BIGINT columns
+    # lastPulledAt arrives as epoch milliseconds (Int scalar). All BIGINT columns in
+    # PostgreSQL also store epoch ms, so no conversion is needed for those.
+    # The only conversion needed is for TIMESTAMPTZ (logbook_entries) which requires
+    # a Python datetime — done via last_pulled_at_sec = last_pulled_at // 1000.
+    last_pulled_at = event['arguments'].get('lastPulledAt', 0) or 0  # epoch ms
+    last_pulled_at_sec = last_pulled_at // 1000  # epoch seconds — for TIMESTAMPTZ only
     cursor_arg = event['arguments'].get('cursor')
 
     conn = get_db_connection()
@@ -36,8 +38,8 @@ def handler(event, context):
         limit = 100
         # Handle None/null cursor (first request)
         offset = int(cursor_arg) if cursor_arg is not None else 0
-        timestamp = int(time.time())  # epoch seconds — returned as AWSTimestamp
-        timestamp_ms = timestamp * 1000  # epoch ms — used for internal BIGINT comparisons
+        timestamp_ms = int(time.time() * 1000)   # epoch ms — used for BIGINT comparisons
+        timestamp = float(timestamp_ms)           # float so AppSync serializes as JSON Float, not Long
 
         # Convert to PostgreSQL timestamp for TIMESTAMPTZ columns (logbook, user data)
         last_pulled_datetime = datetime.fromtimestamp(last_pulled_at_sec)
@@ -267,6 +269,26 @@ def handler(event, context):
             else:
                 assessments_created.append(format_assessment(row))
 
+        # ========== PROFICIENCY SNAPSHOTS (PostgreSQL) ==========
+        # Return snapshots whose computed_at > lastPulledAt so the client can
+        # populate the historical chart on fresh install and receive recomputed
+        # scores on subsequent syncs.
+        # LIMIT 90 caps history to ~3 months (one snapshot per calendar day).
+        # Fresh install (lastPulledAt = 0): computed_at > 0 matches all rows.
+
+        cursor.execute("""
+            SELECT id, snapshot_date, score, recency, exposure, envelope, consistency, computed_at
+            FROM proficiency_snapshots
+            WHERE user_id = %s
+              AND computed_at > %s
+            ORDER BY snapshot_date DESC
+            LIMIT 90
+        """, [user_id, last_pulled_at])
+
+        snapshots_created = []
+        for row in cursor.fetchall():
+            snapshots_created.append(format_snapshot(row))
+
         conn.commit()
 
         result = {
@@ -305,6 +327,10 @@ def handler(event, context):
                     'updated': [],
                     'deleted': assessments_deleted
                 },
+                'proficiencySnapshots': {
+                    'created': snapshots_created,
+                    'deleted': [],
+                },
             },
             'cursor': str(offset + len(rows)),
             'hasMore': len(rows) == limit,
@@ -317,7 +343,8 @@ def handler(event, context):
             f"aircraft({len(aircraft_created)}c) "
             f"missions({len(missions_created)}c/{len(missions_updated)}u/{len(missions_deleted)}d) "
             f"airports({len(airports_created)}c/{len(airports_deleted)}d) "
-            f"assessments({len(assessments_created)}c/{len(assessments_deleted)}d)"
+            f"assessments({len(assessments_created)}c/{len(assessments_deleted)}d) "
+            f"snapshots({len(snapshots_created)}c)"
         )
         return result
 
@@ -330,14 +357,16 @@ def handler(event, context):
         return_db_connection(conn)
 
 def parse_timestamp(iso_string):
-    """Parse ISO 8601 timestamp to milliseconds since epoch"""
+    """Parse ISO 8601 timestamp to milliseconds since epoch as float.
+    Returns float so AppSync serializes as JSON Float (not Long integer).
+    """
     if not iso_string:
-        return 0
+        return 0.0
     try:
         dt = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
-        return int(dt.timestamp() * 1000)
+        return float(int(dt.timestamp() * 1000))
     except:
-        return 0
+        return 0.0
 
 def format_entry(row):
     """Format database row to GraphQL entry."""
@@ -384,8 +413,8 @@ def format_entry(row):
         'status': row[39],
         'signature': row[40],
         'isFlightReview': bool(row[41]) if row[41] is not None else False,
-        'createdAt': int(row[42].timestamp() * 1000),
-        'updatedAt': int(row[43].timestamp() * 1000) if row[43] else int(row[42].timestamp() * 1000),
+        'createdAt': float(int(row[42].timestamp() * 1000)),
+        'updatedAt': float(int(row[43].timestamp() * 1000)) if row[43] else float(int(row[42].timestamp() * 1000)),
     }
 
 def format_minimums_profile(profile):
@@ -464,21 +493,21 @@ def format_mission(row):
         'status': row[3],
         'isOperational': bool(row[4]) if row[4] is not None else False,
         'missionType': row[5],
-        'scheduledTimeUtc': int(row[6]) if row[6] is not None else None,
+        'scheduledTimeUtc': float(int(row[6])) if row[6] is not None else None,
         'timePrecision': row[7],
         'tailNumber': row[8],
         'aircraftLabel': row[9],
         'notes': row[10],
-        'forecastReviewedAt': int(row[11]) if row[11] is not None else None,
+        'forecastReviewedAt': float(int(row[11])) if row[11] is not None else None,
         'routeHash': row[12],
         'latestAssessmentId': row[13],
         'latestResult': row[14],
-        'latestCheckedTime': int(row[15]) if row[15] is not None else None,
+        'latestCheckedTime': float(int(row[15])) if row[15] is not None else None,
         'latestReasonShort': row[16],
         'latestReasonLong': row[17],
-        'createdAt': int(row[18]) if row[18] is not None else None,
-        'updatedAt': int(row[19]) if row[19] is not None else None,
-        'deletedAt': int(row[20]) if row[20] is not None else None,
+        'createdAt': float(int(row[18])) if row[18] is not None else None,
+        'updatedAt': float(int(row[19])) if row[19] is not None else None,
+        'deletedAt': float(int(row[20])) if row[20] is not None else None,
     }
 
 
@@ -495,6 +524,24 @@ def format_mission_airport(row):
         'role': row[3],
         'orderIndex': int(row[4]) if row[4] is not None else 0,
         'displayName': row[5],
+    }
+
+
+def format_snapshot(row):
+    """Format proficiency_snapshots DB row to GraphQL ProficiencySnapshot type.
+
+    Column order matches SELECT in sync-pull:
+      0:id 1:snapshot_date 2:score 3:recency 4:exposure 5:envelope 6:consistency 7:computed_at
+    """
+    return {
+        'id':           str(row[0]),
+        'snapshotDate': row[1],
+        'score':        int(row[2]),
+        'recency':      int(row[3]),
+        'exposure':     int(row[4]),
+        'envelope':     int(row[5]),
+        'consistency':  int(row[6]),
+        'computedAt':   float(int(row[7])),
     }
 
 
@@ -517,8 +564,8 @@ def format_assessment(row):
     return {
         'id': str(row[0]),
         'missionId': str(row[1]),
-        'assessmentTimeUtc': int(row[2]) if row[2] is not None else None,
-        'targetTimeUtc': int(row[3]) if row[3] is not None else None,
+        'assessmentTimeUtc': float(int(row[2])) if row[2] is not None else None,
+        'targetTimeUtc': float(int(row[3])) if row[3] is not None else None,
         'targetTimeKind': row[4],
         'routeHash': row[5],
         'routeAirportsJson': row[6],          # already parsed JSONB from psycopg
@@ -539,6 +586,6 @@ def format_assessment(row):
         'noGoAirportCount': int(row[21]) if row[21] is not None else 0,
         'airportChecksJson': row[22],         # already parsed JSONB from psycopg
         'staleThresholdMinutes': int(row[23]) if row[23] is not None else 360,
-        'createdAt': int(row[24]) if row[24] is not None else None,
-        'deletedAt': int(row[25]) if row[25] is not None else None,
+        'createdAt': float(int(row[24])) if row[24] is not None else None,
+        'deletedAt': float(int(row[25])) if row[25] is not None else None,
     }

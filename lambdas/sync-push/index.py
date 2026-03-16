@@ -3,6 +3,7 @@ Sync Push Lambda - Process bulk changes from client (outbox pattern)
 - Logbook entries: PostgreSQL
 - User data (preferences, aircraft, personal minimums): DynamoDB
 - Missions, mission airports, readiness assessments: PostgreSQL
+- Proficiency snapshots: PostgreSQL (upsert by user_id + snapshot_date)
 Includes: server-side signature hash validation, CFI auto-copy mirror logic
 """
 import json
@@ -131,11 +132,10 @@ def handler(event, context):
     
     user_id = event['identity']['claims']['sub']
     changes = event['arguments']['changes']
-    # lastPulledAt arrives as AWSTimestamp (epoch seconds). Convert to ms to match
-    # BIGINT columns in missions / readiness_assessments, and the existing logbook
-    # conflict check which also works in ms (via .timestamp() * 1000).
-    last_pulled_at_sec = event['arguments'].get('lastPulledAt', 0) or 0
-    last_pulled_at = last_pulled_at_sec * 1000
+    # lastPulledAt arrives as epoch milliseconds (Int scalar). All BIGINT columns store
+    # epoch ms, so no conversion needed for those comparisons.
+    # For TIMESTAMPTZ (logbook) conflict checks we need epoch seconds via // 1000.
+    last_pulled_at = event['arguments'].get('lastPulledAt', 0) or 0  # epoch ms
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -143,7 +143,7 @@ def handler(event, context):
     try:
         conflicts = []
         timestamp_ms = int(time.time() * 1000)   # epoch ms — used for DB BIGINT columns
-        timestamp = int(time.time())              # epoch seconds — returned as AWSTimestamp
+        timestamp = float(timestamp_ms)           # float so AppSync serializes as JSON Float, not Long
         
         # ========== LOGBOOK ENTRIES (PostgreSQL) ==========
         
@@ -251,7 +251,7 @@ def handler(event, context):
                     conflicts.append({
                         'entryId': entry_id,
                         'type': 'SERVER_NEWER',
-                        'serverTimestamp': int(row[0].timestamp()),  # epoch seconds for AWSTimestamp
+                        'serverTimestamp': float(server_updated_at_ms),  # epoch ms as float for AppSync
                     })
                     continue
             
@@ -386,7 +386,7 @@ def handler(event, context):
                             conflicts.append({
                                 'entryId': profile_id,
                                 'type': 'SERVER_NEWER',
-                                'serverTimestamp': int(server_updated_at.timestamp()),  # epoch seconds for AWSTimestamp
+                                'serverTimestamp': float(server_timestamp_ms),  # epoch ms as float for AppSync
                             })
                             continue  # Skip update, server wins
                     except Exception as e:
@@ -500,6 +500,7 @@ def handler(event, context):
             mission_id = mission.get('id')
             print(f"[sync-push] Creating mission: {mission_id}")
             try:
+                cursor.execute("SAVEPOINT mission_create")
                 cursor.execute("""
                     INSERT INTO missions (
                         id, mission_id, user_id, status, is_operational,
@@ -534,17 +535,21 @@ def handler(event, context):
                     mission.get('updatedAt', timestamp_ms),
                     mission.get('deletedAt'),
                 ])
+                cursor.execute("RELEASE SAVEPOINT mission_create")
             except Exception as e:
-                conn.rollback()
+                cursor.execute("ROLLBACK TO SAVEPOINT mission_create")
                 print(f"[sync-push] Error creating mission {mission_id}: {e}")
 
         for update in changes.get('missions', {}).get('updated', []):
             mission_id = update.get('id')
             data = update.get('data', update)  # flat update or wrapped in .data
-            print(f"[sync-push] Updating mission: {mission_id}")
+            print(f"[sync-push] Upserting mission: {mission_id}")
 
-            # Conflict check: server newer than client's lastPulledAt?
-            # row[0] is epoch ms (BIGINT). serverTimestamp must be epoch seconds (AWSTimestamp).
+            # Conflict check: if the row exists and the server version is newer than the
+            # client's lastPulledAt, reject the update and let the client re-pull.
+            # If the row doesn't exist at all (client race: createdAt < lastPulledAt caused
+            # the client to misclassify a new mission as 'updated'), fall through to the
+            # upsert so the row is created now.
             cursor.execute("""
                 SELECT updated_at FROM missions
                 WHERE id = %s AND user_id = %s AND deleted_at IS NULL
@@ -554,21 +559,47 @@ def handler(event, context):
                 conflicts.append({
                     'entryId': mission_id,
                     'type': 'SERVER_NEWER',
-                    'serverTimestamp': row[0] // 1000  # convert ms → seconds for AWSTimestamp
+                    'serverTimestamp': float(row[0]),  # epoch ms as float for AppSync
                 })
                 continue
 
+            # Upsert: INSERT if the row doesn't exist yet (handles the race where the client
+            # sent 'updated' for a mission the server has never seen), otherwise UPDATE.
+            # The WHERE clause on the DO UPDATE path re-applies the conflict guard so a
+            # concurrent write between the SELECT above and this statement can't overwrite
+            # a newer server version.
             cursor.execute("""
-                UPDATE missions SET
-                    status = %s, is_operational = %s, mission_type = %s,
-                    scheduled_time_utc = %s, time_precision = %s,
-                    tail_number = %s, aircraft_label = %s, notes = %s,
-                    forecast_reviewed_at = %s, route_hash = %s,
-                    latest_assessment_id = %s, latest_result = %s,
-                    latest_checked_time = %s, latest_reason_short = %s,
-                    latest_reason_long = %s, updated_at = %s, deleted_at = %s
-                WHERE id = %s AND user_id = %s
+                INSERT INTO missions (
+                    id, mission_id, user_id, status, is_operational, mission_type,
+                    scheduled_time_utc, time_precision, tail_number, aircraft_label,
+                    notes, forecast_reviewed_at, route_hash, latest_assessment_id,
+                    latest_result, latest_checked_time, latest_reason_short,
+                    latest_reason_long, created_at, updated_at, deleted_at, _sync_pending
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    is_operational = EXCLUDED.is_operational,
+                    mission_type = EXCLUDED.mission_type,
+                    scheduled_time_utc = EXCLUDED.scheduled_time_utc,
+                    time_precision = EXCLUDED.time_precision,
+                    tail_number = EXCLUDED.tail_number,
+                    aircraft_label = EXCLUDED.aircraft_label,
+                    notes = EXCLUDED.notes,
+                    forecast_reviewed_at = EXCLUDED.forecast_reviewed_at,
+                    route_hash = EXCLUDED.route_hash,
+                    latest_assessment_id = EXCLUDED.latest_assessment_id,
+                    latest_result = EXCLUDED.latest_result,
+                    latest_checked_time = EXCLUDED.latest_checked_time,
+                    latest_reason_short = EXCLUDED.latest_reason_short,
+                    latest_reason_long = EXCLUDED.latest_reason_long,
+                    updated_at = EXCLUDED.updated_at,
+                    deleted_at = EXCLUDED.deleted_at
+                WHERE missions.updated_at <= %s OR missions.updated_at IS NULL
             """, [
+                mission_id, data.get('missionId', mission_id), user_id,
                 data.get('status'), data.get('isOperational', False),
                 data.get('missionType'), data.get('scheduledTimeUtc'),
                 data.get('timePrecision'), data.get('tailNumber'),
@@ -577,9 +608,10 @@ def handler(event, context):
                 data.get('latestAssessmentId'), data.get('latestResult'),
                 data.get('latestCheckedTime'), data.get('latestReasonShort'),
                 data.get('latestReasonLong'),
+                data.get('createdAt', timestamp_ms),
                 data.get('updatedAt', timestamp_ms),
                 data.get('deletedAt'),
-                mission_id, user_id,
+                last_pulled_at,
             ])
 
         for mission_id in changes.get('missions', {}).get('deleted', []):
@@ -621,6 +653,7 @@ def handler(event, context):
                     continue
                 print(f"[sync-push] Inserting mission airport: {airport_id}")
                 try:
+                    cursor.execute("SAVEPOINT airport_insert")
                     cursor.execute("""
                         INSERT INTO mission_airports (
                             id, mission_id, icao, role, order_index, display_name, _sync_pending
@@ -638,8 +671,9 @@ def handler(event, context):
                         airport.get('orderIndex', 0),
                         airport.get('displayName'),
                     ])
+                    cursor.execute("RELEASE SAVEPOINT airport_insert")
                 except Exception as e:
-                    conn.rollback()
+                    cursor.execute("ROLLBACK TO SAVEPOINT airport_insert")
                     print(f"[sync-push] Error inserting mission airport {airport_id}: {e}")
 
         for update in changes.get('missionAirports', {}).get('updated', []):
@@ -727,6 +761,39 @@ def handler(event, context):
                 UPDATE readiness_assessments SET deleted_at = %s
                 WHERE id = %s AND deleted_at IS NULL
             """, [timestamp_ms, assessment_id])
+
+        # ========== PROFICIENCY SNAPSHOTS ==========
+        # Snapshots are upserted by (user_id, snapshot_date) — the business key.
+        # The server always takes the client's value; there are no conflicts.
+
+        for snap in changes.get('proficiencySnapshots', {}).get('upserted', []):
+            snap_id = snap.get('id')
+            print(f"[sync-push] Upserting proficiency snapshot: {snap.get('snapshotDate')} score={snap.get('score')}")
+            cursor.execute("""
+                INSERT INTO proficiency_snapshots (
+                    id, user_id, snapshot_date,
+                    score, recency, exposure, envelope, consistency,
+                    computed_at, _sync_pending
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+                ON CONFLICT (user_id, snapshot_date) DO UPDATE SET
+                    id          = EXCLUDED.id,
+                    score       = EXCLUDED.score,
+                    recency     = EXCLUDED.recency,
+                    exposure    = EXCLUDED.exposure,
+                    envelope    = EXCLUDED.envelope,
+                    consistency = EXCLUDED.consistency,
+                    computed_at = EXCLUDED.computed_at
+            """, [
+                snap_id,
+                user_id,
+                snap.get('snapshotDate'),
+                snap.get('score'),
+                snap.get('recency'),
+                snap.get('exposure'),
+                snap.get('envelope'),
+                snap.get('consistency'),
+                int(snap.get('computedAt', timestamp_ms)),
+            ])
 
         conn.commit()
 
