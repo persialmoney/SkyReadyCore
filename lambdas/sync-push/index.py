@@ -773,25 +773,38 @@ def handler(event, context):
                 INSERT INTO proficiency_snapshots (
                     id, user_id, snapshot_date,
                     score, recency, exposure, envelope, consistency,
-                    computed_at, _sync_pending
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+                    score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
+                    active_domains, computed_at, _sync_pending
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
                 ON CONFLICT (user_id, snapshot_date) DO UPDATE SET
-                    id          = EXCLUDED.id,
-                    score       = EXCLUDED.score,
-                    recency     = EXCLUDED.recency,
-                    exposure    = EXCLUDED.exposure,
-                    envelope    = EXCLUDED.envelope,
-                    consistency = EXCLUDED.consistency,
-                    computed_at = EXCLUDED.computed_at
+                    id             = EXCLUDED.id,
+                    score          = EXCLUDED.score,
+                    recency        = EXCLUDED.recency,
+                    exposure       = EXCLUDED.exposure,
+                    envelope       = EXCLUDED.envelope,
+                    consistency    = EXCLUDED.consistency,
+                    score_core_vfr = EXCLUDED.score_core_vfr,
+                    score_night    = EXCLUDED.score_night,
+                    score_ifr      = EXCLUDED.score_ifr,
+                    score_tailwheel = EXCLUDED.score_tailwheel,
+                    score_multi    = EXCLUDED.score_multi,
+                    active_domains = EXCLUDED.active_domains,
+                    computed_at    = EXCLUDED.computed_at
             """, [
                 snap_id,
                 user_id,
                 snap.get('snapshotDate'),
                 snap.get('score'),
-                snap.get('recency'),
-                snap.get('exposure'),
-                snap.get('envelope'),
-                snap.get('consistency'),
+                snap.get('recency', 0),
+                snap.get('exposure', 0),
+                snap.get('envelope', 0),
+                snap.get('consistency', 0),
+                snap.get('scoreCoreVfr'),
+                snap.get('scoreNight'),
+                snap.get('scoreIfr'),
+                snap.get('scoreTailwheel'),
+                snap.get('scoreMulti'),
+                snap.get('activeDomains'),
                 int(snap.get('computedAt', timestamp_ms)),
             ])
 

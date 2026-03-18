@@ -277,7 +277,9 @@ def handler(event, context):
         # Fresh install (lastPulledAt = 0): computed_at > 0 matches all rows.
 
         cursor.execute("""
-            SELECT id, snapshot_date, score, recency, exposure, envelope, consistency, computed_at
+            SELECT id, snapshot_date, score, recency, exposure, envelope, consistency,
+                   score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
+                   active_domains, computed_at
             FROM proficiency_snapshots
             WHERE user_id = %s
               AND computed_at > %s
@@ -531,17 +533,25 @@ def format_snapshot(row):
     """Format proficiency_snapshots DB row to GraphQL ProficiencySnapshot type.
 
     Column order matches SELECT in sync-pull:
-      0:id 1:snapshot_date 2:score 3:recency 4:exposure 5:envelope 6:consistency 7:computed_at
+      0:id 1:snapshot_date 2:score 3:recency 4:exposure 5:envelope 6:consistency
+      7:score_core_vfr 8:score_night 9:score_ifr 10:score_tailwheel 11:score_multi
+      12:active_domains 13:computed_at
     """
     return {
-        'id':           str(row[0]),
-        'snapshotDate': row[1],
-        'score':        int(row[2]),
-        'recency':      int(row[3]),
-        'exposure':     int(row[4]),
-        'envelope':     int(row[5]),
-        'consistency':  int(row[6]),
-        'computedAt':   float(int(row[7])),
+        'id':             str(row[0]),
+        'snapshotDate':   row[1],
+        'score':          int(row[2]),
+        'recency':        int(row[3]),
+        'exposure':       int(row[4]),
+        'envelope':       int(row[5]),
+        'consistency':    int(row[6]),
+        'scoreCoreVfr':   int(row[7]) if row[7] is not None else None,
+        'scoreNight':     int(row[8]) if row[8] is not None else None,
+        'scoreIfr':       int(row[9]) if row[9] is not None else None,
+        'scoreTailwheel': int(row[10]) if row[10] is not None else None,
+        'scoreMulti':     int(row[11]) if row[11] is not None else None,
+        'activeDomains':  row[12],
+        'computedAt':     float(int(row[13])),
     }
 
 
