@@ -629,13 +629,14 @@ async def fetch_taf(airport_code: str) -> Dict[str, Any]:
                 "forecast": parsed_forecast if parsed_forecast else []  # Ensure it's always a list
             }
             
-            # Write-through: Store in cache for next request with TTL atomically
+            # Write-through: store the normalised result (not the raw AWC dict) so
+            # cache hits go through the fast Format-1 path in parse_taf_forecast.
             if glide_client:
                 try:
                     cache_key = f"taf:{airport_code}"
                     await glide_client.set(
                         cache_key,
-                        json.dumps(taf),
+                        json.dumps(result),
                         expiry=ExpirySet(ExpiryType.SEC, 3600)  # 1 hour
                     )
                 except Exception:
@@ -1075,48 +1076,134 @@ def parse_sky_conditions(metar: Dict) -> list:
     return sky_conditions
 
 
+def _awc_clouds_to_sky_conditions(clouds: list) -> list:
+    """Convert AWC API 'clouds' array [{cover, base, type}] to skyConditions [{skyCover, cloudBase, cloudType}].
+
+    In the AWC JSON API response, 'base' is already in feet (e.g. 25000 for FEW250).
+    """
+    sky_conditions = []
+    for c in (clouds or []):
+        if not isinstance(c, dict):
+            continue
+        cover = str(c.get("cover") or "").strip().upper()
+        if not cover or cover == "///":
+            continue
+        base_raw = c.get("base")
+        cloud_base = None
+        if base_raw is not None:
+            try:
+                cloud_base = int(base_raw)  # Already in feet from AWC API
+            except (ValueError, TypeError):
+                cloud_base = None
+        cloud_type = c.get("type") or None
+        if cover in ("CLR", "SKC"):
+            return [{"skyCover": "CLR", "cloudBase": None, "cloudType": None}]
+        sky_conditions.append({"skyCover": cover, "cloudBase": cloud_base, "cloudType": cloud_type})
+    return sky_conditions
+
+
 def parse_taf_forecast(taf: Dict) -> list:
-    """Parse TAF forecast periods from AWC API response or cached data."""
+    """Parse TAF forecast periods from AWC API response or cached data.
+
+    Handles three source formats:
+    1. Normalised (our own cache-ingestion format): 'forecast' key with fcstTimeFrom/fcstTimeTo/skyConditions
+    2. AWC live API: 'fcsts' key with timeFrom/timeTo (epoch ints) and clouds[{cover,base}]
+    3. AVWX raw text parse fallback
+    """
     forecasts = []
-    
-    # Check for structured forecast array first (from cache ingestion)
+
+    # ── Format 1: Already-normalised data (from cache ingestion or a prior parse) ──
     if "forecast" in taf and isinstance(taf["forecast"], list) and len(taf["forecast"]) > 0:
         logger.info(f"Found {len(taf['forecast'])} forecast periods in structured format")
         for idx, fcst in enumerate(taf["forecast"]):
             logger.info(f"Forecast {idx} keys: {list(fcst.keys()) if isinstance(fcst, dict) else 'not a dict'}")
-            
-            # Extract sky conditions - check for structured format first, then fall back to parsing
+
+            # Sky conditions: structured > AWC clouds > skyc/skyl fields
             sky_conditions = []
             if "skyConditions" in fcst and isinstance(fcst["skyConditions"], list):
-                # Use structured sky conditions from cache ingestion
                 sky_conditions = fcst["skyConditions"]
                 logger.info(f"Using structured skyConditions for forecast {idx}")
+            elif "clouds" in fcst and isinstance(fcst["clouds"], list):
+                sky_conditions = _awc_clouds_to_sky_conditions(fcst["clouds"])
+                logger.info(f"Converted AWC clouds to skyConditions for forecast {idx}")
             else:
-                # Parse from skyc1/skyl1 format or other formats
                 sky_conditions = _parse_taf_sky_conditions(fcst)
-            
-            # Time fields - already in ISO format from cache ingestion, but handle both formats
+
+            # Time fields
             fcst_time_from = fcst.get("fcstTimeFrom", "")
             if not fcst_time_from:
                 fcst_time_from = _convert_time_to_iso(fcst.get("validTimeFrom", fcst.get("timeFrom", "")))
-            
+
             fcst_time_to = fcst.get("fcstTimeTo", "")
             if not fcst_time_to:
                 fcst_time_to = _convert_time_to_iso(fcst.get("validTimeTo", fcst.get("timeTo", "")))
-            
+
+            # Visibility: AWC 'visib' is already in SM (may be "6+" string)
+            raw_visib = fcst.get("visib", fcst.get("visibility", None))
+            visibility = None
+            if isinstance(raw_visib, str) and raw_visib.endswith("+"):
+                try:
+                    visibility = float(raw_visib[:-1]) + 0.5
+                except (ValueError, TypeError):
+                    visibility = None
+            elif raw_visib is not None:
+                try:
+                    visibility = float(raw_visib)
+                except (ValueError, TypeError):
+                    visibility = None
+
             forecast_period = {
                 "fcstTimeFrom": fcst_time_from,
                 "fcstTimeTo": fcst_time_to,
-                "changeIndicator": fcst.get("changeIndicator", fcst.get("changeind", fcst.get("changeIndicator", None))),
+                "changeIndicator": fcst.get("changeIndicator", fcst.get("changeind", None)),
                 "windDirection": fcst.get("wdir", fcst.get("windDirection", None)),
                 "windSpeed": fcst.get("wspd", fcst.get("windSpeed", None)),
                 "windGust": fcst.get("wspdGust", fcst.get("windGust", None)),
-                "visibility": fcst.get("visib", fcst.get("visibility", None)),
+                "visibility": visibility,
                 "skyConditions": sky_conditions,
                 "flightCategory": fcst.get("flightCategory", fcst.get("flightcat", None))
             }
             forecasts.append(forecast_period)
-    
+
+    # ── Format 2: Raw AWC API response — uses 'fcsts' key, epoch-int timestamps, clouds array ──
+    if not forecasts and "fcsts" in taf and isinstance(taf["fcsts"], list) and len(taf["fcsts"]) > 0:
+        logger.info(f"Found {len(taf['fcsts'])} forecast periods in AWC 'fcsts' format")
+        for idx, fcst in enumerate(taf["fcsts"]):
+            if not isinstance(fcst, dict):
+                continue
+
+            sky_conditions = _awc_clouds_to_sky_conditions(fcst.get("clouds", []))
+
+            fcst_time_from = _convert_time_to_iso(fcst.get("timeFrom", ""))
+            fcst_time_to = _convert_time_to_iso(fcst.get("timeTo", ""))
+
+            raw_visib = fcst.get("visib", None)
+            visibility = None
+            if isinstance(raw_visib, str) and raw_visib.endswith("+"):
+                try:
+                    visibility = float(raw_visib[:-1]) + 0.5
+                except (ValueError, TypeError):
+                    visibility = None
+            elif raw_visib is not None:
+                try:
+                    visibility = float(raw_visib)
+                except (ValueError, TypeError):
+                    visibility = None
+
+            forecast_period = {
+                "fcstTimeFrom": fcst_time_from,
+                "fcstTimeTo": fcst_time_to,
+                "changeIndicator": fcst.get("fcstChange", None),
+                "windDirection": fcst.get("wdir", None),
+                "windSpeed": fcst.get("wspd", None),
+                "windGust": fcst.get("wgst", None),
+                "visibility": visibility,
+                "skyConditions": sky_conditions,
+                "flightCategory": fcst.get("flightCategory", None)
+            }
+            forecasts.append(forecast_period)
+            logger.info(f"AWC fcsts[{idx}]: {fcst_time_from}→{fcst_time_to} wind={fcst.get('wspd')} vis={visibility} clouds={len(sky_conditions)}")
+
     # If no structured forecast, try to parse from raw TAF text
     if not forecasts:
         raw_taf = taf.get("rawTAF", taf.get("rawText", ""))
