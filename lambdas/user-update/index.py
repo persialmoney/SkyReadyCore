@@ -165,6 +165,10 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         if 'enabledCurrencies' in preferences and preferences['enabledCurrencies'] is not None:
             update_expression_parts.append("preferences.enabledCurrencies = :enabledCurrencies")
             expression_values[":enabledCurrencies"] = preferences['enabledCurrencies']
+        
+        if 'onboardingComplete' in preferences and preferences['onboardingComplete'] is not None:
+            update_expression_parts.append("preferences.onboardingComplete = :onboardingComplete")
+            expression_values[":onboardingComplete"] = preferences['onboardingComplete']
     
     # Conditionally update pilotInfo if provided
     pilot_info = input_data.get('pilotInfo')
