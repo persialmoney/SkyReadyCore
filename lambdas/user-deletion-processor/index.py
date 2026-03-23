@@ -9,6 +9,7 @@ import json
 import os
 import time
 import boto3
+from botocore.exceptions import ClientError
 from datetime import datetime
 from typing import Dict, Any, List
 
@@ -26,6 +27,7 @@ SAVED_AIRPORTS_TABLE = os.environ.get('SAVED_AIRPORTS_TABLE', f'sky-ready-saved-
 ALERTS_TABLE = os.environ.get('ALERTS_TABLE', f'sky-ready-alerts-{STAGE}')
 DELETION_OTPS_TABLE = os.environ.get('DELETION_OTPS_TABLE', f'sky-ready-deletion-otps-{STAGE}')
 DELETION_REQUESTS_TABLE = os.environ.get('DELETION_REQUESTS_TABLE', f'sky-ready-deletion-requests-{STAGE}')
+EVENTS_TABLE = os.environ.get('EVENTS_TABLE', f'sky-ready-events-{STAGE}')
 USER_POOL_ID = os.environ.get('USER_POOL_ID', '')
 
 
@@ -48,7 +50,27 @@ def get_cognito_client():
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Process all expired grace-period deletion requests."""
+    """
+    - Scheduled (EventBridge): scan deletion_requests for expired GRACE_PERIOD rows.
+    - Direct invoke (admin CLI): `{"adminPurgeUserId": "<cognito sub>"}` — immediate
+      full delete using the same process_hard_delete path as the scheduled job.
+    """
+    # Admin / break-glass immediate purge (Lambda invoke from trusted principal)
+    admin_uid = event.get("adminPurgeUserId") if isinstance(event, dict) else None
+    if admin_uid:
+        user_id = str(admin_uid).strip()
+        print(f"[DeletionProcessor] Admin immediate purge requested for userId={user_id}")
+        if not user_id:
+            return {"ok": False, "error": "adminPurgeUserId is empty"}
+        try:
+            summary = process_hard_delete(user_id, {}, admin_purge=True)
+            print(f"[DeletionProcessor] Admin purge completed: {summary}")
+            return {"ok": True, "userId": user_id, "summary": summary}
+        except Exception as e:
+            print(f"[DeletionProcessor] Admin purge FAILED for {user_id}: {e}")
+            return {"ok": False, "userId": user_id, "error": str(e)}
+
+    # Scheduled job: process all expired grace-period deletion requests.
     print(f"[DeletionProcessor] Starting hard-delete scan at {datetime.utcnow().isoformat()}")
 
     requests_table = get_dynamodb().Table(DELETION_REQUESTS_TABLE)
@@ -61,7 +83,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     for request in expired_requests:
         user_id = request['userId']
         try:
-            summary = process_hard_delete(user_id, request)
+            summary = process_hard_delete(user_id, request, admin_purge=False)
             results.append({'userId': user_id, 'status': 'completed', 'summary': summary})
             print(f"[DeletionProcessor] Successfully hard-deleted user {user_id}: {summary}")
         except Exception as e:
@@ -94,7 +116,7 @@ def scan_expired_requests(table, now_iso: str) -> List[Dict]:
     return expired
 
 
-def process_hard_delete(user_id: str, request: Dict) -> Dict:
+def process_hard_delete(user_id: str, request: Dict, *, admin_purge: bool = False) -> Dict:
     """Execute permanent deletion of all user data across all stores."""
     summary = {
         'logbook_entries_deleted': 0,
@@ -104,6 +126,7 @@ def process_hard_delete(user_id: str, request: Dict) -> Dict:
         'assessments_deleted': 0,
         'saved_airports_deleted': 0,
         'alerts_deleted': 0,
+        'events_deleted': 0,
         'cognito_deleted': False,
         'dynamodb_user_deleted': False,
     }
@@ -123,6 +146,9 @@ def process_hard_delete(user_id: str, request: Dict) -> Dict:
     summary['alerts_deleted'] = batch_delete_dynamo_items(
         ALERTS_TABLE, 'userId', user_id, sort_key='alertId'
     )
+
+    # 5b. DynamoDB: Delete outbox-derived events (userId + logbook payloads)
+    summary['events_deleted'] = scan_delete_events_for_user(EVENTS_TABLE, user_id)
 
     # 6. DynamoDB: Delete stale OTP (if any)
     try:
@@ -149,9 +175,54 @@ def process_hard_delete(user_id: str, request: Dict) -> Dict:
     except Exception as e:
         print(f"[DeletionProcessor] Error deleting Cognito user: {e}")
 
-    # 9. Update deletion request to COMPLETED
+    # 9. Update deletion_requests audit row (scheduled flow) or admin audit (CLI purge)
+    _finalize_deletion_request_record(user_id, summary, admin_purge=admin_purge)
+
+    return summary
+
+
+def _finalize_deletion_request_record(user_id: str, summary: Dict, *, admin_purge: bool) -> None:
+    """Mark deletion_requests COMPLETED, or create an admin audit row if none existed."""
     now_iso = datetime.utcnow().isoformat() + 'Z'
-    get_dynamodb().Table(DELETION_REQUESTS_TABLE).update_item(
+    table = get_dynamodb().Table(DELETION_REQUESTS_TABLE)
+    audit_ttl = int(time.time()) + (365 * 86400)
+
+    if admin_purge:
+        try:
+            table.update_item(
+                Key={'userId': user_id},
+                UpdateExpression=(
+                    'SET #s = :status, completedAt = :completedAt, '
+                    'dataSnapshot = :snapshot, requestedBy = :rb'
+                ),
+                ExpressionAttributeNames={'#s': 'status'},
+                ExpressionAttributeValues={
+                    ':status': 'COMPLETED',
+                    ':completedAt': now_iso,
+                    ':snapshot': summary,
+                    ':rb': 'admin_cli_immediate',
+                },
+                ConditionExpression='attribute_exists(userId)',
+            )
+        except ClientError as e:
+            code = e.response.get('Error', {}).get('Code', '')
+            if code != 'ConditionalCheckFailedException':
+                print(f"[DeletionProcessor] Error updating deletion_requests: {e}")
+                raise
+            table.put_item(Item={
+                'userId': user_id,
+                'status': 'COMPLETED',
+                'requestedAt': now_iso,
+                'completedAt': now_iso,
+                'requestedBy': 'admin_cli_immediate',
+                'reason': 'Immediate admin purge (no prior grace-period record)',
+                'dataSnapshot': summary,
+                'ttl': audit_ttl,
+            })
+            print(f"[DeletionProcessor] Wrote admin audit deletion_requests item for {user_id}")
+        return
+
+    table.update_item(
         Key={'userId': user_id},
         UpdateExpression='SET #s = :status, completedAt = :completedAt, dataSnapshot = :snapshot',
         ExpressionAttributeNames={'#s': 'status'},
@@ -161,8 +232,6 @@ def process_hard_delete(user_id: str, request: Dict) -> Dict:
             ':snapshot': summary,
         },
     )
-
-    return summary
 
 
 def hard_delete_postgres_data(user_id: str) -> Dict:
@@ -178,6 +247,7 @@ def hard_delete_postgres_data(user_id: str) -> Dict:
         'missions_deleted': 0,
         'mission_airports_deleted': 0,
         'assessments_deleted': 0,
+        'proficiency_snapshots_deleted': 0,
     }
 
     if not db_secret_arn or not db_endpoint:
@@ -274,6 +344,13 @@ def hard_delete_postgres_data(user_id: str) -> Dict:
             )
             result['outbox_entries_deleted'] = cur.rowcount
 
+            # Proficiency score history (sync-push upserts to proficiency_snapshots)
+            cur.execute(
+                "DELETE FROM proficiency_snapshots WHERE user_id = %s",
+                (user_id,)
+            )
+            result['proficiency_snapshots_deleted'] = cur.rowcount
+
         conn.commit()
         print(f"[DeletionProcessor] PostgreSQL cleanup: {result}")
     except Exception as e:
@@ -284,6 +361,35 @@ def hard_delete_postgres_data(user_id: str) -> Dict:
         conn.close()
 
     return result
+
+
+def scan_delete_events_for_user(table_name: str, user_id: str) -> int:
+    """
+    Remove DynamoDB events copied from PostgreSQL outbox (outbox-processor).
+    PK is (id, timestamp); there is no userId index, so we scan with a filter.
+    """
+    if not table_name:
+        return 0
+    table = get_dynamodb().Table(table_name)
+    deleted_count = 0
+    scan_kwargs: Dict[str, Any] = {
+        'FilterExpression': 'userId = :uid',
+        'ExpressionAttributeValues': {':uid': user_id},
+        'ProjectionExpression': 'id, #ts',
+        'ExpressionAttributeNames': {'#ts': 'timestamp'},
+    }
+    while True:
+        response = table.scan(**scan_kwargs)
+        items = response.get('Items', [])
+        if items:
+            with table.batch_writer() as batch:
+                for item in items:
+                    batch.delete_item(Key={'id': item['id'], 'timestamp': item['timestamp']})
+            deleted_count += len(items)
+        if 'LastEvaluatedKey' not in response:
+            break
+        scan_kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
+    return deleted_count
 
 
 def batch_delete_dynamo_items(table_name: str, pk_name: str, pk_value: str, sort_key: str = None) -> int:
