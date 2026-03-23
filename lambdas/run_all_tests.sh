@@ -37,6 +37,9 @@ LAMBDAS=(
     "logbook-operations"
     "logbook-ai"
     "weather"
+    "shared"
+    "user-deletion-processor"
+    "user-data-export"
 )
 
 # Track results
