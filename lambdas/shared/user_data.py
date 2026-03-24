@@ -306,3 +306,98 @@ def dynamo_to_jsonable(obj: Any) -> Any:
     if isinstance(obj, Decimal):
         return float(obj)
     return obj
+
+
+# ---------------------------------------------------------------------------
+# CCPA/GDPR export — sanitization
+# ---------------------------------------------------------------------------
+
+# Fields stripped per table. Goal: remove Cognito IDs, internal PKs/FKs,
+# sync flags, tombstone columns, and implementation hashes before the
+# payload is written to S3 and delivered to the user.
+
+_LOGBOOK_STRIP: frozenset = frozenset({
+    "entry_id",
+    "user_id",
+    "instructor_user_id",   # another user's Cognito sub
+    "student_user_id",      # another user's Cognito sub
+    "mirrored_from_entry_id",
+    "mirrored_from_user_id",  # another user's Cognito sub
+    "deleted_at",
+})
+
+_MISSION_STRIP: frozenset = frozenset({
+    "id",
+    "user_id",
+    "route_hash",
+    "latest_assessment_id",
+    "deleted_at",
+    "_sync_pending",
+})
+
+_MISSION_AIRPORT_STRIP: frozenset = frozenset({
+    "id",
+    "mission_id",
+    "_sync_pending",
+})
+
+_ASSESSMENT_STRIP: frozenset = frozenset({
+    "id",
+    "mission_id",
+    "route_hash",
+    "minimums_profile_id",  # keep minimums_profile_name
+    "deleted_at",
+    "_sync_pending",
+})
+
+_SNAPSHOT_STRIP: frozenset = frozenset({
+    "id",
+    "user_id",
+    "_sync_pending",
+})
+
+_PROFILE_STRIP: frozenset = frozenset({"userId", "id"})
+_AIRPORT_STRIP: frozenset = frozenset({"userId"})
+_ALERT_STRIP: frozenset = frozenset({"userId"})
+
+
+def _strip_keys(d: Dict[str, Any], keys: frozenset) -> Dict[str, Any]:
+    return {k: v for k, v in d.items() if k not in keys}
+
+
+def sanitize_export_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strip internal system fields and flatten storage namespaces before the
+    CCPA export is written to S3. The outbox is omitted entirely (internal
+    event queue, no user-meaningful content).
+    """
+    pg = payload.get("postgresql", {})
+    ddb = payload.get("dynamodb", {})
+
+    return {
+        "exportVersion": payload["exportVersion"],
+        "exportedAt": payload["exportedAt"],
+        "profile": _strip_keys(ddb.get("profile") or {}, _PROFILE_STRIP),
+        "savedAirports": [
+            _strip_keys(a, _AIRPORT_STRIP) for a in ddb.get("saved_airports", [])
+        ],
+        "alerts": [
+            _strip_keys(a, _ALERT_STRIP) for a in ddb.get("alerts", [])
+        ],
+        "logbookEntries": [
+            _strip_keys(e, _LOGBOOK_STRIP) for e in pg.get("logbook_entries", [])
+        ],
+        "missions": [
+            _strip_keys(m, _MISSION_STRIP) for m in pg.get("missions", [])
+        ],
+        "missionAirports": [
+            _strip_keys(a, _MISSION_AIRPORT_STRIP) for a in pg.get("mission_airports", [])
+        ],
+        "readinessAssessments": [
+            _strip_keys(a, _ASSESSMENT_STRIP) for a in pg.get("readiness_assessments", [])
+        ],
+        "proficiencySnapshots": [
+            _strip_keys(s, _SNAPSHOT_STRIP) for s in pg.get("proficiency_snapshots", [])
+        ],
+        # outbox omitted — internal event-sourcing queue
+    }

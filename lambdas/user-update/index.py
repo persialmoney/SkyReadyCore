@@ -3,7 +3,6 @@ AppSync Lambda Resolver for updating user information.
 Handles conditional updates to user profile and preferences.
 Note: Aircraft management is now handled via sync protocol.
 """
-import json
 import os
 import boto3
 import secrets
@@ -12,9 +11,18 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Any, Optional
 
+import email_templates
+
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "noreply@skyready.app")
+STAGE = os.environ.get("STAGE", "dev")
+
+# Password-reset deep link — uses the universal link; works on both iOS and Android.
+RESET_URL = "https://skyready.app/reset-password"
+
 # Lazy initialization - DynamoDB resources created on first use to reduce cold start time
 _dynamodb_resource = None
 _users_table = None
+_ses_client = None
 
 
 def generate_invite_code() -> str:
@@ -38,6 +46,14 @@ def get_users_table():
         _users_table = _dynamodb_resource.Table(os.environ.get('USERS_TABLE', 'sky-ready-users-dev'))
     
     return _users_table
+
+
+def get_ses():
+    """Get SES client with lazy initialization."""
+    global _ses_client
+    if _ses_client is None:
+        _ses_client = boto3.client("ses")
+    return _ses_client
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -122,6 +138,14 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     
     if not input_data:
         raise ValueError("Input data is required")
+
+    # Read the current user record upfront so we can:
+    #   1. Detect whether the email is actually changing (for the security notice).
+    #   2. Avoid a second get_item later when generating an instructor invite code.
+    users_table = get_users_table()
+    user_response = users_table.get_item(Key={'userId': user_id})
+    existing_user = user_response.get('Item', {})
+    existing_email = existing_user.get('email', '')
     
     # Build update expression parts
     update_expression_parts = []
@@ -139,9 +163,11 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         expression_values[":name"] = input_data['name']
     
     # Conditionally update email if provided
+    new_email_value = None
     if 'email' in input_data and input_data['email'] is not None:
+        new_email_value = input_data['email']
         update_expression_parts.append("email = :email")
-        expression_values[":email"] = input_data['email']
+        expression_values[":email"] = new_email_value
     
     # Conditionally update preferences if provided
     preferences = input_data.get('preferences')
@@ -212,10 +238,6 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
             expression_values[":instructorCertificateExpiration"] = pilot_info['instructorCertificateExpiration']
         
         # Auto-generate inviteCode if instructor certificates are set and inviteCode doesn't exist
-        # Need to check if inviteCode already exists first
-        users_table = get_users_table()
-        user_response = users_table.get_item(Key={'userId': user_id})
-        existing_user = user_response.get('Item', {})
         existing_pilot_info = existing_user.get('pilotInfo', {})
         existing_invite_code = existing_pilot_info.get('inviteCode')
         
@@ -243,9 +265,6 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     if expression_names:
         update_params['ExpressionAttributeNames'] = expression_names
     
-    # Get table reference (lazy initialization reduces cold start time)
-    users_table = get_users_table()
-    
     # Perform the update
     response = users_table.update_item(**update_params)
     
@@ -258,6 +277,27 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         updated_item['id'] = updated_item.get('userId', user_id)
     
     user_data = convert_item(updated_item)
-    
+
+    # Send a security notification to the OLD email address whenever the
+    # sign-in email is changed. The old address remains active for sign-in
+    # (Cognito keep_original is enabled) so the user can still recover via
+    # password reset if this change was not made by them.
+    if new_email_value and existing_email and new_email_value.lower() != existing_email.lower():
+        try:
+            get_ses().send_email(
+                Source=SENDER_EMAIL,
+                Destination={"ToAddresses": [existing_email]},
+                Message=email_templates.email_change_notification(
+                    old_email=existing_email,
+                    new_email=new_email_value,
+                    reset_url=RESET_URL,
+                ),
+            )
+            print(f"[UserUpdate] Email-change security notice sent to {existing_email}")
+        except Exception as ses_err:
+            # Non-fatal — log and continue so the profile update is not blocked
+            # by a transient SES failure.
+            print(f"[UserUpdate] WARNING: Failed to send email-change notice: {ses_err}")
+
     return user_data
 

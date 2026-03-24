@@ -13,6 +13,7 @@ from user_data import (
     collect_dynamo_user_data,
     collect_postgres_user_data,
     dynamo_to_jsonable,
+    sanitize_export_payload,
 )
 
 STAGE = os.environ.get("STAGE", "dev")
@@ -132,13 +133,13 @@ def _collect_all(user_id: str) -> Dict[str, Any]:
     else:
         print("[UserDataExport] PostgreSQL not configured, DynamoDB-only export")
 
-    return {
+    raw = {
         "exportVersion": "1.0",
         "exportedAt": datetime.utcnow().isoformat() + "Z",
-        "userId": user_id,
         "dynamodb": dynamo_part,
         "postgresql": postgres_part,
     }
+    return sanitize_export_payload(raw)
 
 
 def _email_link(to_email: str, name: str, url: str) -> None:
