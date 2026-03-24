@@ -29,7 +29,7 @@ def get_database_url():
     secret = json.loads(response['SecretString'])
     
     db_endpoint = os.environ.get('DB_ENDPOINT')
-    db_name = os.environ.get('DB_NAME', 'logbook')
+    db_name = os.environ.get('DB_NAME', 'skyready')
     
     if not db_endpoint:
         raise ValueError("DB_ENDPOINT environment variable not set")

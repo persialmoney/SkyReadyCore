@@ -236,7 +236,19 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         if 'instructorCertificateExpiration' in pilot_info and pilot_info['instructorCertificateExpiration'] is not None:
             update_expression_parts.append("pilotInfo.instructorCertificateExpiration = :instructorCertificateExpiration")
             expression_values[":instructorCertificateExpiration"] = pilot_info['instructorCertificateExpiration']
-        
+
+        if 'instructorVerificationStatus' in pilot_info and pilot_info['instructorVerificationStatus'] is not None:
+            update_expression_parts.append("pilotInfo.instructorVerificationStatus = :instructorVerificationStatus")
+            expression_values[":instructorVerificationStatus"] = pilot_info['instructorVerificationStatus']
+
+        if 'instructorVerifiedAt' in pilot_info and pilot_info['instructorVerifiedAt'] is not None:
+            update_expression_parts.append("pilotInfo.instructorVerifiedAt = :instructorVerifiedAt")
+            expression_values[":instructorVerifiedAt"] = pilot_info['instructorVerifiedAt']
+
+        if 'instructorSnapshotDate' in pilot_info and pilot_info['instructorSnapshotDate'] is not None:
+            update_expression_parts.append("pilotInfo.instructorSnapshotDate = :instructorSnapshotDate")
+            expression_values[":instructorSnapshotDate"] = pilot_info['instructorSnapshotDate']
+
         # Auto-generate inviteCode if instructor certificates are set and inviteCode doesn't exist
         existing_pilot_info = existing_user.get('pilotInfo', {})
         existing_invite_code = existing_pilot_info.get('inviteCode')
