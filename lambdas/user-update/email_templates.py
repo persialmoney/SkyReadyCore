@@ -1,19 +1,10 @@
 """
-SkyReady transactional email templates.
+SkyReady transactional email templates (bundled with user-update Lambda).
 
-Also copied to ../user-update/email_templates.py for the AppSync user-update Lambda
-(same-directory import). Edit both when changing templates.
+Canonical copy for editing: ../shared/email_templates.py — keep both files in sync.
 
 Each function returns a dict shaped for the SES send_email(Message=...) parameter,
 containing a Subject and both Text and HTML Body variants.
-
-Usage:
-    import email_templates
-    ses.send_email(
-        Source=SENDER_EMAIL,
-        Destination={"ToAddresses": [recipient]},
-        Message=email_templates.email_change_notification(old_email, new_email, reset_url),
-    )
 
 Templates defined here:
 - email_change_notification  — security notice sent to old address when email change is requested
