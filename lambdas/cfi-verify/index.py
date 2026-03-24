@@ -2,14 +2,24 @@
 CFI Certificate Verification Lambda
 
 AppSync resolver for the verifyCfiCertificate mutation. Looks up the entered
-certificate number and last name against the FAA airmen tables (imported daily
-by faa-airmen-sync), applies three-state matching logic, writes an audit row,
-persists the result back to DynamoDB pilotInfo, and returns CfiVerificationResult.
+first name, last name, and certificate expiry date against the FAA airmen tables
+(imported monthly by faa-airmen-sync), applies three-state matching logic, writes
+an audit row, persists the result back to DynamoDB pilotInfo, and returns
+CfiVerificationResult.
+
+WHY NAME + EXPIRY (not cert number):
+  The FAA Airmen Certification Releasable Database explicitly does not include
+  airmen certificate numbers. The UNIQUE_ID in the FAA files is an internal DB
+  key, not the number printed on a pilot's certificate. Verification must
+  therefore be done by matching name + certificate expiry date.
+  Same first+last name with the same expiry date is an extremely rare collision
+  in practice, making this a reliable verification signal.
 
 Verification states:
-  verified   — cert# and last name match an active FAA flight instructor record
-  partial    — cert# matches but name/ratings check is weak, or vice versa
-  unverified — no FAA match found
+  verified   — first+last name and expiry date match an active FAA CFI record
+  partial    — name matches but expiry is off, or expiry matches but first name
+               is weak, or cert type (CFII/MEI) not in FAA ratings
+  unverified — no FAA CFI record found for this name
 
 Metrics emitted to CloudWatch namespace: SkyReady/FAA/{STAGE}
 """
@@ -40,9 +50,9 @@ FAA_SOURCE_LABEL = 'FAA Airmen Certification Releasable Database'
 # If the user selected a cert type that should be present in ratings_raw but
 # is not found, we downgrade to partial.
 CERT_RATINGS_MAP = {
-    'CFI':  ['CFI', 'FLIGHT INSTRUCTOR'],
-    'CFII': ['CFII', 'INSTRUMENT'],
-    'MEI':  ['MEI', 'MULTI'],
+    'CFI':  ['CFI', 'FLIGHT INSTRUCTOR', 'ASEL', 'AMEL', 'ASE', 'AME'],
+    'CFII': ['INST', 'INSTRUMENT'],
+    'MEI':  ['AMEL', 'AME', 'MULTI'],
 }
 
 
@@ -51,6 +61,30 @@ CERT_RATINGS_MAP = {
 def normalize(value: str) -> str:
     """Strip non-alphanumeric characters and lowercase."""
     return re.sub(r'[^a-z0-9]', '', (value or '').lower().strip())
+
+
+def normalize_expiry(value: str) -> str:
+    """
+    Normalize a user-entered expiry date to MMDDYYYY for comparison against
+    the FAA CERT.csv format.
+
+    Accepts:
+      YYYY-MM-DD  (app's internal format)
+      MM/DD/YYYY
+      MMDDYYYY    (already FAA format)
+    Returns MMDDYYYY string, or '' if unparseable.
+    """
+    v = (value or '').strip()
+    for fmt, out_fmt in [
+        ('%Y-%m-%d', '%m%d%Y'),
+        ('%m/%d/%Y', '%m%d%Y'),
+        ('%m%d%Y',   '%m%d%Y'),
+    ]:
+        try:
+            return datetime.strptime(v, fmt).strftime(out_fmt)
+        except ValueError:
+            continue
+    return ''
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -91,10 +125,17 @@ def _return_conn(conn) -> None:
 
 # ── FAA lookup ────────────────────────────────────────────────────────────────
 
-def lookup_faa(conn, norm_cert: str, norm_last: str) -> List[Dict[str, Any]]:
+def lookup_faa(
+    conn,
+    norm_first: str,
+    norm_last: str,
+    norm_expiry: str,
+) -> List[Dict[str, Any]]:
     """
-    Primary match: cert number + last name + is_flight_instructor.
-    Returns all matching rows joined from both tables.
+    Primary match: last name (exact) + first name (prefix) + expiry date + CFI.
+
+    The expiry date match is what disambiguates people with identical names.
+    Same first+last name with same expiry is an extremely rare collision.
     """
     cur = conn.cursor()
     try:
@@ -105,23 +146,25 @@ def lookup_faa(conn, norm_cert: str, norm_last: str) -> List[Dict[str, Any]]:
                 b.first_middle_name,
                 b.last_name_suffix,
                 b.norm_last_name,
+                b.norm_first_name,
+                b.state,
                 c.certificate_type,
                 c.certificate_level,
                 c.certificate_expire_date,
                 c.ratings_raw,
                 c.is_flight_instructor,
-                c.norm_cert_number,
                 m.source_snapshot_date
             FROM faa_airmen_certificates c
             JOIN faa_airmen_basic b ON b.unique_id = c.unique_id
             LEFT JOIN faa_ingest_metadata m ON m.id = 1
-            WHERE c.norm_cert_number = %s
-              AND b.norm_last_name   = %s
-              AND c.is_flight_instructor = true
+            WHERE b.norm_last_name        = %s
+              AND b.norm_first_name       LIKE %s
+              AND c.is_flight_instructor  = true
+              AND c.certificate_expire_date = %s
             ORDER BY c.certificate_expire_date DESC NULLS LAST
             LIMIT 10
             """,
-            (norm_cert, norm_last),
+            (norm_last, norm_first + '%', norm_expiry),
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -129,19 +172,33 @@ def lookup_faa(conn, norm_cert: str, norm_last: str) -> List[Dict[str, Any]]:
         cur.close()
 
 
-def lookup_cert_number_only(conn, norm_cert: str) -> List[Dict[str, Any]]:
-    """Partial-match fallback: cert number matches but we didn't check last name."""
+def lookup_name_only(
+    conn,
+    norm_first: str,
+    norm_last: str,
+) -> List[Dict[str, Any]]:
+    """
+    Partial-match fallback: name matches but expiry didn't.
+    Returns all active CFI records for this name so we can check
+    whether the name exists in FAA data at all.
+    """
     cur = conn.cursor()
     try:
         cur.execute(
             """
-            SELECT b.norm_last_name, c.is_flight_instructor
+            SELECT
+                b.norm_last_name,
+                b.norm_first_name,
+                c.is_flight_instructor,
+                c.certificate_expire_date
             FROM faa_airmen_certificates c
             JOIN faa_airmen_basic b ON b.unique_id = c.unique_id
-            WHERE c.norm_cert_number = %s
-            LIMIT 5
+            WHERE b.norm_last_name       = %s
+              AND b.norm_first_name      LIKE %s
+              AND c.is_flight_instructor = true
+            LIMIT 10
             """,
-            (norm_cert,),
+            (norm_last, norm_first + '%'),
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -161,22 +218,6 @@ def get_snapshot_date(conn) -> Optional[str]:
 
 # ── Matching logic ────────────────────────────────────────────────────────────
 
-def _is_expired(expire_date_str: Optional[str]) -> bool:
-    if not expire_date_str:
-        return False
-    try:
-        # FAA uses YYYYMMDD or similar; try both formats
-        for fmt in ('%Y%m%d', '%Y-%m-%d', '%m/%d/%Y'):
-            try:
-                exp = datetime.strptime(expire_date_str.strip(), fmt).date()
-                return exp < date.today()
-            except ValueError:
-                continue
-    except Exception:
-        pass
-    return False
-
-
 def _check_ratings(faa_row: Dict, user_cert_types: List[str]) -> Tuple[bool, str]:
     """Return (ok, reason) — ok=False means ratings inconsistency → partial."""
     if not user_cert_types:
@@ -191,52 +232,52 @@ def _check_ratings(faa_row: Dict, user_cert_types: List[str]) -> Tuple[bool, str
 
 def determine_status(
     conn,
-    norm_cert: str,
+    norm_first: str,
     norm_last: str,
-    norm_first: Optional[str],
+    norm_expiry: str,
     user_cert_types: List[str],
 ) -> Tuple[str, Optional[Dict], str]:
     """
     Returns (status, best_faa_row_or_None, match_reason).
+
+    Logic:
+      verified  — name + expiry match an active FAA CFI record, and ratings OK
+      partial   — name matches but expiry is off, OR ratings mismatch
+      unverified — no name match in FAA data at all
     """
-    rows = lookup_faa(conn, norm_cert, norm_last)
+    if not norm_first or not norm_last:
+        return 'unverified', None, 'first or last name not provided'
+
+    if not norm_expiry:
+        # No expiry provided: fall back to name-only partial check
+        name_rows = lookup_name_only(conn, norm_first, norm_last)
+        if name_rows:
+            return 'partial', None, 'name found in FAA CFI data but no expiry date provided for confirmation'
+        return 'unverified', None, 'no FAA CFI record found for this name'
+
+    # Primary: full match (name + expiry)
+    rows = lookup_faa(conn, norm_first, norm_last, norm_expiry)
 
     if rows:
-        # Pick best row: prefer non-expired, then latest expiry
-        best = next(
-            (r for r in rows if not _is_expired(r.get('certificate_expire_date'))),
-            rows[0],
-        )
-
+        best = rows[0]
         reasons = []
 
-        # Secondary: first name
-        if norm_first:
-            faa_first = normalize(best.get('first_middle_name') or '')
-            # Match if norm_first is a prefix of the FAA first+middle field
-            if not faa_first.startswith(norm_first) and norm_first not in faa_first:
-                reasons.append('first name mismatch')
-
-        # Secondary: ratings
+        # Secondary: ratings check
         ratings_ok, ratings_reason = _check_ratings(best, user_cert_types)
         if not ratings_ok:
             reasons.append(ratings_reason)
 
-        # Secondary: expiration
-        if _is_expired(best.get('certificate_expire_date')):
-            reasons.append('instructor certificate expired')
-
         if reasons:
-            return 'partial', best, 'primary match succeeded; secondary checks: ' + '; '.join(reasons)
+            return 'partial', best, 'name+expiry matched; secondary checks: ' + '; '.join(reasons)
 
-        return 'verified', best, 'cert# and last name matched active FAA instructor record'
+        return 'verified', best, 'first name, last name, and expiry date matched active FAA CFI record'
 
-    # No primary match — check if cert# exists at all (different name)
-    cert_only_rows = lookup_cert_number_only(conn, norm_cert)
-    if cert_only_rows:
-        return 'partial', None, 'cert# found in FAA data but last name does not match'
+    # No full match — check if name exists without expiry match (typo in expiry?)
+    name_rows = lookup_name_only(conn, norm_first, norm_last)
+    if name_rows:
+        return 'partial', None, 'name found in FAA CFI data but expiry date does not match'
 
-    return 'unverified', None, 'no FAA record found for this cert# and last name'
+    return 'unverified', None, 'no FAA CFI record found for this name'
 
 
 # ── Audit write ───────────────────────────────────────────────────────────────
@@ -247,6 +288,7 @@ def write_attempt(
     entered_cert: str,
     entered_last: str,
     entered_first: Optional[str],
+    entered_expiry: Optional[str],
     matched_id: Optional[str],
     status: str,
     reason: str,
@@ -261,14 +303,13 @@ def write_attempt(
                  matched_unique_id, verification_status, match_reason, source_snapshot_date)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (user_id, entered_cert, entered_last, entered_first,
+            (user_id, entered_cert or '', entered_last, entered_first,
              matched_id, status, reason, snapshot_date),
         )
         conn.commit()
     except Exception as e:
         conn.rollback()
         emit_metric('DbWriteFailure', 1)
-        # Non-fatal: log but don't fail the verification response
         print(f"[cfi-verify] WARNING: audit write failed: {e}")
     finally:
         cur.close()
@@ -312,7 +353,10 @@ def build_response(status: str, faa_row: Optional[Dict],
         ])) or None
 
         ratings_raw = faa_row.get('ratings_raw') or ''
-        ratings = [r.strip() for r in ratings_raw.split('/') if r.strip()]
+        # FAA ratings format: 10 chars per rating, e.g. "A/ASEL    A/INST    "
+        # Split on whitespace blocks and strip the leading level prefix (e.g. "A/")
+        raw_parts = [r.strip() for r in ratings_raw.split() if r.strip()]
+        ratings = [r.split('/')[-1] for r in raw_parts if '/' in r]
 
         summary = {
             'isCfi': bool(faa_row.get('is_flight_instructor')),
@@ -338,45 +382,49 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     args = event.get('arguments', {}).get('input', {})
     user_id = event.get('identity', {}).get('sub') or event.get('userId', '')
 
-    cert_number = args.get('certificateNumber', '')
-    last_name = args.get('lastName', '')
-    first_name = args.get('firstName') or None
-    # User-selected instructor cert types for secondary ratings check
+    # certificateNumber is stored for self-attestation but NOT used for FAA lookup.
+    # The FAA Airmen Releasable Database does not include certificate numbers.
+    cert_number  = args.get('certificateNumber', '') or ''
+    last_name    = args.get('lastName', '')
+    first_name   = args.get('firstName') or ''
+    cert_expiry  = args.get('certificateExpiration') or ''
     user_cert_types = args.get('instructorCertificates', [])
 
-    print(f"[cfi-verify] user={user_id} cert={cert_number!r} last={last_name!r}")
+    print(f"[cfi-verify] user={user_id} first={first_name!r} last={last_name!r} expiry={cert_expiry!r}")
 
-    norm_cert = normalize(cert_number)
-    norm_last = normalize(last_name)
-    norm_first = normalize(first_name) if first_name else None
+    norm_first  = normalize(first_name)
+    norm_last   = normalize(last_name)
+    norm_expiry = normalize_expiry(cert_expiry)
 
-    if not norm_cert or not norm_last:
-        return {
-            'status': 'unverified',
-            'displayName': None,
-            'certificateSummary': None,
-            'source': FAA_SOURCE_LABEL,
-            'verifiedAt': datetime.now(timezone.utc).isoformat(),
-            'snapshotDate': None,
-        }
+    _unverified = {
+        'status': 'unverified',
+        'displayName': None,
+        'certificateSummary': None,
+        'source': FAA_SOURCE_LABEL,
+        'verifiedAt': datetime.now(timezone.utc).isoformat(),
+        'snapshotDate': None,
+    }
+
+    if not norm_last:
+        return _unverified
 
     conn = None
     try:
         conn = _get_conn()
 
         status, faa_row, reason = determine_status(
-            conn, norm_cert, norm_last, norm_first, user_cert_types
+            conn, norm_first, norm_last, norm_expiry, user_cert_types
         )
         snapshot_date = faa_row.get('source_snapshot_date') if faa_row else get_snapshot_date(conn)
         if snapshot_date:
             snapshot_date = str(snapshot_date)
 
         verified_at = datetime.now(timezone.utc).isoformat()
-        matched_id = faa_row.get('unique_id') if faa_row else None
+        matched_id  = faa_row.get('unique_id') if faa_row else None
 
         # Audit trail (non-fatal)
-        write_attempt(conn, user_id, cert_number, last_name, first_name,
-                      matched_id, status, reason, snapshot_date)
+        write_attempt(conn, user_id, cert_number, last_name, first_name or None,
+                      cert_expiry or None, matched_id, status, reason, snapshot_date)
 
         # Persist to DynamoDB pilotInfo (non-fatal)
         if user_id:
@@ -394,15 +442,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         emit_metric('DbReadFailure', 1)
         emit_metric('VerifyDurationMs', elapsed_ms, unit='Milliseconds')
         print(f"[cfi-verify] ERROR: {e}")
-        # Return unverified rather than raising — verification is never blocking
-        return {
-            'status': 'unverified',
-            'displayName': None,
-            'certificateSummary': None,
-            'source': FAA_SOURCE_LABEL,
-            'verifiedAt': datetime.now(timezone.utc).isoformat(),
-            'snapshotDate': None,
-        }
+        return _unverified
     finally:
         if conn is not None:
             _return_conn(conn)

@@ -40,7 +40,10 @@ METRIC_DIMS = [{'Name': 'Stage', 'Value': STAGE}]
 
 # FAA Airmen Certification Releasable Database download URL.
 # The file at this URL is updated daily by the FAA.
-FAA_AIRMEN_ZIP_URL = "https://av-info.faa.gov/data/ACS/CS012019.zip"
+# The FAA publishes a new snapshot monthly at registry.faa.gov.
+# URL pattern: CS{MM}{YYYY}.zip — we dynamically build this at runtime so the
+# Lambda always fetches the current month's file without needing a code deploy.
+FAA_AIRMEN_ZIP_BASE_URL = "https://registry.faa.gov/database"
 
 # Reject a new snapshot if either table shrinks by more than this fraction.
 MAX_DELTA_FRACTION = 0.20
@@ -91,10 +94,17 @@ def _return_conn(conn) -> None:
 
 # ── Download ──────────────────────────────────────────────────────────────────
 
+def _build_faa_url() -> str:
+    """Build the current month's FAA CSV ZIP URL: CS{MM}{YYYY}.zip."""
+    today = date.today()
+    return f"{FAA_AIRMEN_ZIP_BASE_URL}/CS{today.strftime('%m%Y')}.zip"
+
+
 def download_zip() -> bytes:
-    print(f"[FAA-Airmen-Sync] Downloading {FAA_AIRMEN_ZIP_URL}")
+    url = _build_faa_url()
+    print(f"[FAA-Airmen-Sync] Downloading {url}")
     req = urllib.request.Request(
-        FAA_AIRMEN_ZIP_URL,
+        url,
         headers={'User-Agent': 'SkyReady/1.0 (+https://skyready.app)'},
     )
     try:
@@ -141,12 +151,12 @@ def extract_csvs(zip_data: bytes) -> Tuple[List[str], List[str]]:
 
 def parse_basic(lines: List[str]) -> List[Dict[str, Any]]:
     """
-    Parse BASIC.csv rows into dicts ready for INSERT.
+    Parse PILOT_BASIC.csv rows into dicts ready for INSERT.
 
-    FAA BASIC.csv columns (0-indexed):
-      0  UNIQUE ID
-      1  FIRST NAME      (first + middle)
-      2  LAST NAME       (last + suffix)
+    FAA PILOT_BASIC.csv columns (0-indexed):
+      0  UNIQUE ID       — internal FAA DB key (NOT the cert number on the card)
+      1  FIRST NAME      (first + middle, up to 30 chars)
+      2  LAST NAME       (last + suffix, up to 30 chars)
       3  STREET 1
       4  STREET 2
       5  CITY
@@ -157,6 +167,12 @@ def parse_basic(lines: List[str]) -> List[Dict[str, Any]]:
       10 MED CLASS
       11 MED DATE
       12 MED EXP DATE
+      13 BASIC MED COURSE DATE
+      14 BASIC MED CMEC DATE
+
+    norm_first_name is the normalized first token of the FIRST & MIDDLE NAME
+    field. Used as the primary lookup key for CFI verification since the FAA
+    data does not include airmen certificate numbers.
     """
     rows = []
     for i, line in enumerate(lines):
@@ -168,10 +184,14 @@ def parse_basic(lines: List[str]) -> List[Dict[str, Any]]:
         unique_id = fields[0].strip()
         if not unique_id:
             continue
+        first_middle = fields[1].strip() if len(fields) > 1 else ''
         last_name_suffix = fields[2].strip()
+        # Take only the first token of first+middle as the normalized first name
+        # so "JOHN MICHAEL" → norm_first_name = "john"
+        first_token = first_middle.split()[0] if first_middle.split() else ''
         rows.append({
             'unique_id':         unique_id,
-            'first_middle_name': fields[1].strip() if len(fields) > 1 else '',
+            'first_middle_name': first_middle,
             'last_name_suffix':  last_name_suffix,
             'city':              fields[5].strip() if len(fields) > 5 else '',
             'state':             fields[6].strip() if len(fields) > 6 else '',
@@ -179,20 +199,24 @@ def parse_basic(lines: List[str]) -> List[Dict[str, Any]]:
             'medical_class':     fields[10].strip() if len(fields) > 10 else '',
             'medical_date':      fields[11].strip() if len(fields) > 11 else '',
             'norm_last_name':    normalize(last_name_suffix),
+            'norm_first_name':   normalize(first_token),
         })
     return rows
 
 
 def parse_certs(lines: List[str]) -> List[Dict[str, Any]]:
     """
-    Parse CERT.csv rows into dicts ready for INSERT.
+    Parse PILOT_CERT.csv rows into dicts ready for INSERT.
 
-    FAA CERT.csv columns (0-indexed):
-      0  UNIQUE ID
-      1  CERTIFICATE TYPE    ('F' = Flight Instructor)
-      2  LEVEL
-      3  EXPIRE DATE
-      4  RATINGS
+    FAA PILOT_CERT.csv columns (0-indexed):
+      0  UNIQUE ID           — internal FAA DB key; links to PILOT_BASIC.csv
+                               NOTE: this is NOT the airmen certificate number.
+                               The FAA explicitly does not release cert numbers.
+      1  RECORD TYPE
+      2  CERTIFICATE TYPE    ('F' = Flight Instructor)
+      3  CERTIFICATE LEVEL
+      4  CERTIFICATE EXPIRE DATE  — MMDDYYYY format (CFI only)
+      5  RATINGS             — up to 11 ratings, 10 chars each (e.g. 'A/ASEL    ')
     """
     rows = []
     for i, line in enumerate(lines):
@@ -204,17 +228,18 @@ def parse_certs(lines: List[str]) -> List[Dict[str, Any]]:
         unique_id = fields[0].strip()
         if not unique_id:
             continue
-        cert_type = fields[1].strip() if len(fields) > 1 else ''
-        # The cert number stored in CERT.csv is the same as unique_id for airmen
-        # (the UNIQUE ID field is the FAA certificate number).
+        record_type = fields[1].strip() if len(fields) > 1 else ''
+        cert_type   = fields[2].strip() if len(fields) > 2 else ''
         rows.append({
             'unique_id':               unique_id,
-            'record_type':             '',
+            'record_type':             record_type,
             'certificate_type':        cert_type,
-            'certificate_level':       fields[2].strip() if len(fields) > 2 else '',
-            'certificate_expire_date': fields[3].strip() if len(fields) > 3 else '',
-            'ratings_raw':             fields[4].strip() if len(fields) > 4 else '',
+            'certificate_level':       fields[3].strip() if len(fields) > 3 else '',
+            'certificate_expire_date': fields[4].strip() if len(fields) > 4 else '',
+            'ratings_raw':             fields[5].strip() if len(fields) > 5 else '',
             'is_flight_instructor':    cert_type in FLIGHT_INSTRUCTOR_CERT_TYPES,
+            # norm_cert_number is kept for schema compatibility but is derived from
+            # UNIQUE_ID (internal FAA key), not the number on a pilot's certificate.
             'norm_cert_number':        normalize(unique_id),
         })
     return rows
@@ -233,11 +258,11 @@ def bulk_insert_basic(conn, rows: List[Dict[str, Any]]) -> None:
             INSERT INTO faa_airmen_basic_staging
                 (unique_id, first_middle_name, last_name_suffix,
                  city, state, country, medical_class, medical_date,
-                 norm_last_name, raw_source_updated_at)
+                 norm_last_name, norm_first_name, raw_source_updated_at)
             VALUES
                 (%(unique_id)s, %(first_middle_name)s, %(last_name_suffix)s,
                  %(city)s, %(state)s, %(country)s, %(medical_class)s, %(medical_date)s,
-                 %(norm_last_name)s, now())
+                 %(norm_last_name)s, %(norm_first_name)s, now())
             """,
             rows,
         )
