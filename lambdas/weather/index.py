@@ -765,13 +765,27 @@ def _alt(obj) -> Optional[int]:
     return int(obj)
 
 
-def _map_notam_category(report: dict) -> str:
+def _map_notam_category(report: dict, subject_hint: str = "") -> str:
     """Map AVWX NOTAM type/subject to a frontend category slug."""
     subject_obj = report.get("subject") or {}
     subject = (subject_obj.get("value") or subject_obj.get("repr") or "").lower()
     body = (report.get("body") or "").lower()
     raw = (report.get("raw") or "").lower()
     text = body or raw
+
+    # Use D-NOTAM subject_hint when AVWX fields are absent
+    hint = subject_hint.lower()
+    if hint in ("runway", "runway_closed"):
+        return "runway"
+    if hint == "taxiway":
+        return "taxiway"
+    if hint == "nav":
+        return "approach"
+    if hint in ("airspace", "uas"):
+        return "other"
+    if hint == "obstacle":
+        return "obstacle"
+
     if "runway" in subject or subject == "rwy":
         return "runway"
     if "taxiway" in subject or subject == "twy":
@@ -788,20 +802,93 @@ def _map_notam_category(report: dict) -> str:
 
 
 def _derive_notam_severity(body: str) -> str:
-    """Derive high/medium/low severity from NOTAM body text."""
-    b = body.upper()
-    if b.startswith("!") or "GFM" in b or "RUNWAY CLSD" in b or "AD CLSD" in b:
+    """Derive severity from body text alone (used as a helper)."""
+    b = body.upper().lstrip("! \t\n")
+
+    high_keywords = (
+        "RUNWAY CLSD", "RWY CLSD",
+        "AD CLSD", "AIRPORT CLSD", "AERODROME CLSD",
+        "ALL RWYS CLSD",
+        "GFM",
+        "LAHSO SUSPENDED",
+    )
+    if any(kw in b for kw in high_keywords):
         return "high"
-    if "ILS" in b or "GLIDESLOPE" in b or "LOCALIZER" in b or "PAPI" in b or "VASI" in b:
+
+    medium_keywords = (
+        "ILS", "GLIDESLOPE", "LOCALIZER", "GLIDE PATH",
+        "PAPI", "VASI",
+        "ATIS UNMON", "ATIS U/S",
+        "TWY CLSD", "TAXIWAY CLSD",
+        "APRON CLSD",
+    )
+    if any(kw in b for kw in medium_keywords):
         return "medium"
+
     return "low"
 
 
-def _derive_notam_title(report: dict) -> str:
+def _derive_notam_severity_from_report(report: dict, body: str, subject_hint: str = "") -> str:
+    """
+    Derive severity using AVWX structured fields first, then D-NOTAM hint, then body text.
+    Note: the leading '!' is a FAA D-NOTAM format marker — not a severity indicator.
+    """
+    subject_val = ((report.get("subject") or {}).get("value") or "").lower()
+    condition_val = ((report.get("condition") or {}).get("value") or "").lower()
+
+    # High: closures of runways or the airport itself
+    if any(kw in subject_val for kw in ("runway",)) and "closed" in condition_val:
+        return "high"
+    if any(kw in subject_val for kw in ("aerodrome", "airport", "ad")) and "closed" in condition_val:
+        return "high"
+
+    # Medium: nav/approach aids out of service
+    nav_subjects = ("ils", "localizer", "glideslope", "glide path", "papi", "vasi",
+                    "instrument approach", "nav", "instrument landing")
+    if any(kw in subject_val for kw in nav_subjects):
+        return "medium"
+    if any(kw in subject_val for kw in ("taxiway",)) and "closed" in condition_val:
+        return "medium"
+
+    # Low: UAS, airspace restrictions, construction, lighting, procedures — not operationally critical
+    low_subjects = ("uas", "unmanned", "airspace", "aerodrome beacon", "obstacle",
+                    "construction", "crane", "wind turbine")
+    if any(kw in subject_val for kw in low_subjects):
+        return "low"
+
+    # Use D-NOTAM subject_hint when AVWX fields are absent
+    hint = subject_hint.lower()
+    if hint == "runway_closed":
+        return "high"
+    if hint in ("nav",):
+        return "medium"
+    if hint in ("uas", "airspace", "obstacle", "taxiway"):
+        return "low"
+
+    # Fall back to body-text heuristics
+    return _derive_notam_severity(body)
+
+
+def _derive_notam_title(report: dict, dnotam: dict | None = None) -> str:
     """Build a human-readable title when AVWX doesn't provide one."""
     subject = (report.get("subject") or {}).get("value", "") or (report.get("subject") or {}).get("repr", "")
     condition = (report.get("condition") or {}).get("value", "") or (report.get("condition") or {}).get("repr", "")
-    station = report.get("station") or ""
+    station = report.get("station") or (dnotam or {}).get("station") or ""
+
+    # For fully-unparsed D-NOTAMs, derive a readable title from the subject_hint
+    if not subject and dnotam:
+        hint = (dnotam.get("subject_hint") or "").lower()
+        hint_titles = {
+            "uas": "UAS Airspace Restriction",
+            "airspace": "Airspace Notice",
+            "runway_closed": "Runway Closed",
+            "runway": "Runway Notice",
+            "taxiway": "Taxiway Notice",
+            "nav": "Navigation Aid Notice",
+            "obstacle": "Obstacle Notice",
+        }
+        subject = hint_titles.get(hint, "")
+
     parts = [p for p in [station, subject, condition] if p]
     return " — ".join(parts) if parts else "NOTAM"
 
@@ -809,27 +896,104 @@ def _derive_notam_title(report: dict) -> str:
 def _looks_like_raw_notam(text: str) -> bool:
     """Return True if text appears to be unprocessed NOTAM header/body rather than plain English."""
     t = text.strip()
-    # Raw NOTAM patterns: starts with "!" (FDC/D-NOTAM), or contains Q)/A)/B)/C)/E) line markers
     if t.startswith("!"):
         return True
     if any(f"\n{k})" in t or t.startswith(f"{k})") for k in ("Q", "A", "B", "C", "E")):
         return True
-    # All-uppercase with date/time codes like 2511050000-2611042359
+    # YYMMDDHHMM-YYMMDDHHMM datetime range codes
     if re.search(r"\b\d{10}-\d{10}\b", t):
         return True
     return False
 
 
-def _derive_notam_description(report: dict, raw_body: str) -> str:
+def _parse_dnotam_datetime(dt_str: str) -> str | None:
+    """Convert YYMMDDHHMM string to ISO 8601 UTC string, or None on failure."""
+    try:
+        return datetime.strptime(dt_str, "%y%m%d%H%M").replace(tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return None
+
+
+def _parse_dnotam_raw(raw: str) -> dict:
+    """
+    Parse a FAA D-NOTAM raw string that AVWX couldn't decode.
+    Format: !ICAO NR/NNN STATION <body text> YYMMDDHHMM-YYMMDDHHMM
+
+    Returns a dict with keys: number, station, body, start_time, end_time, subject_hint
+    All values may be None/empty if not parseable.
+    """
+    result = {
+        "number": None,
+        "station": None,
+        "body": "",
+        "start_time": None,
+        "end_time": None,
+        "subject_hint": None,   # coarse topic for category/severity
+    }
+    if not raw:
+        return result
+
+    # Collapse whitespace / newlines for easier parsing
+    flat = re.sub(r"\s+", " ", raw).strip()
+
+    # Extract header: !ICAO NR/NNN STATION
+    header_match = re.match(r"^!([A-Z]{3,4})\s+(\d+/\d+)\s+([A-Z]{3,4})\s+", flat)
+    if header_match:
+        result["station"] = header_match.group(1)
+        result["number"] = f"{header_match.group(1)}-{header_match.group(2)}"
+        after_header = flat[header_match.end():]
+    else:
+        after_header = flat.lstrip("!").strip()
+
+    # Extract trailing YYMMDDHHMM-YYMMDDHHMM datetime range
+    dt_match = re.search(r"\b(\d{10})-(\d{10})\s*$", after_header)
+    if dt_match:
+        result["start_time"] = _parse_dnotam_datetime(dt_match.group(1))
+        result["end_time"] = _parse_dnotam_datetime(dt_match.group(2))
+        body_text = after_header[:dt_match.start()].strip()
+    else:
+        body_text = after_header.strip()
+
+    result["body"] = body_text
+
+    # Derive a coarse subject hint from body keywords for severity/category
+    b = body_text.upper()
+    if "UAS" in b or "UNMANNED" in b or "DRONE" in b:
+        result["subject_hint"] = "uas"
+    elif "RWY" in b or "RUNWAY" in b:
+        if "CLSD" in b or "CLOSED" in b:
+            result["subject_hint"] = "runway_closed"
+        else:
+            result["subject_hint"] = "runway"
+    elif "TWY" in b or "TAXIWAY" in b:
+        result["subject_hint"] = "taxiway"
+    elif "ILS" in b or "GLIDESLOPE" in b or "LOCALIZER" in b or "LOC" in b:
+        result["subject_hint"] = "nav"
+    elif "PAPI" in b or "VASI" in b:
+        result["subject_hint"] = "nav"
+    elif "AIRSPACE" in b or "TFR" in b or "PROHIBITED" in b or "RESTRICTED" in b:
+        result["subject_hint"] = "airspace"
+    elif "OBST" in b or "CRANE" in b or "TOWER" in b:
+        result["subject_hint"] = "obstacle"
+
+    return result
+
+
+def _derive_notam_description(report: dict, raw_body: str, dnotam: dict | None = None) -> str:
     """
     Build the best human-readable description for a NOTAM.
-    Priority: structured body > qualifiers summary > stripped E) line from raw text.
+    Priority:
+      1. Structured AVWX body (already plain English)
+      2. AVWX qualifiers summary (subject — condition)
+      3. E) line extracted from ICAO raw text
+      4. Body parsed from D-NOTAM raw text (for fully-unparsed NOTAMs)
+      5. Raw text as-is (last resort)
     """
-    # 1. If body is non-empty and doesn't look like raw NOTAM text, use it
+    # 1. Structured body — if non-empty and not raw NOTAM text, use it directly
     if raw_body and not _looks_like_raw_notam(raw_body):
         return raw_body
 
-    # 2. Try to build from qualifiers: subject + condition + purpose
+    # 2. AVWX qualifiers: subject + condition + purpose/scope
     subject_val = (report.get("subject") or {}).get("value", "")
     condition_val = (report.get("condition") or {}).get("value", "")
     qualifiers = report.get("qualifiers") or {}
@@ -855,7 +1019,7 @@ def _derive_notam_description(report: dict, raw_body: str) -> str:
     if parts:
         return ". ".join(parts)
 
-    # 3. Try to extract the E) line from raw NOTAM text (the plain-English body section)
+    # 3. E) line from ICAO raw NOTAM text
     raw_text = report.get("raw") or ""
     e_match = re.search(r"\bE\)\s+(.+?)(?:\n[F-Z]\)|$)", raw_text, re.DOTALL)
     if e_match:
@@ -863,7 +1027,11 @@ def _derive_notam_description(report: dict, raw_body: str) -> str:
         if e_body and not _looks_like_raw_notam(e_body):
             return e_body
 
-    # 4. Last resort: use the raw body as-is (something is better than nothing)
+    # 4. D-NOTAM parsed body (plain text after stripping header and datetime)
+    if dnotam and dnotam.get("body"):
+        return dnotam["body"]
+
+    # 5. Last resort
     return raw_body or raw_text
 
 
@@ -915,30 +1083,47 @@ async def fetch_notams(airport_code: str) -> list:
                 logger.debug(f"[NOTAM] {airport_code}: skipping {notam_number} — cancelled by NOTAMC")
                 continue
 
-            end_time = _dt(report.get("end_time"))
+            raw_text = report.get("raw") or ""
+            body = report.get("body") or ""
+
+            # When AVWX couldn't parse structured fields, extract data from raw text directly
+            avwx_fully_unparsed = (
+                not body.strip()
+                and report.get("type") is None
+                and report.get("qualifiers") is None
+                and report.get("number") is None
+            )
+            dnotam = _parse_dnotam_raw(raw_text) if avwx_fully_unparsed else {}
+
+            # Resolve end_time: AVWX structured → D-NOTAM parsed → None
+            end_time = _dt(report.get("end_time")) or dnotam.get("end_time")
             if _is_expired(end_time):
                 skipped += 1
                 continue
 
-            raw_text = report.get("raw") or ""
-            body = report.get("body") or ""
-            # Use body for categorization/severity; fall back to raw for those heuristics only
-            effective_body_for_heuristics = body if body.strip() else raw_text
-            # Build the best human-readable description (may differ from raw body)
-            description = _derive_notam_description(report, body)
-            raw_id = report.get("number") or report.get("id") or ""
-            # Guarantee a unique, non-empty id so the frontend can use it as a React key
+            # Effective body for category/severity heuristics (no raw header noise)
+            effective_body_for_heuristics = body.strip() or dnotam.get("body", "")
+
+            # Build the best human-readable description
+            description = _derive_notam_description(report, body, dnotam)
+
+            # Resolve NOTAM ID
+            raw_id = report.get("number") or dnotam.get("number") or report.get("id") or ""
             notam_id = raw_id if raw_id else f"{airport_code}-{idx}-{abs(hash(raw_text)) % 100000}"
-            category = _map_notam_category({**report, "body": effective_body_for_heuristics})
-            severity = _derive_notam_severity(effective_body_for_heuristics)
-            logger.debug(f"[NOTAM] {airport_code}: id={notam_id} cat={category} sev={severity} end={end_time}")
+
+            # Category and severity — pass subject_hint from D-NOTAM parse when available
+            subject_hint = dnotam.get("subject_hint") or ""
+            category = _map_notam_category({**report, "body": effective_body_for_heuristics}, subject_hint)
+            severity = _derive_notam_severity_from_report(report, effective_body_for_heuristics, subject_hint)
+
+            logger.debug(f"[NOTAM] {airport_code}: id={notam_id} cat={category} sev={severity} end={end_time} unparsed={avwx_fully_unparsed}")
             results.append({
                 "id": notam_id,
-                "title": report.get("title") or _derive_notam_title(report),
+                "title": report.get("title") or _derive_notam_title(report, dnotam),
                 "description": description,
                 "category": category,
                 "severity": severity,
-                "effectiveStart": _dt(report.get("start_time")),
+                "effectiveStart": _dt(report.get("start_time")) or dnotam.get("start_time"),
                 "effectiveEnd": end_time,
                 "rawText": raw_text or body,
                 "whyShown": report.get("reason"),
