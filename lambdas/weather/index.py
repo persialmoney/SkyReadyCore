@@ -767,19 +767,22 @@ def _alt(obj) -> Optional[int]:
 
 def _map_notam_category(report: dict) -> str:
     """Map AVWX NOTAM type/subject to a frontend category slug."""
-    subject = (report.get("subject") or {}).get("value", "").lower()
+    subject_obj = report.get("subject") or {}
+    subject = (subject_obj.get("value") or subject_obj.get("repr") or "").lower()
     body = (report.get("body") or "").lower()
-    if subject in ("runway", "rwy"):
+    raw = (report.get("raw") or "").lower()
+    text = body or raw
+    if "runway" in subject or subject == "rwy":
         return "runway"
-    if subject in ("taxiway", "twy"):
+    if "taxiway" in subject or subject == "twy":
         return "taxiway"
-    if "ils" in body or "glideslope" in body or "localizer" in body or "approach" in body or "nav" in subject:
+    if "ils" in text or "glideslope" in text or "localizer" in text or "approach" in text or "nav" in subject or "instrument" in subject:
         return "approach"
-    if "light" in body or "papi" in body or "vasi" in body:
+    if "light" in text or "papi" in text or "vasi" in text or "lighting" in subject:
         return "lighting"
-    if "crane" in body or "tower" in body or "obstacle" in body or "obst" in body:
+    if "crane" in text or "tower" in text or "obstacle" in text or "obst" in text or "obstacle" in subject:
         return "obstacle"
-    if "procedure" in body or "chart" in body or "dp " in body or "star" in body:
+    if "procedure" in text or "chart" in text or "dp " in text or "star" in text or "procedure" in subject:
         return "procedure"
     return "other"
 
@@ -796,11 +799,72 @@ def _derive_notam_severity(body: str) -> str:
 
 def _derive_notam_title(report: dict) -> str:
     """Build a human-readable title when AVWX doesn't provide one."""
-    subject = (report.get("subject") or {}).get("repr", "")
-    condition = (report.get("condition") or {}).get("repr", "")
+    subject = (report.get("subject") or {}).get("value", "") or (report.get("subject") or {}).get("repr", "")
+    condition = (report.get("condition") or {}).get("value", "") or (report.get("condition") or {}).get("repr", "")
     station = report.get("station") or ""
     parts = [p for p in [station, subject, condition] if p]
     return " — ".join(parts) if parts else "NOTAM"
+
+
+def _looks_like_raw_notam(text: str) -> bool:
+    """Return True if text appears to be unprocessed NOTAM header/body rather than plain English."""
+    t = text.strip()
+    # Raw NOTAM patterns: starts with "!" (FDC/D-NOTAM), or contains Q)/A)/B)/C)/E) line markers
+    if t.startswith("!"):
+        return True
+    if any(f"\n{k})" in t or t.startswith(f"{k})") for k in ("Q", "A", "B", "C", "E")):
+        return True
+    # All-uppercase with date/time codes like 2511050000-2611042359
+    if re.search(r"\b\d{10}-\d{10}\b", t):
+        return True
+    return False
+
+
+def _derive_notam_description(report: dict, raw_body: str) -> str:
+    """
+    Build the best human-readable description for a NOTAM.
+    Priority: structured body > qualifiers summary > stripped E) line from raw text.
+    """
+    # 1. If body is non-empty and doesn't look like raw NOTAM text, use it
+    if raw_body and not _looks_like_raw_notam(raw_body):
+        return raw_body
+
+    # 2. Try to build from qualifiers: subject + condition + purpose
+    subject_val = (report.get("subject") or {}).get("value", "")
+    condition_val = (report.get("condition") or {}).get("value", "")
+    qualifiers = report.get("qualifiers") or {}
+    purpose_list = qualifiers.get("purpose") or []
+    scope_list = qualifiers.get("scope") or []
+
+    parts = []
+    if subject_val and condition_val:
+        parts.append(f"{subject_val} — {condition_val}")
+    elif subject_val:
+        parts.append(subject_val)
+    elif condition_val:
+        parts.append(condition_val)
+
+    purpose_values = [p.get("value", "") for p in purpose_list if isinstance(p, dict) and p.get("value")]
+    if purpose_values:
+        parts.append("Purpose: " + ", ".join(purpose_values))
+
+    scope_values = [s.get("value", "") for s in scope_list if isinstance(s, dict) and s.get("value")]
+    if scope_values:
+        parts.append("Scope: " + ", ".join(scope_values))
+
+    if parts:
+        return ". ".join(parts)
+
+    # 3. Try to extract the E) line from raw NOTAM text (the plain-English body section)
+    raw_text = report.get("raw") or ""
+    e_match = re.search(r"\bE\)\s+(.+?)(?:\n[F-Z]\)|$)", raw_text, re.DOTALL)
+    if e_match:
+        e_body = e_match.group(1).strip().replace("\n", " ")
+        if e_body and not _looks_like_raw_notam(e_body):
+            return e_body
+
+    # 4. Last resort: use the raw body as-is (something is better than nothing)
+    return raw_body or raw_text
 
 
 async def fetch_notams(airport_code: str) -> list:
@@ -826,7 +890,31 @@ async def fetch_notams(airport_code: str) -> list:
         logger.info(f"[NOTAM] {airport_code}: {len(raw_reports)} raw reports from API")
         results = []
         skipped = 0
+        cancelled_numbers: set[str] = set()
+
+        # First pass: collect all NOTAM numbers that are cancelled by a NOTAMC
+        for report in raw_reports:
+            notam_type = (report.get("type") or {}).get("repr", "").upper()
+            if notam_type == "NOTAMC":
+                replaces = report.get("replaces") or ""
+                if replaces:
+                    cancelled_numbers.add(replaces.strip().upper())
+
         for idx, report in enumerate(raw_reports):
+            # Skip cancellation NOTAMs themselves — they have no operational content
+            notam_type = (report.get("type") or {}).get("repr", "").upper()
+            if notam_type == "NOTAMC":
+                skipped += 1
+                logger.debug(f"[NOTAM] {airport_code}: skipping NOTAMC (cancellation notice)")
+                continue
+
+            # Skip NOTAMs that have been explicitly cancelled by a NOTAMC
+            notam_number = (report.get("number") or "").strip().upper()
+            if notam_number and notam_number in cancelled_numbers:
+                skipped += 1
+                logger.debug(f"[NOTAM] {airport_code}: skipping {notam_number} — cancelled by NOTAMC")
+                continue
+
             end_time = _dt(report.get("end_time"))
             if _is_expired(end_time):
                 skipped += 1
@@ -834,28 +922,29 @@ async def fetch_notams(airport_code: str) -> list:
 
             raw_text = report.get("raw") or ""
             body = report.get("body") or ""
-            # For NOTAMs where AVWX couldn't parse a structured body, fall back to
-            # the full raw text for display, categorization, and severity scoring.
-            effective_body = body if body.strip() else raw_text
+            # Use body for categorization/severity; fall back to raw for those heuristics only
+            effective_body_for_heuristics = body if body.strip() else raw_text
+            # Build the best human-readable description (may differ from raw body)
+            description = _derive_notam_description(report, body)
             raw_id = report.get("number") or report.get("id") or ""
             # Guarantee a unique, non-empty id so the frontend can use it as a React key
             notam_id = raw_id if raw_id else f"{airport_code}-{idx}-{abs(hash(raw_text)) % 100000}"
-            category = _map_notam_category({**report, "body": effective_body})
-            severity = _derive_notam_severity(effective_body)
+            category = _map_notam_category({**report, "body": effective_body_for_heuristics})
+            severity = _derive_notam_severity(effective_body_for_heuristics)
             logger.debug(f"[NOTAM] {airport_code}: id={notam_id} cat={category} sev={severity} end={end_time}")
             results.append({
                 "id": notam_id,
                 "title": report.get("title") or _derive_notam_title(report),
-                "description": effective_body,
+                "description": description,
                 "category": category,
                 "severity": severity,
                 "effectiveStart": _dt(report.get("start_time")),
                 "effectiveEnd": end_time,
-                "rawText": raw_text or effective_body,
+                "rawText": raw_text or body,
                 "whyShown": report.get("reason"),
             })
 
-        logger.info(f"[NOTAM] {airport_code}: returning {len(results)} active, {skipped} expired skipped")
+        logger.info(f"[NOTAM] {airport_code}: returning {len(results)} active, {skipped} skipped (expired/cancelled), {len(cancelled_numbers)} cancellations found")
         return results
 
     except urllib.error.HTTPError as e:

@@ -94,27 +94,67 @@ def _return_conn(conn) -> None:
 
 # ── Download ──────────────────────────────────────────────────────────────────
 
+# Well-known S3 key for a manually-uploaded FAA ZIP. The Lambda checks this
+# first so operators can seed the DB without relying on direct FAA downloads
+# (registry.faa.gov can be slow/unreachable from AWS IPs).
+S3_MANUAL_SEED_KEY = "faa-airmen-latest.zip"
+
 def _build_faa_url() -> str:
     """Build the current month's FAA CSV ZIP URL: CS{MM}{YYYY}.zip."""
     today = date.today()
     return f"{FAA_AIRMEN_ZIP_BASE_URL}/CS{today.strftime('%m%Y')}.zip"
 
 
-def download_zip() -> bytes:
+def _load_from_s3(key: str) -> Optional[bytes]:
+    """Return ZIP bytes from S3, or None if the key doesn't exist."""
+    try:
+        resp = s3_client.get_object(Bucket=FAA_AIRMEN_BUCKET, Key=key)
+        data = resp['Body'].read()
+        print(f"[FAA-Airmen-Sync] Loaded {len(data):,} bytes from s3://{FAA_AIRMEN_BUCKET}/{key}")
+        return data
+    except s3_client.exceptions.NoSuchKey:
+        return None
+    except Exception as e:
+        print(f"[FAA-Airmen-Sync] WARNING: S3 load failed for {key}: {e}")
+        return None
+
+
+def _download_from_faa() -> bytes:
     url = _build_faa_url()
     print(f"[FAA-Airmen-Sync] Downloading {url}")
     req = urllib.request.Request(
         url,
         headers={'User-Agent': 'SkyReady/1.0 (+https://skyready.app)'},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = resp.read()
-        print(f"[FAA-Airmen-Sync] Downloaded {len(data):,} bytes")
+    chunks: List[bytes] = []
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        while True:
+            chunk = resp.read(1024 * 1024)  # 1 MB at a time
+            if not chunk:
+                break
+            chunks.append(chunk)
+    data = b''.join(chunks)
+    print(f"[FAA-Airmen-Sync] Downloaded {len(data):,} bytes from FAA")
+    return data
+
+
+def acquire_zip() -> bytes:
+    """
+    S3-first acquisition strategy:
+    1. Check for a manually-uploaded seed file at s3://{bucket}/faa-airmen-latest.zip
+    2. Fall back to direct FAA download if not found
+    This allows operators to bootstrap without relying on FAA server availability.
+    """
+    data = _load_from_s3(S3_MANUAL_SEED_KEY)
+    if data:
         return data
+
+    print(f"[FAA-Airmen-Sync] No seed file in S3, attempting direct FAA download")
+    try:
+        return _download_from_faa()
     except Exception as e:
         emit_metric('DownloadFailure', 1)
-        raise RuntimeError(f"FAA airmen ZIP download failed: {e}") from e
+        raise RuntimeError(f"FAA airmen ZIP acquisition failed: {e}") from e
 
 
 # ── S3 archive ────────────────────────────────────────────────────────────────
@@ -381,8 +421,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     conn: Optional[Any] = None
     try:
-        # 1. Download
-        zip_data = download_zip()
+        # 1. Acquire ZIP (S3 seed first, then direct FAA download)
+        zip_data = acquire_zip()
 
         # 2. Archive to S3
         s3_key = archive_to_s3(zip_data)
