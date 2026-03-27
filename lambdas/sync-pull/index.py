@@ -270,34 +270,41 @@ def handler(event, context):
                 assessments_created.append(format_assessment(row))
 
         # ========== PENDING SIGNATURE REQUESTS (PostgreSQL, cross-user) ==========
-        # Returns student-owned entries where this user is the named instructor
-        # and the entry is awaiting their signature. These are NOT the CFI's own
-        # logbook entries — they are surfaced as a separate read-only queue.
+        # Only run this query for users who are confirmed CFIs (isCfi flag in DynamoDB).
+        # A non-CFI user should never receive cross-user entries here — this also
+        # prevents the self-endorsement loop where a single account owns both sides.
 
-        cursor.execute("""
-            SELECT
-                entry_id, user_id, date, aircraft, tail_number,
-                route, route_legs, flight_types, total_time,
-                pic, sic, dual_received, dual_given, solo,
-                cross_country, night, actual_imc, simulated_instrument,
-                day_takeoffs, day_landings, night_takeoffs, night_landings,
-                day_full_stop_landings, night_full_stop_landings,
-                approaches, holds, tracking,
-                instructor_user_id, instructor_snapshot, student_user_id, student_snapshot,
-                mirrored_from_entry_id, mirrored_from_user_id,
-                lesson_topic, ground_instruction,
-                maneuvers, remarks, safety_notes, safety_relevant,
-                status, signature, is_flight_review,
-                created_at, updated_at
-            FROM logbook_entries
-            WHERE instructor_user_id = %s
-              AND status = 'PENDING_SIGNATURE'
-              AND deleted_at IS NULL
-            ORDER BY date DESC
-        """, [user_id])
+        is_cfi = bool(user_item.get('pilotInfo', {}).get('isCfi', False))
+        print(f"[sync-pull] isCfi={is_cfi} for user {user_id}")
 
-        pending_signature_items = [format_entry(row) for row in cursor.fetchall()]
-        print(f"[sync-pull] Found {len(pending_signature_items)} pending signature requests")
+        if is_cfi:
+            cursor.execute("""
+                SELECT
+                    entry_id, user_id, date, aircraft, tail_number,
+                    route, route_legs, flight_types, total_time,
+                    pic, sic, dual_received, dual_given, solo,
+                    cross_country, night, actual_imc, simulated_instrument,
+                    day_takeoffs, day_landings, night_takeoffs, night_landings,
+                    day_full_stop_landings, night_full_stop_landings,
+                    approaches, holds, tracking,
+                    instructor_user_id, instructor_snapshot, student_user_id, student_snapshot,
+                    mirrored_from_entry_id, mirrored_from_user_id,
+                    lesson_topic, ground_instruction,
+                    maneuvers, remarks, safety_notes, safety_relevant,
+                    status, signature, is_flight_review,
+                    created_at, updated_at
+                FROM logbook_entries
+                WHERE instructor_user_id = %s
+                  AND user_id != %s
+                  AND status = 'PENDING_SIGNATURE'
+                  AND deleted_at IS NULL
+                ORDER BY date DESC
+            """, [user_id, user_id])
+            pending_signature_items = [format_entry(row) for row in cursor.fetchall()]
+        else:
+            pending_signature_items = []
+
+        print(f"[sync-pull] Found {len(pending_signature_items)} pending signature requests (isCfi={is_cfi})")
 
         conn.commit()
 

@@ -42,8 +42,8 @@ def handler(event, context):
             # Search by certificate number only
             filter_expression = Attr('pilotInfo.instructorCertificateNumber').eq(certificate_number)
         
-        # Scan users table with filter
-        response = users_table.scan(
+        # Scan users table with filter — paginate through all pages
+        scan_kwargs = dict(
             FilterExpression=filter_expression,
             ProjectionExpression='userId, #name, pilotInfo, city, #state',
             ExpressionAttributeNames={
@@ -51,8 +51,19 @@ def handler(event, context):
                 '#state': 'state'
             }
         )
+        items = []
+        while True:
+            response = users_table.scan(**scan_kwargs)
+            items.extend(response.get('Items', []))
+            # Stop as soon as we have a match — no need to keep scanning
+            if items:
+                break
+            last_key = response.get('LastEvaluatedKey')
+            if not last_key:
+                break
+            scan_kwargs['ExclusiveStartKey'] = last_key
         
-        items = response.get('Items', [])
+        print(f"[instructor-lookup] Scan complete — found {len(items)} matching item(s)")
         
         if not items:
             # No instructor found

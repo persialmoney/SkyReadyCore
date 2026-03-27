@@ -226,8 +226,11 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         
         # Instructor fields
         if 'instructorCertificates' in pilot_info and pilot_info['instructorCertificates'] is not None:
-            update_expression_parts.append("pilotInfo.instructorCertificates = :instructorCertificates")
-            expression_values[":instructorCertificates"] = pilot_info['instructorCertificates']
+            # Only write if non-empty, or if overwriting a previously non-empty list
+            # (prevents an empty [] from clobbering real cert data)
+            if pilot_info['instructorCertificates']:
+                update_expression_parts.append("pilotInfo.instructorCertificates = :instructorCertificates")
+                expression_values[":instructorCertificates"] = pilot_info['instructorCertificates']
         
         if 'instructorCertificateNumber' in pilot_info and pilot_info['instructorCertificateNumber'] is not None:
             update_expression_parts.append("pilotInfo.instructorCertificateNumber = :instructorCertificateNumber")
@@ -249,15 +252,26 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
             update_expression_parts.append("pilotInfo.instructorSnapshotDate = :instructorSnapshotDate")
             expression_values[":instructorSnapshotDate"] = pilot_info['instructorSnapshotDate']
 
-        # Auto-generate inviteCode if instructor certificates are set and inviteCode doesn't exist
+        # Auto-generate inviteCode any time an instructor has certs but no code yet
         existing_pilot_info = existing_user.get('pilotInfo', {})
         existing_invite_code = existing_pilot_info.get('inviteCode')
+        existing_instructor_certs = existing_pilot_info.get('instructorCertificates', [])
+        incoming_certs = pilot_info.get('instructorCertificates') or []
         
-        # If user is setting instructor certificates and doesn't have an invite code, generate one
-        if 'instructorCertificates' in pilot_info and pilot_info['instructorCertificates'] and not existing_invite_code:
+        # Generate if: no existing code AND (incoming certs non-empty OR existing certs non-empty)
+        effective_certs = incoming_certs if incoming_certs else existing_instructor_certs
+        if not existing_invite_code and effective_certs:
             new_invite_code = generate_invite_code()
             update_expression_parts.append("pilotInfo.inviteCode = :inviteCode")
             expression_values[":inviteCode"] = new_invite_code
+
+        # Derive and persist isCfi: true iff the user has effective instructor certs.
+        # This is always written so it stays in sync with the cert list even when
+        # the caller does not explicitly pass isCfi.
+        is_cfi = bool(effective_certs)
+        update_expression_parts.append("pilotInfo.isCfi = :isCfi")
+        expression_values[":isCfi"] = is_cfi
+        print(f"[UserUpdate] isCfi derived as {is_cfi} for user {user_id} (effective_certs={effective_certs})")
     
     # Build the update expression string
     if not update_expression_parts:

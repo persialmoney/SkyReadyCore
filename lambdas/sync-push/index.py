@@ -151,7 +151,19 @@ def handler(event, context):
         for entry in changes.get('logbookEntries', {}).get('created', []):
             try:
                 print(f"[sync-push] Creating entry: {entry.get('entryId')}")
-                
+
+                # Self-endorsement guard: a user cannot be both the entry owner and
+                # the instructor for the same entry. Strip instructor_user_id silently
+                # so the entry is saved but treated as un-endorsed.
+                if entry.get('instructorUserId') and entry.get('instructorUserId') == user_id:
+                    print(f"[sync-push] WARN: self-endorsement blocked for entry {entry.get('entryId')} "
+                          f"(user_id={user_id}). Stripping instructorUserId.")
+                    entry = dict(entry)
+                    entry['instructorUserId'] = None
+                    entry['instructorSnapshot'] = None
+                    if entry.get('status') == 'PENDING_SIGNATURE':
+                        entry['status'] = 'SAVED'
+
                 if entry.get('status') == 'SIGNED':
                     validate_signature_hash(entry)
                 
@@ -227,7 +239,17 @@ def handler(event, context):
             entry_data = update['data']
             
             print(f"[sync-push] Updating entry: {entry_id}")
-            
+
+            # Self-endorsement guard: strip instructor link if user is signing their own entry.
+            if entry_data.get('instructorUserId') and entry_data.get('instructorUserId') == user_id:
+                print(f"[sync-push] WARN: self-endorsement blocked for entry {entry_id} "
+                      f"(user_id={user_id}). Stripping instructorUserId.")
+                entry_data = dict(entry_data)
+                entry_data['instructorUserId'] = None
+                entry_data['instructorSnapshot'] = None
+                if entry_data.get('status') == 'PENDING_SIGNATURE':
+                    entry_data['status'] = 'SAVED'
+
             if entry_data.get('status') == 'SIGNED':
                 try:
                     validate_signature_hash(entry_data)
