@@ -180,13 +180,18 @@ def extract_csvs(zip_data: bytes) -> Tuple[List[str], List[str]]:
         print(f"[FAA-Airmen-Sync] ZIP contains: {names}")
 
         def read(filename: str) -> List[str]:
-            # The FAA sometimes capitalises or changes paths; match case-insensitively.
-            match = next((n for n in names if n.upper().endswith(filename.upper())), None)
+            # Match the exact basename case-insensitively so that NONPILOT_CERT.csv
+            # is never confused with PILOT_CERT.csv (both end with PILOT_CERT.csv).
+            target = filename.upper()
+            match = next(
+                (n for n in names if n.upper() == target or n.upper().endswith('/' + target)),
+                None,
+            )
             if not match:
                 raise ValueError(f"{filename} not found in FAA airmen ZIP (files: {names})")
             return zf.read(match).decode('latin-1', errors='replace').splitlines()
 
-        return read('BASIC.csv'), read('CERT.csv')
+        return read('PILOT_BASIC.csv'), read('PILOT_CERT.csv')
 
 
 def parse_basic(lines: List[str]) -> List[Dict[str, Any]]:
@@ -248,35 +253,39 @@ def parse_certs(lines: List[str]) -> List[Dict[str, Any]]:
     """
     Parse PILOT_CERT.csv rows into dicts ready for INSERT.
 
-    FAA PILOT_CERT.csv columns (0-indexed):
+    Actual FAA PILOT_CERT.csv columns (0-indexed), confirmed from live data:
       0  UNIQUE ID           — internal FAA DB key; links to PILOT_BASIC.csv
                                NOTE: this is NOT the airmen certificate number.
-                               The FAA explicitly does not release cert numbers.
-      1  RECORD TYPE
-      2  CERTIFICATE TYPE    ('F' = Flight Instructor)
-      3  CERTIFICATE LEVEL
-      4  CERTIFICATE EXPIRE DATE  — MMDDYYYY format (CFI only)
-      5  RATINGS             — up to 11 ratings, 10 chars each (e.g. 'A/ASEL    ')
+      1  FIRST NAME          — repeated from BASIC for convenience (not used here)
+      2  LAST NAME           — repeated from BASIC for convenience (not used here)
+      3  TYPE                — certificate type ('F' = Flight Instructor)
+      4  LEVEL               — certificate level (e.g. 'A', 'P', ' ')
+      5  EXPIRE DATE         — MMDDYYYY format (CFI only; blank for non-expiring certs)
+      6-16  RATING1..RATING11  — up to 11 ratings, e.g. 'F/ASME', 'F/INSTA'
+      17+   TYPERATING1..99    — type ratings (always empty for CFI rows)
     """
     rows = []
     for i, line in enumerate(lines):
         if i == 0 or not line.strip():
             continue
         fields = line.split(',')
-        if len(fields) < 2:
+        if len(fields) < 4:
             continue
         unique_id = fields[0].strip()
         if not unique_id:
             continue
-        record_type = fields[1].strip() if len(fields) > 1 else ''
-        cert_type   = fields[2].strip() if len(fields) > 2 else ''
+        cert_type = fields[3].strip() if len(fields) > 3 else ''
+        # Ratings are only in cols 6-16 (RATING1-11). Cap at 17 to exclude
+        # TYPERATING cols (17+) which are always empty for CFI rows.
+        ratings_parts = [fields[j].strip() for j in range(6, min(17, len(fields))) if fields[j].strip()]
+        ratings_raw = ' '.join(ratings_parts)
         rows.append({
             'unique_id':               unique_id,
-            'record_type':             record_type,
+            'record_type':             '',
             'certificate_type':        cert_type,
-            'certificate_level':       fields[3].strip() if len(fields) > 3 else '',
-            'certificate_expire_date': fields[4].strip() if len(fields) > 4 else '',
-            'ratings_raw':             fields[5].strip() if len(fields) > 5 else '',
+            'certificate_level':       fields[4].strip() if len(fields) > 4 else '',
+            'certificate_expire_date': fields[5].strip() if len(fields) > 5 else '',
+            'ratings_raw':             ratings_raw,
             'is_flight_instructor':    cert_type in FLIGHT_INSTRUCTOR_CERT_TYPES,
             # norm_cert_number is kept for schema compatibility but is derived from
             # UNIQUE_ID (internal FAA key), not the number on a pilot's certificate.
@@ -286,6 +295,74 @@ def parse_certs(lines: List[str]) -> List[Dict[str, Any]]:
 
 
 # ── DB writes ─────────────────────────────────────────────────────────────────
+
+_STAGING_BASIC_DDL = """
+    CREATE TABLE IF NOT EXISTS faa_airmen_basic_staging (
+        id                   BIGSERIAL PRIMARY KEY,
+        unique_id            TEXT NOT NULL,
+        first_middle_name    TEXT,
+        last_name_suffix     TEXT,
+        city                 TEXT,
+        state                TEXT,
+        country              TEXT,
+        medical_class        TEXT,
+        medical_date         TEXT,
+        norm_last_name       TEXT NOT NULL,
+        norm_first_name      TEXT NOT NULL,
+        raw_source_updated_at TIMESTAMPTZ
+    )
+"""
+
+_STAGING_CERTS_DDL = """
+    CREATE TABLE IF NOT EXISTS faa_airmen_certificates_staging (
+        id                       BIGSERIAL PRIMARY KEY,
+        unique_id                TEXT NOT NULL,
+        record_type              TEXT,
+        certificate_type         TEXT,
+        certificate_level        TEXT,
+        certificate_expire_date  TEXT,
+        ratings_raw              TEXT,
+        is_flight_instructor     BOOLEAN NOT NULL DEFAULT FALSE,
+        norm_cert_number         TEXT,
+        raw_source_updated_at    TIMESTAMPTZ
+    )
+"""
+
+
+def ensure_staging_tables(conn) -> None:
+    """
+    Create staging tables with proper BIGSERIAL ids if they don't exist.
+    Also fixes existing staging tables that have a broken id column (no sequence
+    default) — a side-effect of PostgreSQL's LIKE ... INCLUDING ALL not copying
+    sequence ownership.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(_STAGING_BASIC_DDL)
+        cur.execute(_STAGING_CERTS_DDL)
+        # Fix any existing id columns that have no default (broken LIKE copy)
+        for tbl in ('faa_airmen_basic_staging', 'faa_airmen_certificates_staging'):
+            cur.execute(
+                """
+                SELECT column_default FROM information_schema.columns
+                WHERE table_name = %s AND column_name = 'id'
+                """,
+                (tbl,),
+            )
+            row = cur.fetchone()
+            if row and not row[0]:
+                seq = f"{tbl}_id_seq"
+                cur.execute(f"CREATE SEQUENCE IF NOT EXISTS {seq}")
+                cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN id SET DEFAULT nextval('{seq}')")
+                cur.execute(f"ALTER SEQUENCE {seq} OWNED BY {tbl}.id")
+                print(f"[FAA-Airmen-Sync] Fixed missing id sequence on {tbl}")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"ensure_staging_tables failed: {e}") from e
+    finally:
+        cur.close()
+
 
 def bulk_insert_basic(conn, rows: List[Dict[str, Any]]) -> None:
     if not rows:
@@ -381,15 +458,43 @@ def atomic_swap(conn, basic_count: int, cert_count: int) -> None:
         cur.execute("ALTER TABLE faa_airmen_certificates_staging RENAME TO faa_airmen_certificates")
         cur.execute("DROP TABLE IF EXISTS faa_airmen_basic CASCADE")
         cur.execute("ALTER TABLE faa_airmen_basic_staging RENAME TO faa_airmen_basic")
-        # Recreate staging tables immediately so next run can write into them
+        # Recreate staging tables with explicit definitions so that BIGSERIAL id
+        # columns always get proper sequences. LIKE ... INCLUDING ALL does NOT
+        # transfer sequence ownership in PostgreSQL, leaving id with no default.
         cur.execute("""
-            CREATE TABLE faa_airmen_basic_staging
-                (LIKE faa_airmen_basic INCLUDING ALL)
+            CREATE TABLE faa_airmen_basic_staging (
+                id                   BIGSERIAL PRIMARY KEY,
+                unique_id            TEXT NOT NULL,
+                first_middle_name    TEXT,
+                last_name_suffix     TEXT,
+                city                 TEXT,
+                state                TEXT,
+                country              TEXT,
+                medical_class        TEXT,
+                medical_date         TEXT,
+                norm_last_name       TEXT NOT NULL,
+                norm_first_name      TEXT NOT NULL,
+                raw_source_updated_at TIMESTAMPTZ
+            )
         """)
+        cur.execute("CREATE INDEX ON faa_airmen_basic_staging (norm_last_name)")
+        cur.execute("CREATE INDEX ON faa_airmen_basic_staging (unique_id)")
         cur.execute("""
-            CREATE TABLE faa_airmen_certificates_staging
-                (LIKE faa_airmen_certificates INCLUDING ALL)
+            CREATE TABLE faa_airmen_certificates_staging (
+                id                       BIGSERIAL PRIMARY KEY,
+                unique_id                TEXT NOT NULL,
+                record_type              TEXT,
+                certificate_type         TEXT,
+                certificate_level        TEXT,
+                certificate_expire_date  TEXT,
+                ratings_raw              TEXT,
+                is_flight_instructor     BOOLEAN NOT NULL DEFAULT FALSE,
+                norm_cert_number         TEXT,
+                raw_source_updated_at    TIMESTAMPTZ
+            )
         """)
+        cur.execute("CREATE INDEX ON faa_airmen_certificates_staging (unique_id)")
+        cur.execute("CREATE INDEX ON faa_airmen_certificates_staging (is_flight_instructor, certificate_expire_date)")
         cur.execute(
             """
             INSERT INTO faa_ingest_metadata (id, source_snapshot_date, ingested_at,
@@ -435,6 +540,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         # 4. Write staging
         conn = _get_conn()
+        ensure_staging_tables(conn)
         bulk_insert_basic(conn, basic_rows)
         bulk_insert_certs(conn, cert_rows)
 

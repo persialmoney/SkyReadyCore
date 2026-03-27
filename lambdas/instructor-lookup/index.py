@@ -78,6 +78,7 @@ def handler(event, context):
             'instructorCertificates': instructor_certs,
             'instructorCertificateNumber': pilot_info.get('instructorCertificateNumber', ''),
             'instructorCertificateExpiration': pilot_info.get('instructorCertificateExpiration', ''),
+            'primaryAirport': pilot_info.get('primaryAirport'),
             'city': user.get('city', ''),
             'state': user.get('state', '')
         }

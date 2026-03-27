@@ -49,10 +49,26 @@ FAA_SOURCE_LABEL = 'FAA Airmen Certification Releasable Database'
 # In-app certificate labels → known FAA ratings substrings for secondary check.
 # If the user selected a cert type that should be present in ratings_raw but
 # is not found, we downgrade to partial.
+#
+# FAA PILOT_CERT RATING columns use the format LEVEL/CODE, e.g.:
+#   F/ASE   = Flight Instructor - Airplane Single Engine
+#   F/ASME  = Flight Instructor - Airplane Single & Multi Engine
+#   F/AME   = Flight Instructor - Airplane Multi Engine
+#   F/INSTA = Flight Instructor - Instrument Airplane
+#   F/INSTH = Flight Instructor - Instrument Helicopter
+#   F/HEL   = Flight Instructor - Helicopter
+#   F/GL    = Flight Instructor - Glider
+#   F/SPORT = Flight Instructor - Sport
+#   F/PLIFT = Flight Instructor - Powered Lift
+#   F/GYRO  = Flight Instructor - Gyroplane
+#
+# All CFI rows have ratings prefixed with "F/" so 'F/' is a reliable CFI marker.
+# CFII is indicated by INSTA/INSTH/INSTI/INSTP in the rating codes.
+# MEI is indicated by AME or ASME (which covers both single and multi).
 CERT_RATINGS_MAP = {
-    'CFI':  ['CFI', 'FLIGHT INSTRUCTOR', 'ASEL', 'AMEL', 'ASE', 'AME'],
-    'CFII': ['INST', 'INSTRUMENT'],
-    'MEI':  ['AMEL', 'AME', 'MULTI'],
+    'CFI':  ['F/'],          # any F/ prefixed rating confirms CFI authority
+    'CFII': ['INSTA', 'INSTH', 'INSTI', 'INSTP'],   # instrument ratings
+    'MEI':  ['AME', 'ASME'], # multi-engine (AME covers pure multi, ASME covers both)
 }
 
 

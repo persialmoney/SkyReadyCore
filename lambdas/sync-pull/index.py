@@ -269,6 +269,38 @@ def handler(event, context):
             else:
                 assessments_created.append(format_assessment(row))
 
+        # ========== PENDING SIGNATURE REQUESTS (PostgreSQL, cross-user) ==========
+        # Returns student-owned entries where this user is the named instructor
+        # and the entry is awaiting their signature. These are NOT the CFI's own
+        # logbook entries — they are surfaced as a separate read-only queue.
+
+        cursor.execute("""
+            SELECT
+                entry_id, user_id, date, aircraft, tail_number,
+                route, route_legs, flight_types, total_time,
+                pic, sic, dual_received, dual_given, solo,
+                cross_country, night, actual_imc, simulated_instrument,
+                day_takeoffs, day_landings, night_takeoffs, night_landings,
+                day_full_stop_landings, night_full_stop_landings,
+                approaches, holds, tracking,
+                instructor_user_id, instructor_snapshot, student_user_id, student_snapshot,
+                mirrored_from_entry_id, mirrored_from_user_id,
+                lesson_topic, ground_instruction,
+                maneuvers, remarks, safety_notes, safety_relevant,
+                status, signature, is_flight_review,
+                created_at, updated_at
+            FROM logbook_entries
+            WHERE instructor_user_id = %s
+              AND status = 'PENDING_SIGNATURE'
+              AND deleted_at IS NULL
+            ORDER BY date DESC
+        """, [user_id])
+
+        pending_signature_items = [format_entry(row) for row in cursor.fetchall()]
+        print(f"[sync-pull] Found {len(pending_signature_items)} pending signature requests")
+
+        conn.commit()
+
         # ========== PROFICIENCY SNAPSHOTS (PostgreSQL) ==========
         # Return snapshots whose computed_at > lastPulledAt so the client can
         # populate the historical chart on fresh install and receive recomputed
@@ -333,6 +365,9 @@ def handler(event, context):
                     'created': snapshots_created,
                     'deleted': [],
                 },
+                'pendingSignatureRequests': {
+                    'items': pending_signature_items,
+                },
             },
             'cursor': str(offset + len(rows)),
             'hasMore': len(rows) == limit,
@@ -346,7 +381,8 @@ def handler(event, context):
             f"missions({len(missions_created)}c/{len(missions_updated)}u/{len(missions_deleted)}d) "
             f"airports({len(airports_created)}c/{len(airports_deleted)}d) "
             f"assessments({len(assessments_created)}c/{len(assessments_deleted)}d) "
-            f"snapshots({len(snapshots_created)}c)"
+            f"snapshots({len(snapshots_created)}c) "
+            f"pendingSignatures({len(pending_signature_items)})"
         )
         return result
 
