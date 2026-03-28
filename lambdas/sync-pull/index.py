@@ -383,6 +383,38 @@ def handler(event, context):
                 })
             print(f"[sync-pull] Found {len(student_proficiency_shares)} student proficiency shares for CFI")
 
+        # ========== LINKED STUDENTS (cross-user, CFI only) ==========
+        # Return every student who has linked this CFI (regardless of sharing flag).
+        # student_snapshot carries the student's name and certificateType so the CFI
+        # can display a student list without looking up profiles individually.
+
+        linked_students = []
+        if is_cfi:
+            cursor.execute("""
+                SELECT student_id,
+                       sharing,
+                       student_snapshot,
+                       updated_at
+                FROM student_cfi_shares
+                WHERE cfi_user_id = %s
+                ORDER BY updated_at DESC
+            """, [user_id])
+            import json as _json
+            for row in cursor.fetchall():
+                snap = {}
+                try:
+                    snap = _json.loads(row[2]) if row[2] else {}
+                except Exception:
+                    snap = {}
+                linked_students.append({
+                    'studentUserId':         row[0],
+                    'sharing':               bool(row[1]),
+                    'studentName':           snap.get('name', ''),
+                    'studentCertificateType': snap.get('certificateType', ''),
+                    'linkedAt':              float(int(row[3].timestamp() * 1000)) if row[3] else 0.0,
+                })
+            print(f"[sync-pull] Found {len(linked_students)} linked students for CFI")
+
         conn.commit()
 
         # ========== PROFICIENCY SNAPSHOTS (PostgreSQL) ==========
@@ -455,6 +487,9 @@ def handler(event, context):
                 },
                 'studentProficiencyShares': {
                     'items': student_proficiency_shares,
+                },
+                'linkedStudents': {
+                    'items': linked_students,
                 },
             },
             'cursor': str(offset + len(rows)),

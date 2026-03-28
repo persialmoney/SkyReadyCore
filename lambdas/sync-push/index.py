@@ -871,16 +871,27 @@ def handler(event, context):
         for share in changes.get('studentCfiShares', {}).get('upserted', []):
             cfi_user_id = share.get('cfiUserId', '')
             sharing = bool(share.get('sharing', True))
+            student_name = share.get('studentName') or None
+            student_cert_type = share.get('studentCertificateType') or None
             if not cfi_user_id or cfi_user_id == user_id:
                 print(f"[sync-push] Skipping invalid studentCfiShare: cfiUserId={cfi_user_id}")
                 continue
             print(f"[sync-push] Upserting studentCfiShare: cfi={cfi_user_id} sharing={sharing}")
+            student_snapshot = None
+            if student_name or student_cert_type:
+                import json as _json
+                student_snapshot = _json.dumps({
+                    'name': student_name,
+                    'certificateType': student_cert_type,
+                })
             cursor.execute("""
-                INSERT INTO student_cfi_shares (student_id, cfi_user_id, sharing, updated_at)
-                VALUES (%s, %s, %s, NOW())
+                INSERT INTO student_cfi_shares (student_id, cfi_user_id, sharing, updated_at, student_snapshot)
+                VALUES (%s, %s, %s, NOW(), %s)
                 ON CONFLICT (student_id, cfi_user_id)
-                DO UPDATE SET sharing = EXCLUDED.sharing, updated_at = NOW()
-            """, [user_id, cfi_user_id, sharing])
+                DO UPDATE SET sharing = EXCLUDED.sharing,
+                              updated_at = NOW(),
+                              student_snapshot = COALESCE(EXCLUDED.student_snapshot, student_cfi_shares.student_snapshot)
+            """, [user_id, cfi_user_id, sharing, student_snapshot])
 
         conn.commit()
 
