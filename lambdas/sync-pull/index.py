@@ -409,6 +409,71 @@ def handler(event, context):
 
             print(f"[sync-pull] Found {len(student_proficiency_shares)} active / {len(revoked_student_ids)} revoked proficiency shares for CFI")
 
+        # ========== STUDENT SHARED LOGBOOK ENTRIES (cross-user, CFI only) ==========
+        # For students who are actively sharing data with this CFI, fetch their
+        # logbook entries that name this CFI as instructor.  These are merged into
+        # the regular logbookEntries payload so the client stores them in its local
+        # logbook_entries table and the InstructorStudentDetailScreen can query them.
+        # The WHERE clause mirrors the main logbook query's incremental filter so
+        # subsequent syncs only transfer new/updated rows.
+
+        if is_cfi:
+            sharing_student_ids_result = cursor.execute("""
+                SELECT student_id FROM student_cfi_shares
+                WHERE cfi_user_id = %s AND sharing = TRUE
+            """, [user_id])
+            sharing_student_ids = [r[0] for r in cursor.fetchall()]
+
+            if sharing_student_ids:
+                placeholders = ','.join(['%s'] * len(sharing_student_ids))
+                cursor.execute(f"""
+                    SELECT
+                        entry_id, user_id, date, aircraft, tail_number,
+                        route, route_legs, flight_types, total_time,
+                        pic, sic, dual_received, dual_given, solo,
+                        cross_country, night, actual_imc, simulated_instrument,
+                        day_takeoffs, day_landings, night_takeoffs, night_landings,
+                        day_full_stop_landings, night_full_stop_landings,
+                        approaches, holds, tracking,
+                        instructor_user_id, instructor_snapshot, student_user_id, student_snapshot,
+                        mirrored_from_entry_id, mirrored_from_user_id,
+                        lesson_topic, ground_instruction,
+                        maneuvers, remarks, safety_notes, safety_relevant,
+                        status, signature, is_flight_review,
+                        return_note,
+                        created_at, updated_at
+                    FROM logbook_entries
+                    WHERE instructor_user_id = %s
+                      AND user_id IN ({placeholders})
+                      AND deleted_at IS NULL
+                      AND (created_at > %s OR updated_at > %s)
+                    ORDER BY GREATEST(created_at, updated_at)
+                """, [user_id] + sharing_student_ids + [last_pulled_datetime, last_pulled_datetime])
+
+                for row in cursor.fetchall():
+                    entry_id = row[0]
+                    created_at = int(row[43].timestamp() * 1000)
+                    if created_at > last_pulled_at:
+                        created.append(format_entry(row))
+                    else:
+                        updated.append(format_entry(row))
+
+                # Also pick up student entries deleted since last pull so the CFI's
+                # local copy stays consistent.
+                cursor.execute(f"""
+                    SELECT entry_id FROM logbook_entries
+                    WHERE instructor_user_id = %s
+                      AND user_id IN ({placeholders})
+                      AND deleted_at IS NOT NULL
+                      AND deleted_at > %s
+                """, [user_id] + sharing_student_ids + [last_pulled_datetime])
+                for row in cursor.fetchall():
+                    eid = str(row[0])
+                    if eid not in deleted:
+                        deleted.append(eid)
+
+            print(f"[sync-pull] Added shared student logbook entries for {len(sharing_student_ids)} sharing students")
+
         # ========== LINKED STUDENTS (cross-user, CFI only) ==========
         # Return every student who has linked this CFI (regardless of sharing flag).
         # student_snapshot carries the student's name and certificateType so the CFI
@@ -525,7 +590,7 @@ def handler(event, context):
         }
 
         print(
-            f"[sync-pull] logbook({len(created)}c/{len(updated)}u/{len(deleted)}d) "
+            f"[sync-pull] logbook({len(created)}c/{len(updated)}u/{len(deleted)}d, includes cross-user shared entries) "
             f"profiles({len(profiles_created)}c/{len(profiles_updated)}u) "
             f"aircraft({len(aircraft_created)}c) "
             f"missions({len(missions_created)}c/{len(missions_updated)}u/{len(missions_deleted)}d) "
