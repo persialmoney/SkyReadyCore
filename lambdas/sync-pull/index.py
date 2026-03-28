@@ -278,6 +278,7 @@ def handler(event, context):
         print(f"[sync-pull] isCfi={is_cfi} for user {user_id}")
 
         if is_cfi:
+            # Active queue: entries still awaiting signature
             cursor.execute("""
                 SELECT
                     entry_id, user_id, date, aircraft, tail_number,
@@ -301,10 +302,26 @@ def handler(event, context):
                 ORDER BY date DESC
             """, [user_id, user_id])
             pending_signature_items = [format_entry(row) for row in cursor.fetchall()]
+
+            # Resolved queue: entries this CFI was listed on that have since moved to
+            # SIGNED or RETURNED since the last pull. The client uses this list to
+            # delete stale rows from its local pending_signature_requests table.
+            cursor.execute("""
+                SELECT entry_id
+                FROM logbook_entries
+                WHERE instructor_user_id = %s
+                  AND user_id != %s
+                  AND status IN ('SIGNED', 'RETURNED', 'VOIDED')
+                  AND deleted_at IS NULL
+                  AND updated_at > %s
+                ORDER BY updated_at DESC
+            """, [user_id, user_id, last_pulled_datetime])
+            resolved_entry_ids = [str(row[0]) for row in cursor.fetchall()]
         else:
             pending_signature_items = []
+            resolved_entry_ids = []
 
-        print(f"[sync-pull] Found {len(pending_signature_items)} pending signature requests (isCfi={is_cfi})")
+        print(f"[sync-pull] Found {len(pending_signature_items)} pending / {len(resolved_entry_ids)} resolved signature requests (isCfi={is_cfi})")
 
         conn.commit()
 
@@ -374,6 +391,7 @@ def handler(event, context):
                 },
                 'pendingSignatureRequests': {
                     'items': pending_signature_items,
+                    'resolvedEntryIds': resolved_entry_ids,
                 },
             },
             'cursor': str(offset + len(rows)),
@@ -389,7 +407,7 @@ def handler(event, context):
             f"airports({len(airports_created)}c/{len(airports_deleted)}d) "
             f"assessments({len(assessments_created)}c/{len(assessments_deleted)}d) "
             f"snapshots({len(snapshots_created)}c) "
-            f"pendingSignatures({len(pending_signature_items)})"
+            f"pendingSignatures({len(pending_signature_items)}) resolvedSignatures({len(resolved_entry_ids)})"
         )
         return result
 
