@@ -349,7 +349,9 @@ def handler(event, context):
         # Data is read directly from proficiency_snapshots — nothing is duplicated.
 
         student_proficiency_shares = []
+        revoked_student_ids = []
         if is_cfi:
+            # Active shares: students with sharing=TRUE — return their latest snapshot.
             cursor.execute("""
                 SELECT DISTINCT ON (ps.user_id)
                     ps.user_id,
@@ -381,7 +383,20 @@ def handler(event, context):
                     'activeDomains': row[12],
                     'computedAt':    float(int(row[13])),
                 })
-            print(f"[sync-pull] Found {len(student_proficiency_shares)} student proficiency shares for CFI")
+
+            # Revoked shares: students with sharing=FALSE whose updated_at > lastPulledAt.
+            # The CFI client must delete these from its local student_proficiency_shares cache.
+            cursor.execute("""
+                SELECT student_id
+                FROM student_cfi_shares
+                WHERE cfi_user_id = %s
+                  AND sharing = FALSE
+                  AND updated_at > to_timestamp(%s / 1000.0)
+            """, [user_id, last_pulled_at])
+            for row in cursor.fetchall():
+                revoked_student_ids.append(row[0])
+
+            print(f"[sync-pull] Found {len(student_proficiency_shares)} active / {len(revoked_student_ids)} revoked proficiency shares for CFI")
 
         # ========== LINKED STUDENTS (cross-user, CFI only) ==========
         # Return every student who has linked this CFI (regardless of sharing flag).
@@ -487,6 +502,7 @@ def handler(event, context):
                 },
                 'studentProficiencyShares': {
                     'items': student_proficiency_shares,
+                    'revokedStudentIds': revoked_student_ids,
                 },
                 'linkedStudents': {
                     'items': linked_students,
