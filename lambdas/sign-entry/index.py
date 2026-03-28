@@ -30,13 +30,31 @@ users_table = dynamodb.Table(os.environ.get('USERS_TABLE', 'sky-ready-users-dev'
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _js_number_str(value) -> str:
+    """
+    Replicate JavaScript's String(number) coercion.
+    JS drops the decimal point for whole numbers: String(2.0) === "2", not "2.0".
+    Python's str(2.0) === "2.0", so we must normalise here to match the client hash.
+    """
+    if value is None:
+        return ''
+    try:
+        f = float(value)
+        # Whole numbers: match JS behaviour (no trailing .0)
+        if f == int(f):
+            return str(int(f))
+        return str(f)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _validate_signature_hash(entry_id, date, total_time, instructor_snapshot, signature):
     """Re-verify client-computed hash to prevent tampering."""
     snap = instructor_snapshot or {}
     hash_input = '|'.join([
         str(entry_id),
         str(date),
-        str(total_time),
+        _js_number_str(total_time),
         snap.get('name', ''),
         snap.get('certificateNumber', ''),
         snap.get('actingAs', ''),

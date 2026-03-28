@@ -22,6 +22,23 @@ dynamodb = boto3.resource('dynamodb')
 users_table = dynamodb.Table(os.environ.get('USERS_TABLE', 'sky-ready-users-dev'))
 
 
+def _js_number_str(value) -> str:
+    """
+    Replicate JavaScript's String(number) coercion.
+    JS drops the decimal point for whole numbers: String(2.0) === "2", not "2.0".
+    Python's str(2.0) === "2.0", so normalise here to match the client hash.
+    """
+    if value is None:
+        return ''
+    try:
+        f = float(value)
+        if f == int(f):
+            return str(int(f))
+        return str(f)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def validate_signature_hash(entry):
     """
     Re-verify signature hash to prevent tampering.
@@ -35,7 +52,7 @@ def validate_signature_hash(entry):
     hash_input = '|'.join([
         str(entry.get('entryId', '')),
         str(entry.get('date', '')),
-        str(entry.get('totalTime', '')),
+        _js_number_str(entry.get('totalTime', '')),
         instructor_snapshot.get('name', ''),
         instructor_snapshot.get('certificateNumber', ''),
         instructor_snapshot.get('actingAs', ''),
