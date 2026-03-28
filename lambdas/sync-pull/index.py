@@ -386,13 +386,24 @@ def handler(event, context):
 
             # Revoked shares: students with sharing=FALSE whose updated_at > lastPulledAt.
             # The CFI client must delete these from its local student_proficiency_shares cache.
-            cursor.execute("""
-                SELECT student_id
-                FROM student_cfi_shares
-                WHERE cfi_user_id = %s
-                  AND sharing = FALSE
-                  AND updated_at > to_timestamp(%s / 1000.0)
-            """, [user_id, last_pulled_at])
+            #
+            # Edge-case: if lastPulledAt == 0 (full re-sync) drop the time filter so that
+            # any previously-revoked student is still cleaned up on the client.
+            if last_pulled_at == 0:
+                cursor.execute("""
+                    SELECT student_id
+                    FROM student_cfi_shares
+                    WHERE cfi_user_id = %s
+                      AND sharing = FALSE
+                """, [user_id])
+            else:
+                cursor.execute("""
+                    SELECT student_id
+                    FROM student_cfi_shares
+                    WHERE cfi_user_id = %s
+                      AND sharing = FALSE
+                      AND updated_at > to_timestamp(%s / 1000.0)
+                """, [user_id, last_pulled_at])
             for row in cursor.fetchall():
                 revoked_student_ids.append(row[0])
 

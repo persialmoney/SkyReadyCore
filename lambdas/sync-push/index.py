@@ -868,6 +868,10 @@ def handler(event, context):
         # Student explicitly opts in/out of sharing proficiency data with a specific CFI.
         # Self-link guard: reject cfi_user_id == caller's user_id.
 
+        # Track which CFI was affected so we can populate the AppSync subscription payload.
+        affected_cfi_user_id = None
+        affected_event_type = None
+
         for share in changes.get('studentCfiShares', {}).get('upserted', []):
             cfi_user_id = share.get('cfiUserId', '')
             sharing = bool(share.get('sharing', True))
@@ -893,13 +897,24 @@ def handler(event, context):
                               student_snapshot = COALESCE(EXCLUDED.student_snapshot, student_cfi_shares.student_snapshot)
             """, [user_id, cfi_user_id, sharing, student_snapshot])
 
+            # Capture the first affected CFI for the subscription event.
+            # eventType tells the CFI why they're being notified.
+            if affected_cfi_user_id is None:
+                affected_cfi_user_id = cfi_user_id
+                affected_event_type = 'sharingChanged' if not sharing else 'proficiencyUpdated'
+
         conn.commit()
 
         print(f"[sync-push] Success: {len(conflicts)} conflicts")
 
         return {
             'timestamp': timestamp,
-            'conflicts': conflicts
+            'conflicts': conflicts,
+            # Populated when a studentCfiShares row was processed — AppSync uses
+            # these fields to fan-out the cfiDataChanged subscription event to
+            # the affected CFI's connected clients.
+            'cfiUserId': affected_cfi_user_id,
+            'eventType': affected_event_type,
         }
 
     except Exception as e:
