@@ -270,242 +270,6 @@ def handler(event, context):
             else:
                 assessments_created.append(format_assessment(row))
 
-        # ========== PENDING SIGNATURE REQUESTS (PostgreSQL, cross-user) ==========
-        # Only run this query for users who are confirmed CFIs (isCfi flag in DynamoDB).
-        # A non-CFI user should never receive cross-user entries here — this also
-        # prevents the self-endorsement loop where a single account owns both sides.
-
-        pilot_info = user_item.get('pilotInfo', {}) or {}
-        # Mirror the client fallback: treat user as CFI if isCfi is True OR if they
-        # have any instructor certificates (covers accounts where isCfi hasn't propagated yet).
-        is_cfi = bool(pilot_info.get('isCfi', False)) or bool(pilot_info.get('instructorCertificates'))
-        print(f"[sync-pull] isCfi={is_cfi} for user {user_id}")
-
-        if is_cfi:
-            # Active queue: entries still awaiting signature
-            cursor.execute("""
-                SELECT
-                    entry_id, user_id, date, aircraft, tail_number,
-                    route, route_legs, flight_types, total_time,
-                    pic, sic, dual_received, dual_given, solo,
-                    cross_country, night, actual_imc, simulated_instrument,
-                    day_takeoffs, day_landings, night_takeoffs, night_landings,
-                    day_full_stop_landings, night_full_stop_landings,
-                    approaches, holds, tracking,
-                    instructor_user_id, instructor_snapshot, student_user_id, student_snapshot,
-                    mirrored_from_entry_id, mirrored_from_user_id,
-                    lesson_topic, ground_instruction,
-                    maneuvers, remarks, safety_notes, safety_relevant,
-                    status, signature, is_flight_review,
-                    return_note,
-                    created_at, updated_at
-                FROM logbook_entries
-                WHERE instructor_user_id = %s
-                  AND user_id != %s
-                  AND status = 'PENDING_SIGNATURE'
-                  AND deleted_at IS NULL
-                ORDER BY date DESC
-            """, [user_id, user_id])
-            pending_signature_items = [format_entry(row) for row in cursor.fetchall()]
-
-            # Resolved queue: entries this CFI was listed on that have since moved to
-            # SIGNED or RETURNED since the last pull. The client uses this list to
-            # delete stale rows from its local pending_signature_requests table.
-            cursor.execute("""
-                SELECT entry_id
-                FROM logbook_entries
-                WHERE instructor_user_id = %s
-                  AND user_id != %s
-                  AND status IN ('SIGNED', 'RETURNED', 'VOIDED')
-                  AND deleted_at IS NULL
-                  AND updated_at > %s
-                ORDER BY updated_at DESC
-            """, [user_id, user_id, last_pulled_datetime])
-            resolved_entry_ids = [str(row[0]) for row in cursor.fetchall()]
-
-            # Also include entries that the student deleted while in PENDING_SIGNATURE
-            # status. These never transition to SIGNED/RETURNED, so we detect them
-            # via deleted_at being set. Client destroys the matching pending row.
-            cursor.execute("""
-                SELECT entry_id
-                FROM logbook_entries
-                WHERE instructor_user_id = %s
-                  AND user_id != %s
-                  AND deleted_at IS NOT NULL
-                  AND deleted_at > %s
-                ORDER BY deleted_at DESC
-            """, [user_id, user_id, last_pulled_datetime])
-            deleted_entry_ids = [str(row[0]) for row in cursor.fetchall()]
-            resolved_entry_ids = resolved_entry_ids + deleted_entry_ids
-        else:
-            pending_signature_items = []
-            resolved_entry_ids = []
-
-        print(f"[sync-pull] Found {len(pending_signature_items)} pending / {len(resolved_entry_ids)} resolved signature requests (isCfi={is_cfi})")
-
-        # ========== STUDENT PROFICIENCY SHARES (cross-user, CFI only) ==========
-        # For each student who has explicitly consented to share proficiency data
-        # with this CFI (via student_cfi_shares), return their latest snapshot.
-        # Data is read directly from proficiency_snapshots — nothing is duplicated.
-
-        student_proficiency_shares = []
-        revoked_student_ids = []
-        if is_cfi:
-            # Active shares: students with sharing=TRUE — return their latest snapshot.
-            cursor.execute("""
-                SELECT DISTINCT ON (ps.user_id)
-                    ps.user_id,
-                    ps.snapshot_date, ps.score,
-                    ps.recency, ps.exposure, ps.envelope, ps.consistency,
-                    ps.score_core_vfr, ps.score_night, ps.score_ifr,
-                    ps.score_tailwheel, ps.score_multi,
-                    ps.active_domains, ps.computed_at
-                FROM student_cfi_shares scs
-                JOIN proficiency_snapshots ps ON ps.user_id = scs.student_id
-                WHERE scs.cfi_user_id = %s
-                  AND scs.sharing = TRUE
-                ORDER BY ps.user_id, ps.snapshot_date DESC
-            """, [user_id])
-            for row in cursor.fetchall():
-                student_proficiency_shares.append({
-                    'studentUserId': row[0],
-                    'snapshotDate':  row[1],
-                    'score':         int(row[2]),
-                    'recency':       int(row[3]),
-                    'exposure':      int(row[4]),
-                    'envelope':      int(row[5]),
-                    'consistency':   int(row[6]),
-                    'scoreCoreVfr':  int(row[7]) if row[7] is not None else None,
-                    'scoreNight':    int(row[8]) if row[8] is not None else None,
-                    'scoreIfr':      int(row[9]) if row[9] is not None else None,
-                    'scoreTailwheel': int(row[10]) if row[10] is not None else None,
-                    'scoreMulti':    int(row[11]) if row[11] is not None else None,
-                    'activeDomains': row[12],
-                    'computedAt':    float(int(row[13])),
-                })
-
-            # Revoked shares: students with sharing=FALSE whose updated_at > lastPulledAt.
-            # The CFI client must delete these from its local student_proficiency_shares cache.
-            #
-            # Edge-case: if lastPulledAt == 0 (full re-sync) drop the time filter so that
-            # any previously-revoked student is still cleaned up on the client.
-            if last_pulled_at == 0:
-                cursor.execute("""
-                    SELECT student_id
-                    FROM student_cfi_shares
-                    WHERE cfi_user_id = %s
-                      AND sharing = FALSE
-                """, [user_id])
-            else:
-                cursor.execute("""
-                    SELECT student_id
-                    FROM student_cfi_shares
-                    WHERE cfi_user_id = %s
-                      AND sharing = FALSE
-                      AND updated_at > to_timestamp(%s / 1000.0)
-                """, [user_id, last_pulled_at])
-            for row in cursor.fetchall():
-                revoked_student_ids.append(row[0])
-
-            print(f"[sync-pull] Found {len(student_proficiency_shares)} active / {len(revoked_student_ids)} revoked proficiency shares for CFI")
-
-        # ========== STUDENT SHARED LOGBOOK ENTRIES (cross-user, CFI only) ==========
-        # For students who are actively sharing data with this CFI, fetch their
-        # logbook entries that name this CFI as instructor.  These are merged into
-        # the regular logbookEntries payload so the client stores them in its local
-        # logbook_entries table and the InstructorStudentDetailScreen can query them.
-        # The WHERE clause mirrors the main logbook query's incremental filter so
-        # subsequent syncs only transfer new/updated rows.
-
-        if is_cfi:
-            sharing_student_ids_result = cursor.execute("""
-                SELECT student_id FROM student_cfi_shares
-                WHERE cfi_user_id = %s AND sharing = TRUE
-            """, [user_id])
-            sharing_student_ids = [r[0] for r in cursor.fetchall()]
-
-            if sharing_student_ids:
-                placeholders = ','.join(['%s'] * len(sharing_student_ids))
-                cursor.execute(f"""
-                    SELECT
-                        entry_id, user_id, date, aircraft, tail_number,
-                        route, route_legs, flight_types, total_time,
-                        pic, sic, dual_received, dual_given, solo,
-                        cross_country, night, actual_imc, simulated_instrument,
-                        day_takeoffs, day_landings, night_takeoffs, night_landings,
-                        day_full_stop_landings, night_full_stop_landings,
-                        approaches, holds, tracking,
-                        instructor_user_id, instructor_snapshot, student_user_id, student_snapshot,
-                        mirrored_from_entry_id, mirrored_from_user_id,
-                        lesson_topic, ground_instruction,
-                        maneuvers, remarks, safety_notes, safety_relevant,
-                        status, signature, is_flight_review,
-                        return_note,
-                        created_at, updated_at
-                    FROM logbook_entries
-                    WHERE instructor_user_id = %s
-                      AND user_id IN ({placeholders})
-                      AND deleted_at IS NULL
-                      AND (created_at > %s OR updated_at > %s)
-                    ORDER BY GREATEST(created_at, updated_at)
-                """, [user_id] + sharing_student_ids + [last_pulled_datetime, last_pulled_datetime])
-
-                for row in cursor.fetchall():
-                    entry_id = row[0]
-                    created_at = int(row[43].timestamp() * 1000)
-                    if created_at > last_pulled_at:
-                        created.append(format_entry(row))
-                    else:
-                        updated.append(format_entry(row))
-
-                # Also pick up student entries deleted since last pull so the CFI's
-                # local copy stays consistent.
-                cursor.execute(f"""
-                    SELECT entry_id FROM logbook_entries
-                    WHERE instructor_user_id = %s
-                      AND user_id IN ({placeholders})
-                      AND deleted_at IS NOT NULL
-                      AND deleted_at > %s
-                """, [user_id] + sharing_student_ids + [last_pulled_datetime])
-                for row in cursor.fetchall():
-                    eid = str(row[0])
-                    if eid not in deleted:
-                        deleted.append(eid)
-
-            print(f"[sync-pull] Added shared student logbook entries for {len(sharing_student_ids)} sharing students")
-
-        # ========== LINKED STUDENTS (cross-user, CFI only) ==========
-        # Return every student who has linked this CFI (regardless of sharing flag).
-        # student_snapshot carries the student's name and certificateType so the CFI
-        # can display a student list without looking up profiles individually.
-
-        linked_students = []
-        if is_cfi:
-            cursor.execute("""
-                SELECT student_id,
-                       sharing,
-                       student_snapshot,
-                       updated_at
-                FROM student_cfi_shares
-                WHERE cfi_user_id = %s
-                ORDER BY updated_at DESC
-            """, [user_id])
-            import json as _json
-            for row in cursor.fetchall():
-                snap = {}
-                try:
-                    snap = _json.loads(row[2]) if row[2] else {}
-                except Exception:
-                    snap = {}
-                linked_students.append({
-                    'studentUserId':         row[0],
-                    'sharing':               bool(row[1]),
-                    'studentName':           snap.get('name', ''),
-                    'studentCertificateType': snap.get('certificateType', ''),
-                    'linkedAt':              float(int(row[3].timestamp() * 1000)) if row[3] else 0.0,
-                })
-            print(f"[sync-pull] Found {len(linked_students)} linked students for CFI")
-
         conn.commit()
 
         # ========== PROFICIENCY SNAPSHOTS (PostgreSQL) ==========
@@ -572,17 +336,6 @@ def handler(event, context):
                     'created': snapshots_created,
                     'deleted': [],
                 },
-                'pendingSignatureRequests': {
-                    'items': pending_signature_items,
-                    'resolvedEntryIds': resolved_entry_ids,
-                },
-                'studentProficiencyShares': {
-                    'items': student_proficiency_shares,
-                    'revokedStudentIds': revoked_student_ids,
-                },
-                'linkedStudents': {
-                    'items': linked_students,
-                },
             },
             'cursor': str(offset + len(rows)),
             'hasMore': len(rows) == limit,
@@ -590,14 +343,13 @@ def handler(event, context):
         }
 
         print(
-            f"[sync-pull] logbook({len(created)}c/{len(updated)}u/{len(deleted)}d, includes cross-user shared entries) "
+            f"[sync-pull] logbook({len(created)}c/{len(updated)}u/{len(deleted)}d) "
             f"profiles({len(profiles_created)}c/{len(profiles_updated)}u) "
             f"aircraft({len(aircraft_created)}c) "
             f"missions({len(missions_created)}c/{len(missions_updated)}u/{len(missions_deleted)}d) "
             f"airports({len(airports_created)}c/{len(airports_deleted)}d) "
             f"assessments({len(assessments_created)}c/{len(assessments_deleted)}d) "
-            f"snapshots({len(snapshots_created)}c) "
-            f"pendingSignatures({len(pending_signature_items)}) resolvedSignatures({len(resolved_entry_ids)})"
+            f"snapshots({len(snapshots_created)}c)"
         )
         return result
 
