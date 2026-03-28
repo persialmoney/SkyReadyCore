@@ -63,6 +63,7 @@ def handler(event, context):
                 lesson_topic, ground_instruction,
                 maneuvers, remarks, safety_notes, safety_relevant,
                 status, signature, is_flight_review,
+                return_note,
                 created_at, updated_at
             FROM logbook_entries
             WHERE user_id = %s
@@ -82,8 +83,8 @@ def handler(event, context):
         
         for row in rows:
             entry_id = row[0]
-            created_at = int(row[42].timestamp() * 1000)
-            updated_at = int(row[43].timestamp() * 1000) if row[43] else created_at
+            created_at = int(row[43].timestamp() * 1000)
+            updated_at = int(row[44].timestamp() * 1000) if row[44] else created_at
             
             if created_at > last_pulled_at:
                 created.append(format_entry(row))
@@ -296,6 +297,7 @@ def handler(event, context):
                     lesson_topic, ground_instruction,
                     maneuvers, remarks, safety_notes, safety_relevant,
                     status, signature, is_flight_review,
+                    return_note,
                     created_at, updated_at
                 FROM logbook_entries
                 WHERE instructor_user_id = %s
@@ -479,8 +481,9 @@ def format_entry(row):
         'status': row[39],
         'signature': row[40],
         'isFlightReview': bool(row[41]) if row[41] is not None else False,
-        'createdAt': float(int(row[42].timestamp() * 1000)),
-        'updatedAt': float(int(row[43].timestamp() * 1000)) if row[43] else float(int(row[42].timestamp() * 1000)),
+        'returnNote': row[42],
+        'createdAt': float(int(row[43].timestamp() * 1000)),
+        'updatedAt': float(int(row[44].timestamp() * 1000)) if row[44] else float(int(row[43].timestamp() * 1000)),
     }
 
 def format_minimums_profile(profile):
