@@ -179,6 +179,17 @@ def handler(event, context):
                 snap['name'] = pushing_user_name
             return snap if snap else None
 
+        # Pre-scan: check if this push includes any PENDING_SIGNATURE entry targeting a CFI.
+        # We record it here so the subscription payload can be set after all entries are written.
+        # Uses the first valid entry found (same "first CFI" policy as studentCfiShares).
+        _pending_sig_cfi_id = None
+        for _e in list(changes.get('logbookEntries', {}).get('created', [])) + \
+                  list(changes.get('logbookEntries', {}).get('updated', [])):
+            if _e.get('status') == 'PENDING_SIGNATURE' and _e.get('instructorUserId') \
+                    and _e.get('instructorUserId') != user_id:
+                _pending_sig_cfi_id = _e.get('instructorUserId')
+                break
+
         # ========== LOGBOOK ENTRIES (PostgreSQL) ==========
         
         # Process created entries
@@ -869,8 +880,23 @@ def handler(event, context):
         # Self-link guard: reject cfi_user_id == caller's user_id.
 
         # Track which CFI was affected so we can populate the AppSync subscription payload.
+        # Initialised here so both proficiency snapshot and studentCfiShares blocks can set it.
         affected_cfi_user_id = None
         affected_event_type = None
+
+        # If the student pushed new proficiency snapshots and is actively sharing with a CFI,
+        # notify that CFI via cfiDataChanged so they see updated scores immediately.
+        if changes.get('proficiencySnapshots', {}).get('upserted'):
+            cursor.execute("""
+                SELECT cfi_user_id FROM student_cfi_shares
+                WHERE student_id = %s AND sharing = TRUE
+                LIMIT 1
+            """, [user_id])
+            row = cursor.fetchone()
+            if row:
+                affected_cfi_user_id = row[0]
+                affected_event_type = 'proficiencyUpdated'
+                print(f"[sync-push] Proficiency snapshot will notify CFI: {affected_cfi_user_id}")
 
         for share in changes.get('studentCfiShares', {}).get('upserted', []):
             cfi_user_id = share.get('cfiUserId', '')
@@ -902,6 +928,12 @@ def handler(event, context):
             if affected_cfi_user_id is None:
                 affected_cfi_user_id = cfi_user_id
                 affected_event_type = 'sharingChanged' if not sharing else 'proficiencyUpdated'
+
+        # If no sharing/proficiency event set a CFI yet, check for a pending signature request.
+        if affected_cfi_user_id is None and _pending_sig_cfi_id:
+            affected_cfi_user_id = _pending_sig_cfi_id
+            affected_event_type = 'signatureRequested'
+            print(f"[sync-push] Signature request will notify CFI: {affected_cfi_user_id}")
 
         conn.commit()
 
