@@ -235,6 +235,7 @@ def handle_sign_entry(event):
     args = event['arguments']
     entry_id = args['entryId']
     sig_input = args['signature']
+    create_mirror = bool(args.get('createMirror', False))
 
     print(f"[sign-entry] signEntry called by {cfi_user_id} for entry {entry_id}")
 
@@ -262,9 +263,13 @@ def handle_sign_entry(event):
             WHERE entry_id = %s AND deleted_at IS NULL
         """, [Jsonb(sig_input), entry_id])
 
-        # Create the CFI's own dual-given mirror entry
+        # Optionally create the CFI's own dual-given mirror entry.
+        # The CFI chooses at signing time via the createMirror argument.
         student_user_id = str(row[1])  # entry owner = student
-        _create_cfi_mirror_entry(cursor, row, student_user_id)
+        if create_mirror:
+            _create_cfi_mirror_entry(cursor, row, student_user_id)
+        else:
+            print(f"[sign-entry] Mirror skipped for entry {entry_id} (createMirror=False)")
 
         conn.commit()
 

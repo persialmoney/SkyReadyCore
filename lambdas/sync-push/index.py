@@ -154,6 +154,15 @@ def handler(event, context):
     # For TIMESTAMPTZ (logbook) conflict checks we need epoch seconds via // 1000.
     last_pulled_at = event['arguments'].get('lastPulledAt', 0) or 0  # epoch ms
 
+    # Look up the pushing user's own name once so we can inject it into
+    # student_snapshot for PENDING_SIGNATURE entries (clients never send their own snapshot).
+    pushing_user_name: str | None = None
+    try:
+        user_resp = users_table.get_item(Key={'userId': user_id}, ProjectionExpression='#n', ExpressionAttributeNames={'#n': 'name'})
+        pushing_user_name = user_resp.get('Item', {}).get('name')
+    except Exception as e:
+        print(f"[sync-push] Warning: could not fetch pushing user name: {e}")
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -162,6 +171,14 @@ def handler(event, context):
         timestamp_ms = int(time.time() * 1000)   # epoch ms — used for DB BIGINT columns
         timestamp = float(timestamp_ms)           # float so AppSync serializes as JSON Float, not Long
         
+        def build_student_snapshot(entry_or_data: dict) -> dict | None:
+            """Return a student_snapshot with name filled in from DynamoDB if the client didn't send one."""
+            snap = entry_or_data.get('studentSnapshot') or {}
+            if not snap.get('name') and pushing_user_name:
+                snap = dict(snap)
+                snap['name'] = pushing_user_name
+            return snap if snap else None
+
         # ========== LOGBOOK ENTRIES (PostgreSQL) ==========
         
         # Process created entries
@@ -222,7 +239,7 @@ def handler(event, context):
                     entry.get('nightFullStopLandings', 0), entry.get('approaches', 0),
                     entry.get('holds', False), entry.get('tracking', False),
                     entry.get('instructorUserId'), Jsonb(entry.get('instructorSnapshot')),
-                    entry.get('studentUserId'), Jsonb(entry.get('studentSnapshot')),
+                    entry.get('studentUserId'), Jsonb(build_student_snapshot(entry)),
                     entry.get('lessonTopic'), entry.get('groundInstruction', 0),
                     entry.get('maneuvers', []), entry.get('remarks'),
                     entry.get('safetyNotes'), entry.get('safetyRelevant', False),
@@ -330,7 +347,7 @@ def handler(event, context):
                 entry_data.get('approaches', 0), entry_data.get('holds', False),
                 entry_data.get('tracking', False),
                 entry_data.get('instructorUserId'), Jsonb(entry_data.get('instructorSnapshot')),
-                entry_data.get('studentUserId'), Jsonb(entry_data.get('studentSnapshot')),
+                entry_data.get('studentUserId'), Jsonb(build_student_snapshot(entry_data)),
                 entry_data.get('lessonTopic'), entry_data.get('groundInstruction', 0),
                 entry_data.get('maneuvers', []),
                 entry_data.get('remarks'), entry_data.get('safetyNotes'),
@@ -846,6 +863,24 @@ def handler(event, context):
                 snap.get('activeDomains'),
                 int(snap.get('computedAt', timestamp_ms)),
             ])
+
+        # ========== STUDENT CFI SHARES (consent) ==========
+        # Student explicitly opts in/out of sharing proficiency data with a specific CFI.
+        # Self-link guard: reject cfi_user_id == caller's user_id.
+
+        for share in changes.get('studentCfiShares', {}).get('upserted', []):
+            cfi_user_id = share.get('cfiUserId', '')
+            sharing = bool(share.get('sharing', True))
+            if not cfi_user_id or cfi_user_id == user_id:
+                print(f"[sync-push] Skipping invalid studentCfiShare: cfiUserId={cfi_user_id}")
+                continue
+            print(f"[sync-push] Upserting studentCfiShare: cfi={cfi_user_id} sharing={sharing}")
+            cursor.execute("""
+                INSERT INTO student_cfi_shares (student_id, cfi_user_id, sharing, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (student_id, cfi_user_id)
+                DO UPDATE SET sharing = EXCLUDED.sharing, updated_at = NOW()
+            """, [user_id, cfi_user_id, sharing])
 
         conn.commit()
 

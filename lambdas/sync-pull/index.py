@@ -322,11 +322,66 @@ def handler(event, context):
                 ORDER BY updated_at DESC
             """, [user_id, user_id, last_pulled_datetime])
             resolved_entry_ids = [str(row[0]) for row in cursor.fetchall()]
+
+            # Also include entries that the student deleted while in PENDING_SIGNATURE
+            # status. These never transition to SIGNED/RETURNED, so we detect them
+            # via deleted_at being set. Client destroys the matching pending row.
+            cursor.execute("""
+                SELECT entry_id
+                FROM logbook_entries
+                WHERE instructor_user_id = %s
+                  AND user_id != %s
+                  AND deleted_at IS NOT NULL
+                  AND deleted_at > %s
+                ORDER BY deleted_at DESC
+            """, [user_id, user_id, last_pulled_datetime])
+            deleted_entry_ids = [str(row[0]) for row in cursor.fetchall()]
+            resolved_entry_ids = resolved_entry_ids + deleted_entry_ids
         else:
             pending_signature_items = []
             resolved_entry_ids = []
 
         print(f"[sync-pull] Found {len(pending_signature_items)} pending / {len(resolved_entry_ids)} resolved signature requests (isCfi={is_cfi})")
+
+        # ========== STUDENT PROFICIENCY SHARES (cross-user, CFI only) ==========
+        # For each student who has explicitly consented to share proficiency data
+        # with this CFI (via student_cfi_shares), return their latest snapshot.
+        # Data is read directly from proficiency_snapshots — nothing is duplicated.
+
+        student_proficiency_shares = []
+        if is_cfi:
+            cursor.execute("""
+                SELECT DISTINCT ON (ps.user_id)
+                    ps.user_id,
+                    ps.snapshot_date, ps.score,
+                    ps.recency, ps.exposure, ps.envelope, ps.consistency,
+                    ps.score_core_vfr, ps.score_night, ps.score_ifr,
+                    ps.score_tailwheel, ps.score_multi,
+                    ps.active_domains, ps.computed_at
+                FROM student_cfi_shares scs
+                JOIN proficiency_snapshots ps ON ps.user_id = scs.student_id
+                WHERE scs.cfi_user_id = %s
+                  AND scs.sharing = TRUE
+                ORDER BY ps.user_id, ps.snapshot_date DESC
+            """, [user_id])
+            for row in cursor.fetchall():
+                student_proficiency_shares.append({
+                    'studentUserId': row[0],
+                    'snapshotDate':  row[1],
+                    'score':         int(row[2]),
+                    'recency':       int(row[3]),
+                    'exposure':      int(row[4]),
+                    'envelope':      int(row[5]),
+                    'consistency':   int(row[6]),
+                    'scoreCoreVfr':  int(row[7]) if row[7] is not None else None,
+                    'scoreNight':    int(row[8]) if row[8] is not None else None,
+                    'scoreIfr':      int(row[9]) if row[9] is not None else None,
+                    'scoreTailwheel': int(row[10]) if row[10] is not None else None,
+                    'scoreMulti':    int(row[11]) if row[11] is not None else None,
+                    'activeDomains': row[12],
+                    'computedAt':    float(int(row[13])),
+                })
+            print(f"[sync-pull] Found {len(student_proficiency_shares)} student proficiency shares for CFI")
 
         conn.commit()
 
@@ -397,6 +452,9 @@ def handler(event, context):
                 'pendingSignatureRequests': {
                     'items': pending_signature_items,
                     'resolvedEntryIds': resolved_entry_ids,
+                },
+                'studentProficiencyShares': {
+                    'items': student_proficiency_shares,
                 },
             },
             'cursor': str(offset + len(rows)),
