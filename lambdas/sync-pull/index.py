@@ -274,7 +274,10 @@ def handler(event, context):
         # A non-CFI user should never receive cross-user entries here — this also
         # prevents the self-endorsement loop where a single account owns both sides.
 
-        is_cfi = bool(user_item.get('pilotInfo', {}).get('isCfi', False))
+        pilot_info = user_item.get('pilotInfo', {}) or {}
+        # Mirror the client fallback: treat user as CFI if isCfi is True OR if they
+        # have any instructor certificates (covers accounts where isCfi hasn't propagated yet).
+        is_cfi = bool(pilot_info.get('isCfi', False)) or bool(pilot_info.get('instructorCertificates'))
         print(f"[sync-pull] isCfi={is_cfi} for user {user_id}")
 
         if is_cfi:
