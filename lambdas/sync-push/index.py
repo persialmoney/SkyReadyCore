@@ -906,7 +906,15 @@ def handler(event, context):
             if not cfi_user_id or cfi_user_id == user_id:
                 print(f"[sync-push] Skipping invalid studentCfiShare: cfiUserId={cfi_user_id}")
                 continue
-            print(f"[sync-push] Upserting studentCfiShare: cfi={cfi_user_id} sharing={sharing}")
+
+            # Fall back to the DynamoDB name if the client didn't send one.
+            # This covers the case where the Apollo cache was empty on the client
+            # (e.g. app cold-started directly into the sharing screen).
+            if not student_name and pushing_user_name:
+                student_name = pushing_user_name
+                print(f"[sync-push] studentName missing from payload; falling back to DynamoDB name: {repr(student_name)}")
+
+            print(f"[sync-push] Upserting studentCfiShare: cfi={cfi_user_id} sharing={sharing} studentName={repr(student_name)} certType={repr(student_cert_type)}")
             student_snapshot = None
             if student_name or student_cert_type:
                 import json as _json
@@ -914,6 +922,7 @@ def handler(event, context):
                     'name': student_name,
                     'certificateType': student_cert_type,
                 })
+            print(f"[sync-push] student_snapshot to write: {repr(student_snapshot)}")
             cursor.execute("""
                 INSERT INTO student_cfi_shares (student_id, cfi_user_id, sharing, updated_at, student_snapshot)
                 VALUES (%s, %s, %s, NOW(), %s)

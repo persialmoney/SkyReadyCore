@@ -123,21 +123,40 @@ def handler(event, context):
         # ── 2. Linked students ───────────────────────────────────────────────
         # Every student who has a student_cfi_shares row for this CFI,
         # regardless of whether sharing is currently enabled.
+        # Falls back to the student_snapshot on any logbook entry they have
+        # submitted to this CFI when the shares row snapshot is NULL.
 
         cursor.execute("""
             SELECT
                 s.student_id,
                 s.sharing,
                 s.student_snapshot,
-                s.updated_at
+                s.updated_at,
+                (
+                    SELECT le.student_snapshot
+                    FROM logbook_entries le
+                    WHERE le.user_id = s.student_id
+                      AND le.instructor_user_id = %s
+                      AND le.student_snapshot IS NOT NULL
+                    ORDER BY le.updated_at DESC
+                    LIMIT 1
+                ) AS entry_student_snapshot
             FROM student_cfi_shares s
             WHERE s.cfi_user_id = %s
             ORDER BY s.updated_at DESC
-        """, [user_id])
+        """, [user_id, user_id])
 
         linked_students = []
         for row in cursor.fetchall():
-            snap = row[2] or {}
+            raw_snap = row[2] or row[4]  # prefer shares snapshot, fall back to entry snapshot
+            print(f"[cfi-dashboard] student_snapshot raw type={type(raw_snap).__name__} value={repr(raw_snap)}")
+            snap = raw_snap if isinstance(raw_snap, dict) else {}
+            if isinstance(raw_snap, str):
+                try:
+                    import json as _json
+                    snap = _json.loads(raw_snap)
+                except Exception as parse_err:
+                    print(f"[cfi-dashboard] Failed to parse student_snapshot string: {parse_err}")
             linked_students.append({
                 'studentUserId':          row[0],
                 'studentName':            snap.get('name') or 'Unknown',
@@ -145,6 +164,7 @@ def handler(event, context):
                 'sharing':                bool(row[1]),
                 'linkedAt':               float(int(row[3].timestamp() * 1000)) if row[3] else 0.0,
             })
+            print(f"[cfi-dashboard] linkedStudent: id={row[0]} name='{snap.get('name')}' sharing={row[1]}")
         print(f"[cfi-dashboard] linkedStudents={len(linked_students)}")
 
         # ── 3. Shared logbook entries ────────────────────────────────────────
@@ -178,7 +198,7 @@ def handler(event, context):
                 seen.add(eid)
                 shared_entries.append(format_entry(row))
 
-        print(f"[cfi-dashboard] sharedEntries={len(shared_entries)} from {len(sharing_student_ids)} students")
+        print(f"[cfi-dashboard] sharedEntries={len(shared_entries)} from {len(sharing_student_ids)} students sharing_ids={sharing_student_ids}")
 
         # ── 4. Proficiency shares ────────────────────────────────────────────
         # Latest proficiency snapshot for each student who is actively sharing.

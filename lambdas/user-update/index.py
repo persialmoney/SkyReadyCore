@@ -252,6 +252,19 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
             update_expression_parts.append("pilotInfo.instructorSnapshotDate = :instructorSnapshotDate")
             expression_values[":instructorSnapshotDate"] = pilot_info['instructorSnapshotDate']
 
+        # Instructor public profile enrichment
+        if 'primaryAirport' in pilot_info and pilot_info['primaryAirport'] is not None:
+            update_expression_parts.append("pilotInfo.primaryAirport = :primaryAirport")
+            expression_values[":primaryAirport"] = pilot_info['primaryAirport']
+
+        if 'bio' in pilot_info and pilot_info['bio'] is not None:
+            update_expression_parts.append("pilotInfo.bio = :bio")
+            expression_values[":bio"] = pilot_info['bio']
+
+        if 'specializations' in pilot_info and pilot_info['specializations'] is not None:
+            update_expression_parts.append("pilotInfo.specializations = :specializations")
+            expression_values[":specializations"] = pilot_info['specializations']
+
         # Auto-generate inviteCode any time an instructor has certs but no code yet
         existing_pilot_info = existing_user.get('pilotInfo', {})
         existing_invite_code = existing_pilot_info.get('inviteCode')
