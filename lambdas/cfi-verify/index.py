@@ -149,31 +149,35 @@ def lookup_faa(
 ) -> List[Dict[str, Any]]:
     """
     Primary match: last name (exact) + expiry date + CFI.
-    First name is used as an additional prefix filter when provided.
+    First name is prefix-matched against norm_first_name (full first+middle).
+    When both first and last are provided we also try norm_full_name for an
+    unambiguous full-name match so that "JOHN MICHAEL SMITH" matches exactly.
 
     The expiry date match disambiguates people with identical last names.
+    """
+    _SELECT = """
+        SELECT
+            b.unique_id,
+            b.first_middle_name,
+            b.last_name_suffix,
+            b.norm_last_name,
+            b.norm_first_name,
+            b.state,
+            c.certificate_type,
+            c.certificate_level,
+            c.certificate_expire_date,
+            c.ratings_raw,
+            c.is_flight_instructor,
+            m.source_snapshot_date
+        FROM faa_airmen_certificates c
+        JOIN faa_airmen_basic b ON b.unique_id = c.unique_id
+        LEFT JOIN faa_ingest_metadata m ON m.id = 1
     """
     cur = conn.cursor()
     try:
         if norm_first:
             cur.execute(
-                """
-                SELECT
-                    b.unique_id,
-                    b.first_middle_name,
-                    b.last_name_suffix,
-                    b.norm_last_name,
-                    b.norm_first_name,
-                    b.state,
-                    c.certificate_type,
-                    c.certificate_level,
-                    c.certificate_expire_date,
-                    c.ratings_raw,
-                    c.is_flight_instructor,
-                    m.source_snapshot_date
-                FROM faa_airmen_certificates c
-                JOIN faa_airmen_basic b ON b.unique_id = c.unique_id
-                LEFT JOIN faa_ingest_metadata m ON m.id = 1
+                _SELECT + """
                 WHERE b.norm_last_name          = %s
                   AND b.norm_first_name         LIKE %s
                   AND c.is_flight_instructor    = true
@@ -186,23 +190,7 @@ def lookup_faa(
         else:
             # No first name provided — match on last name + expiry only
             cur.execute(
-                """
-                SELECT
-                    b.unique_id,
-                    b.first_middle_name,
-                    b.last_name_suffix,
-                    b.norm_last_name,
-                    b.norm_first_name,
-                    b.state,
-                    c.certificate_type,
-                    c.certificate_level,
-                    c.certificate_expire_date,
-                    c.ratings_raw,
-                    c.is_flight_instructor,
-                    m.source_snapshot_date
-                FROM faa_airmen_certificates c
-                JOIN faa_airmen_basic b ON b.unique_id = c.unique_id
-                LEFT JOIN faa_ingest_metadata m ON m.id = 1
+                _SELECT + """
                 WHERE b.norm_last_name          = %s
                   AND c.is_flight_instructor    = true
                   AND c.certificate_expire_date = %s
@@ -223,8 +211,8 @@ def lookup_name_only(
     norm_last: str,
 ) -> List[Dict[str, Any]]:
     """
-    Partial-match fallback: check if this last name exists in FAA CFI data
-    at all (regardless of expiry). First name filter applied when provided.
+    Partial-match fallback: check if this name exists in FAA CFI data
+    regardless of expiry. Matches norm_first_name prefix (full first+middle).
     """
     cur = conn.cursor()
     try:

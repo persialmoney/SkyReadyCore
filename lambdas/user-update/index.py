@@ -195,6 +195,10 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         if 'onboardingComplete' in preferences and preferences['onboardingComplete'] is not None:
             update_expression_parts.append("preferences.onboardingComplete = :onboardingComplete")
             expression_values[":onboardingComplete"] = preferences['onboardingComplete']
+
+        if 'flyingStyles' in preferences and preferences['flyingStyles'] is not None:
+            update_expression_parts.append("preferences.flyingStyles = :flyingStyles")
+            expression_values[":flyingStyles"] = preferences['flyingStyles']
     
     # Conditionally update pilotInfo if provided
     pilot_info = input_data.get('pilotInfo')
@@ -251,6 +255,19 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         if 'instructorSnapshotDate' in pilot_info and pilot_info['instructorSnapshotDate'] is not None:
             update_expression_parts.append("pilotInfo.instructorSnapshotDate = :instructorSnapshotDate")
             expression_values[":instructorSnapshotDate"] = pilot_info['instructorSnapshotDate']
+
+        # Pilot certificate FAA verification fields (written by pilot-verify Lambda)
+        if 'pilotVerificationStatus' in pilot_info and pilot_info['pilotVerificationStatus'] is not None:
+            update_expression_parts.append("pilotInfo.pilotVerificationStatus = :pilotVerificationStatus")
+            expression_values[":pilotVerificationStatus"] = pilot_info['pilotVerificationStatus']
+
+        if 'pilotVerifiedAt' in pilot_info and pilot_info['pilotVerifiedAt'] is not None:
+            update_expression_parts.append("pilotInfo.pilotVerifiedAt = :pilotVerifiedAt")
+            expression_values[":pilotVerifiedAt"] = pilot_info['pilotVerifiedAt']
+
+        if 'pilotSnapshotDate' in pilot_info and pilot_info['pilotSnapshotDate'] is not None:
+            update_expression_parts.append("pilotInfo.pilotSnapshotDate = :pilotSnapshotDate")
+            expression_values[":pilotSnapshotDate"] = pilot_info['pilotSnapshotDate']
 
         # Instructor public profile enrichment
         if 'primaryAirport' in pilot_info and pilot_info['primaryAirport'] is not None:

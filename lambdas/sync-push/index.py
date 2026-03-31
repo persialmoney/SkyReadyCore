@@ -548,7 +548,8 @@ def handler(event, context):
                 'notificationEnabled': prefs.get('notificationEnabled', True),
                 'criticalAlertThreshold': prefs.get('criticalAlertThreshold'),
                 'defaultAirport': prefs.get('defaultAirport'),
-                'enabledCurrencies': prefs.get('enabledCurrencies', [])
+                'enabledCurrencies': prefs.get('enabledCurrencies', []),
+                'flyingStyles': prefs.get('flyingStyles', [])
             }
             user_updated = True
         

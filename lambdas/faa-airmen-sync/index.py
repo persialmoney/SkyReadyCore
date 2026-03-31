@@ -199,9 +199,9 @@ def parse_basic(lines: List[str]) -> List[Dict[str, Any]]:
     Parse PILOT_BASIC.csv rows into dicts ready for INSERT.
 
     FAA PILOT_BASIC.csv columns (0-indexed):
-      0  UNIQUE ID       — internal FAA DB key (NOT the cert number on the card)
-      1  FIRST NAME      (first + middle, up to 30 chars)
-      2  LAST NAME       (last + suffix, up to 30 chars)
+      0  UNIQUE ID            — internal FAA DB key (NOT the cert number on the card)
+      1  FIRST NAME           (first + middle, up to 30 chars)
+      2  LAST NAME            (last + suffix, up to 30 chars)
       3  STREET 1
       4  STREET 2
       5  CITY
@@ -215,9 +215,10 @@ def parse_basic(lines: List[str]) -> List[Dict[str, Any]]:
       13 BASIC MED COURSE DATE
       14 BASIC MED CMEC DATE
 
-    norm_first_name is the normalized first token of the FIRST & MIDDLE NAME
-    field. Used as the primary lookup key for CFI verification since the FAA
-    data does not include airmen certificate numbers.
+    norm_first_name stores the full normalized FIRST & MIDDLE NAME so that
+    queries can match on first name alone, middle name alone, or both together.
+    norm_full_name is last+first+middle concatenated for unambiguous full-name
+    lookups. Both columns use LIKE prefix matching at query time.
     """
     rows = []
     for i, line in enumerate(lines):
@@ -231,9 +232,6 @@ def parse_basic(lines: List[str]) -> List[Dict[str, Any]]:
             continue
         first_middle = fields[1].strip() if len(fields) > 1 else ''
         last_name_suffix = fields[2].strip()
-        # Take only the first token of first+middle as the normalized first name
-        # so "JOHN MICHAEL" → norm_first_name = "john"
-        first_token = first_middle.split()[0] if first_middle.split() else ''
         rows.append({
             'unique_id':         unique_id,
             'first_middle_name': first_middle,
@@ -243,8 +241,15 @@ def parse_basic(lines: List[str]) -> List[Dict[str, Any]]:
             'country':           fields[8].strip() if len(fields) > 8 else '',
             'medical_class':     fields[10].strip() if len(fields) > 10 else '',
             'medical_date':      fields[11].strip() if len(fields) > 11 else '',
-            'norm_last_name':    normalize(last_name_suffix),
-            'norm_first_name':   normalize(first_token),
+            'medical_exp_date':       fields[12].strip() if len(fields) > 12 else '',
+            'basic_med_course_date':  fields[13].strip() if len(fields) > 13 else '',
+            'basic_med_cmec_date':    fields[14].strip() if len(fields) > 14 else '',
+            'norm_last_name':         normalize(last_name_suffix),
+            # Full first+middle normalized — "JOHN MICHAEL" → "johnmichael".
+            # Prefix-LIKE queries (e.g. LIKE 'john%') still match on first name only.
+            'norm_first_name':   normalize(first_middle),
+            # Full name concatenated for unambiguous last+first+middle lookups.
+            'norm_full_name':    normalize(last_name_suffix + first_middle),
         })
     return rows
 
@@ -307,9 +312,13 @@ _STAGING_BASIC_DDL = """
         country              TEXT,
         medical_class        TEXT,
         medical_date         TEXT,
-        norm_last_name       TEXT NOT NULL,
-        norm_first_name      TEXT NOT NULL,
-        raw_source_updated_at TIMESTAMPTZ
+        medical_exp_date         TEXT,
+        basic_med_course_date    TEXT,
+        basic_med_cmec_date      TEXT,
+        norm_last_name           TEXT NOT NULL,
+        norm_first_name          TEXT NOT NULL,
+        norm_full_name           TEXT NOT NULL,
+        raw_source_updated_at    TIMESTAMPTZ
     )
 """
 
@@ -374,12 +383,14 @@ def bulk_insert_basic(conn, rows: List[Dict[str, Any]]) -> None:
             """
             INSERT INTO faa_airmen_basic_staging
                 (unique_id, first_middle_name, last_name_suffix,
-                 city, state, country, medical_class, medical_date,
-                 norm_last_name, norm_first_name, raw_source_updated_at)
+                 city, state, country, medical_class, medical_date, medical_exp_date,
+                 basic_med_course_date, basic_med_cmec_date,
+                 norm_last_name, norm_first_name, norm_full_name, raw_source_updated_at)
             VALUES
                 (%(unique_id)s, %(first_middle_name)s, %(last_name_suffix)s,
                  %(city)s, %(state)s, %(country)s, %(medical_class)s, %(medical_date)s,
-                 %(norm_last_name)s, %(norm_first_name)s, now())
+                 %(medical_exp_date)s, %(basic_med_course_date)s, %(basic_med_cmec_date)s,
+                 %(norm_last_name)s, %(norm_first_name)s, %(norm_full_name)s, now())
             """,
             rows,
         )
@@ -472,13 +483,21 @@ def atomic_swap(conn, basic_count: int, cert_count: int) -> None:
                 country              TEXT,
                 medical_class        TEXT,
                 medical_date         TEXT,
-                norm_last_name       TEXT NOT NULL,
-                norm_first_name      TEXT NOT NULL,
-                raw_source_updated_at TIMESTAMPTZ
+                medical_exp_date         TEXT,
+                basic_med_course_date    TEXT,
+                basic_med_cmec_date      TEXT,
+                norm_last_name           TEXT NOT NULL,
+                norm_first_name          TEXT NOT NULL,
+                norm_full_name           TEXT NOT NULL,
+                raw_source_updated_at    TIMESTAMPTZ
             )
         """)
         cur.execute("CREATE INDEX ON faa_airmen_basic_staging (norm_last_name)")
         cur.execute("CREATE INDEX ON faa_airmen_basic_staging (unique_id)")
+        cur.execute("CREATE INDEX ON faa_airmen_basic_staging (norm_first_name)")
+        cur.execute("CREATE INDEX ON faa_airmen_basic_staging (norm_full_name)")
+        cur.execute("CREATE INDEX ON faa_airmen_basic_staging (norm_last_name, norm_first_name)")
+        cur.execute("CREATE INDEX ON faa_airmen_certificates_staging (certificate_type, certificate_level)")
         cur.execute("""
             CREATE TABLE faa_airmen_certificates_staging (
                 id                       BIGSERIAL PRIMARY KEY,
