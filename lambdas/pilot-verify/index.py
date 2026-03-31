@@ -74,16 +74,29 @@ def parse_medical_date(value: str) -> Optional[date]:
     FAA stores medical dates as MMYYYY (6 digits). Users may provide:
       MMYYYY      — FAA format, pinned to 1st of month
       YYYY-MM-DD  — ISO 8601 (pinned to 1st of month for MMYYYY comparison)
-      MM/YYYY     — common pilot format
+      MM/YYYY     — common pilot format (e.g. 06/2027)
       MM/DD/YYYY  — full date
+      MM/YY       — shorthand (e.g. 06/27 → June 2027, years 00–49 = 2000s)
+      MM-YYYY     — dash variant
     Returns None if unparseable.
     """
     v = (value or '').strip()
-    for fmt in ['%m%Y', '%Y-%m-%d', '%m/%Y', '%m/%d/%Y']:
+
+    # Handle MM/YY shorthand — 5 chars, slash in position 2
+    # Treat two-digit years 00-49 as 2000-2049, 50-99 as 1950-1999
+    if len(v) == 5 and v[2] == '/':
+        try:
+            month = int(v[:2])
+            year_2d = int(v[3:])
+            year = (2000 + year_2d) if year_2d < 50 else (1900 + year_2d)
+            return date(year, month, 1)
+        except (ValueError, TypeError):
+            pass
+
+    for fmt in ['%m%Y', '%Y-%m-%d', '%m/%Y', '%m/%d/%Y', '%m-%Y']:
         try:
             d = datetime.strptime(v, fmt).date()
-            # For formats that give day precision, snap to 1st of month so that
-            # a user entering "03/2024" compares fairly to FAA's "032024".
+            # Snap to 1st of month so MMYYYY comparisons are fair
             return d.replace(day=1)
         except ValueError:
             continue
@@ -202,46 +215,79 @@ def lookup_pilot(
         cur.close()
 
 
+_SELECT_PILOT_ANY_LEVEL = """
+    SELECT
+        b.unique_id,
+        b.first_middle_name,
+        b.last_name_suffix,
+        b.norm_last_name,
+        b.norm_first_name,
+        b.norm_full_name,
+        b.state,
+        b.medical_class,
+        b.medical_date,
+        b.medical_exp_date,
+        b.basic_med_course_date,
+        b.basic_med_cmec_date,
+        c_pilot.certificate_type,
+        c_pilot.certificate_level,
+        c_pilot.ratings_raw,
+        c_cfi.certificate_expire_date  AS cfi_expiry,
+        m.source_snapshot_date
+    FROM faa_airmen_basic b
+    JOIN faa_airmen_certificates c_pilot
+        ON  c_pilot.unique_id         = b.unique_id
+        AND c_pilot.certificate_type  = 'P'
+    LEFT JOIN faa_airmen_certificates c_cfi
+        ON  c_cfi.unique_id        = b.unique_id
+        AND c_cfi.certificate_type = 'F'
+    LEFT JOIN faa_ingest_metadata m ON m.id = 1
+"""
+
+
 def lookup_name_only(
     conn,
     norm_first: str,
     norm_last: str,
+    preferred_cert_level: str = '',
 ) -> List[Dict[str, Any]]:
     """
-    Fallback: check if name exists with ANY pilot cert (not filtered by level).
-    Used to determine whether to return partial vs. unverified.
+    Fallback: find name with ANY pilot cert level (not filtered by level).
+    Returns full rows so build_response can show whatever data we have.
+    Rows matching preferred_cert_level are sorted first; deduped by unique_id.
     """
     cur = conn.cursor()
     try:
+        order = "CASE WHEN c_pilot.certificate_level = %s THEN 0 ELSE 1 END, b.norm_full_name"
         if norm_first:
             cur.execute(
-                """
-                SELECT b.norm_last_name, b.norm_first_name,
-                       c.certificate_type, c.certificate_level
-                FROM faa_airmen_basic b
-                JOIN faa_airmen_certificates c ON c.unique_id = b.unique_id
+                _SELECT_PILOT_ANY_LEVEL + f"""
                 WHERE b.norm_last_name  = %s
                   AND b.norm_first_name LIKE %s
-                  AND c.certificate_type = 'P'
-                LIMIT 5
+                ORDER BY {order}
+                LIMIT 10
                 """,
-                (norm_last, norm_first + '%'),
+                (norm_last, norm_first + '%', preferred_cert_level),
             )
         else:
             cur.execute(
-                """
-                SELECT b.norm_last_name, b.norm_first_name,
-                       c.certificate_type, c.certificate_level
-                FROM faa_airmen_basic b
-                JOIN faa_airmen_certificates c ON c.unique_id = b.unique_id
-                WHERE b.norm_last_name  = %s
-                  AND c.certificate_type = 'P'
-                LIMIT 5
+                _SELECT_PILOT_ANY_LEVEL + f"""
+                WHERE b.norm_last_name = %s
+                ORDER BY {order}
+                LIMIT 10
                 """,
-                (norm_last,),
+                (norm_last, preferred_cert_level),
             )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        seen: set = set()
+        results = []
+        for row in cur.fetchall():
+            d = dict(zip(cols, row))
+            uid = d['unique_id']
+            if uid not in seen:
+                seen.add(uid)
+                results.append(d)
+        return results[:5]
     finally:
         cur.close()
 
@@ -372,17 +418,48 @@ def determine_status(
     candidates = lookup_pilot(conn, norm_first, norm_last, cert_level)
 
     if not candidates:
-        # No cert-level match — check if name exists with any pilot cert
-        name_rows = lookup_name_only(conn, norm_first, norm_last)
-        if name_rows:
-            levels_found = list({r['certificate_level'] for r in name_rows})
+        # No cert-level match — check if name exists with any pilot cert level
+        name_rows = lookup_name_only(conn, norm_first, norm_last, preferred_cert_level=cert_level)
+        if not name_rows:
+            return 'unverified', None, 'no FAA record found for this name'
+
+        # Score the name-only rows against the user's medical details.
+        # If medical matches strongly, still return verified — pilot may hold a
+        # higher cert than they selected (e.g. ATP who chose Private in onboarding).
+        no_medical_provided = not any([user_medical_class, user_medical_date, user_medical_exp_date])
+        best_row = None
+        best_score = -1
+        best_reasons: List[str] = []
+        for row in name_rows:
+            score, reasons = _score_medical_match(
+                row, user_medical_class, user_medical_date, user_medical_exp_date, cert_level
+            )
+            if score > best_score:
+                best_score = score
+                best_row = row
+                best_reasons = reasons
+
+        levels_found = list({r['certificate_level'] for r in name_rows})
+        level_note = f"FAA record shows level(s): {', '.join(levels_found)}"
+
+        if no_medical_provided:
             return (
                 'partial',
-                None,
-                f"name found in FAA data but not at certificate level '{cert_level}'; "
-                f"levels found: {levels_found}",
+                best_row,
+                f"name found at a different certificate level ({level_note}); no medical provided",
             )
-        return 'unverified', None, 'no FAA record found for this name'
+        if best_score >= 2:
+            # Strong medical match — pilot is verified even if cert level differs
+            return (
+                'verified',
+                best_row,
+                f"name + medical matched FAA record ({level_note}): " + '; '.join(best_reasons),
+            )
+        return (
+            'partial',
+            best_row,
+            f"name found at a different certificate level ({level_note}): " + '; '.join(best_reasons),
+        )
 
     # Score each candidate on medical details and pick the best
     no_medical_provided = not any([user_medical_class, user_medical_date, user_medical_exp_date])
@@ -508,6 +585,7 @@ def build_response(
     faa_row: Optional[Dict],
     verified_at: str,
     snapshot_date: Optional[str],
+    requested_cert_level: str = '',
 ) -> Dict[str, Any]:
     summary = None
     display_name = None
@@ -532,10 +610,19 @@ def build_response(
             'cfiExpiry': faa_row.get('cfi_expiry') or None,
         }
 
+    faa_cert_level = (summary or {}).get('certificateLevel', '')
+    cert_level_mismatch = bool(
+        requested_cert_level
+        and faa_cert_level
+        and faa_cert_level != requested_cert_level
+    )
+
     return {
         'status': status,
         'displayName': display_name,
         'certificateSummary': summary,
+        'certLevelMismatch': cert_level_mismatch,
+        'requestedCertLevel': requested_cert_level or None,
         'source': FAA_SOURCE_LABEL,
         'verifiedAt': verified_at,
         'snapshotDate': str(snapshot_date) if snapshot_date else None,
@@ -616,7 +703,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         emit_metric('VerifyDurationMs', elapsed_ms, unit='Milliseconds')
 
         print(f"[pilot-verify] status={status} reason={reason!r} elapsed={elapsed_ms}ms")
-        return build_response(status, faa_row, verified_at, snapshot_date)
+        return build_response(status, faa_row, verified_at, snapshot_date, requested_cert_level=cert_level)
 
     except Exception as e:
         elapsed_ms = round((time.time() - start) * 1000)

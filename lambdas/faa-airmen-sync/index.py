@@ -497,7 +497,6 @@ def atomic_swap(conn, basic_count: int, cert_count: int) -> None:
         cur.execute("CREATE INDEX ON faa_airmen_basic_staging (norm_first_name)")
         cur.execute("CREATE INDEX ON faa_airmen_basic_staging (norm_full_name)")
         cur.execute("CREATE INDEX ON faa_airmen_basic_staging (norm_last_name, norm_first_name)")
-        cur.execute("CREATE INDEX ON faa_airmen_certificates_staging (certificate_type, certificate_level)")
         cur.execute("""
             CREATE TABLE faa_airmen_certificates_staging (
                 id                       BIGSERIAL PRIMARY KEY,
@@ -514,6 +513,7 @@ def atomic_swap(conn, basic_count: int, cert_count: int) -> None:
         """)
         cur.execute("CREATE INDEX ON faa_airmen_certificates_staging (unique_id)")
         cur.execute("CREATE INDEX ON faa_airmen_certificates_staging (is_flight_instructor, certificate_expire_date)")
+        cur.execute("CREATE INDEX ON faa_airmen_certificates_staging (certificate_type, certificate_level)")
         cur.execute(
             """
             INSERT INTO faa_ingest_metadata (id, source_snapshot_date, ingested_at,
