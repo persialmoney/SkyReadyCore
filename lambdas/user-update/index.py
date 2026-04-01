@@ -302,6 +302,56 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         update_expression_parts.append("pilotInfo.isCfi = :isCfi")
         expression_values[":isCfi"] = is_cfi
         print(f"[UserUpdate] isCfi derived as {is_cfi} for user {user_id} (effective_certs={effective_certs})")
+
+    # Merge aircraft list (append or upsert by tailNumber) — onboarding + explicit updateUser
+    aircraft_input = input_data.get('aircraft')
+    if aircraft_input is not None and isinstance(aircraft_input, list) and len(aircraft_input) > 0:
+        existing_aircraft = existing_user.get('aircraft') or []
+        aircraft_list = [dict(x) for x in existing_aircraft]
+        now_iso = datetime.utcnow().isoformat() + 'Z'
+
+        for ac in aircraft_input:
+            if not ac or not isinstance(ac, dict):
+                continue
+            raw_tail = ac.get('tailNumber')
+            if not raw_tail or not str(raw_tail).strip():
+                continue
+            tail = str(raw_tail).strip().upper()
+            new_entry = {
+                'tailNumber': tail,
+                'notes': ac.get('notes') if ac.get('notes') is not None else '',
+                'make': ac.get('make') if ac.get('make') is not None else '',
+                'model': ac.get('model') if ac.get('model') is not None else '',
+                'category': ac.get('category') if ac.get('category') is not None else '',
+                'class': ac.get('class') if ac.get('class') is not None else '',
+                'complex': bool(ac.get('complex', False)),
+                'highPerformance': bool(ac.get('highPerformance', False)),
+                'tailwheel': bool(ac.get('tailwheel', False)),
+                'isManual': bool(ac.get('isManual', True)),
+                'usageCount': int(ac.get('usageCount', 0) or 0),
+                'isArchived': bool(ac.get('isArchived', False)),
+                'addedAt': now_iso,
+            }
+            if ac.get('builderCertification') is not None:
+                new_entry['builderCertification'] = ac.get('builderCertification')
+            if ac.get('airworthinessDate') is not None:
+                new_entry['airworthinessDate'] = ac.get('airworthinessDate')
+
+            replaced = False
+            for i, ex in enumerate(aircraft_list):
+                if str(ex.get('tailNumber', '')).strip().upper() == tail:
+                    merged = dict(ex)
+                    merged.update(new_entry)
+                    merged['usageCount'] = int(ex.get('usageCount', 0) or 0)
+                    aircraft_list[i] = merged
+                    replaced = True
+                    break
+            if not replaced:
+                aircraft_list.append(new_entry)
+
+        update_expression_parts.append("aircraft = :aircraft")
+        expression_values[":aircraft"] = aircraft_list
+        print(f"[UserUpdate] Merged aircraft list for user {user_id}, count={len(aircraft_list)}")
     
     # Build the update expression string
     if not update_expression_parts:

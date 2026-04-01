@@ -211,40 +211,47 @@ def lookup_name_only(
     norm_last: str,
 ) -> List[Dict[str, Any]]:
     """
-    Partial-match fallback: check if this name exists in FAA CFI data
-    regardless of expiry. Matches norm_first_name prefix (full first+middle).
+    Partial-match fallback: fetch the full FAA CFI record for this name
+    regardless of expiry, ordered by most-recent expiry first.
+    Returns full columns so build_response can populate certificateSummary.
+    """
+    _SELECT = """
+        SELECT
+            b.unique_id,
+            b.first_middle_name,
+            b.last_name_suffix,
+            b.norm_last_name,
+            b.norm_first_name,
+            b.state,
+            c.certificate_type,
+            c.certificate_level,
+            c.certificate_expire_date,
+            c.ratings_raw,
+            c.is_flight_instructor,
+            m.source_snapshot_date
+        FROM faa_airmen_certificates c
+        JOIN faa_airmen_basic b ON b.unique_id = c.unique_id
+        LEFT JOIN faa_ingest_metadata m ON m.id = 1
     """
     cur = conn.cursor()
     try:
         if norm_first:
             cur.execute(
-                """
-                SELECT
-                    b.norm_last_name,
-                    b.norm_first_name,
-                    c.is_flight_instructor,
-                    c.certificate_expire_date
-                FROM faa_airmen_certificates c
-                JOIN faa_airmen_basic b ON b.unique_id = c.unique_id
+                _SELECT + """
                 WHERE b.norm_last_name       = %s
                   AND b.norm_first_name      LIKE %s
                   AND c.is_flight_instructor = true
+                ORDER BY c.certificate_expire_date DESC NULLS LAST
                 LIMIT 10
                 """,
                 (norm_last, norm_first + '%'),
             )
         else:
             cur.execute(
-                """
-                SELECT
-                    b.norm_last_name,
-                    b.norm_first_name,
-                    c.is_flight_instructor,
-                    c.certificate_expire_date
-                FROM faa_airmen_certificates c
-                JOIN faa_airmen_basic b ON b.unique_id = c.unique_id
+                _SELECT + """
                 WHERE b.norm_last_name       = %s
                   AND c.is_flight_instructor = true
+                ORDER BY c.certificate_expire_date DESC NULLS LAST
                 LIMIT 10
                 """,
                 (norm_last,),
@@ -302,7 +309,7 @@ def determine_status(
         # No expiry provided: fall back to last-name-only partial check
         name_rows = lookup_name_only(conn, norm_first, norm_last)
         if name_rows:
-            return 'partial', None, 'name found in FAA CFI data but no expiry date provided for confirmation'
+            return 'partial', name_rows[0], 'name found in FAA CFI data but no expiry date provided for confirmation'
         return 'unverified', None, 'no FAA CFI record found for this name'
 
     # Primary: full match (name + expiry)
@@ -325,7 +332,8 @@ def determine_status(
     # No full match — check if name exists without expiry match (typo in expiry?)
     name_rows = lookup_name_only(conn, norm_first, norm_last)
     if name_rows:
-        return 'partial', None, 'name found in FAA CFI data but expiry date does not match'
+        # Return the most-recent matching row so the UI can show real FAA data
+        return 'partial', name_rows[0], 'name found in FAA CFI data but expiry date does not match'
 
     return 'unverified', None, 'no FAA CFI record found for this name'
 
