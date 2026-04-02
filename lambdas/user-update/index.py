@@ -200,7 +200,8 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
             update_expression_parts.append("preferences.flyingStyles = :flyingStyles")
             expression_values[":flyingStyles"] = preferences['flyingStyles']
     
-    # Conditionally update pilotInfo if provided
+    # Conditionally update pilotInfo if provided.
+    # Logbook entries (Postgres) are not modified here — signed rows keep snapshots/signatures.
     pilot_info = input_data.get('pilotInfo')
     if pilot_info is not None:
         # Student/pilot fields
@@ -230,29 +231,30 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         
         # Instructor fields
         if 'instructorCertificates' in pilot_info and pilot_info['instructorCertificates'] is not None:
-            # Only write if non-empty, or if overwriting a previously non-empty list
-            # (prevents an empty [] from clobbering real cert data)
-            if pilot_info['instructorCertificates']:
-                update_expression_parts.append("pilotInfo.instructorCertificates = :instructorCertificates")
-                expression_values[":instructorCertificates"] = pilot_info['instructorCertificates']
+            # Write the list unconditionally when the field is explicitly provided —
+            # an empty [] means the caller is intentionally clearing CFI status.
+            update_expression_parts.append("pilotInfo.instructorCertificates = :instructorCertificates")
+            expression_values[":instructorCertificates"] = pilot_info['instructorCertificates']
         
-        if 'instructorCertificateNumber' in pilot_info and pilot_info['instructorCertificateNumber'] is not None:
+        # For instructor fields that can be explicitly nulled (e.g. when disabling CFI role),
+        # write the value whenever the key is present — null is a valid "clear" signal.
+        if 'instructorCertificateNumber' in pilot_info:
             update_expression_parts.append("pilotInfo.instructorCertificateNumber = :instructorCertificateNumber")
             expression_values[":instructorCertificateNumber"] = pilot_info['instructorCertificateNumber']
-        
-        if 'instructorCertificateExpiration' in pilot_info and pilot_info['instructorCertificateExpiration'] is not None:
+
+        if 'instructorCertificateExpiration' in pilot_info:
             update_expression_parts.append("pilotInfo.instructorCertificateExpiration = :instructorCertificateExpiration")
             expression_values[":instructorCertificateExpiration"] = pilot_info['instructorCertificateExpiration']
 
-        if 'instructorVerificationStatus' in pilot_info and pilot_info['instructorVerificationStatus'] is not None:
+        if 'instructorVerificationStatus' in pilot_info:
             update_expression_parts.append("pilotInfo.instructorVerificationStatus = :instructorVerificationStatus")
             expression_values[":instructorVerificationStatus"] = pilot_info['instructorVerificationStatus']
 
-        if 'instructorVerifiedAt' in pilot_info and pilot_info['instructorVerifiedAt'] is not None:
+        if 'instructorVerifiedAt' in pilot_info:
             update_expression_parts.append("pilotInfo.instructorVerifiedAt = :instructorVerifiedAt")
             expression_values[":instructorVerifiedAt"] = pilot_info['instructorVerifiedAt']
 
-        if 'instructorSnapshotDate' in pilot_info and pilot_info['instructorSnapshotDate'] is not None:
+        if 'instructorSnapshotDate' in pilot_info:
             update_expression_parts.append("pilotInfo.instructorSnapshotDate = :instructorSnapshotDate")
             expression_values[":instructorSnapshotDate"] = pilot_info['instructorSnapshotDate']
 
@@ -282,14 +284,26 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
             update_expression_parts.append("pilotInfo.specializations = :specializations")
             expression_values[":specializations"] = pilot_info['specializations']
 
+        # Structured certificate profile blob (_v:1 JSON from CertificateProfile TypeScript type).
+        # Stored as-is; client is responsible for versioning and parsing.
+        if 'certificateProfile' in pilot_info and pilot_info['certificateProfile'] is not None:
+            update_expression_parts.append("pilotInfo.certificateProfile = :certificateProfile")
+            expression_values[":certificateProfile"] = pilot_info['certificateProfile']
+
         # Auto-generate inviteCode any time an instructor has certs but no code yet
         existing_pilot_info = existing_user.get('pilotInfo', {})
         existing_invite_code = existing_pilot_info.get('inviteCode')
         existing_instructor_certs = existing_pilot_info.get('instructorCertificates', [])
-        incoming_certs = pilot_info.get('instructorCertificates') or []
-        
+
+        # When the caller explicitly sends instructorCertificates (even as []) use
+        # that value as the source of truth.  Only fall back to the existing certs
+        # when the field was not included in the request at all.
+        if 'instructorCertificates' in pilot_info:
+            effective_certs = pilot_info['instructorCertificates'] or []
+        else:
+            effective_certs = existing_instructor_certs
+
         # Generate if: no existing code AND (incoming certs non-empty OR existing certs non-empty)
-        effective_certs = incoming_certs if incoming_certs else existing_instructor_certs
         if not existing_invite_code and effective_certs:
             new_invite_code = generate_invite_code()
             update_expression_parts.append("pilotInfo.inviteCode = :inviteCode")
@@ -307,8 +321,33 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     aircraft_input = input_data.get('aircraft')
     if aircraft_input is not None and isinstance(aircraft_input, list) and len(aircraft_input) > 0:
         existing_aircraft = existing_user.get('aircraft') or []
-        aircraft_list = [dict(x) for x in existing_aircraft]
-        now_iso = datetime.utcnow().isoformat() + 'Z'
+        now_ms = Decimal(str(int(datetime.utcnow().timestamp() * 1000)))
+
+        def _coerce_added_at(val) -> Decimal:
+            """Normalize addedAt to a Decimal (ms timestamp).
+            DynamoDB boto3 resource rejects Python float; Decimal is required.
+            Handles legacy string ISO values stored before this fix."""
+            if val is None:
+                return now_ms
+            if isinstance(val, Decimal):
+                return val
+            if isinstance(val, (int, float)):
+                return Decimal(str(int(val)))
+            # Legacy ISO string — parse and convert to ms
+            try:
+                from datetime import timezone
+                s = str(val).rstrip('Z')
+                dt = datetime.fromisoformat(s)
+                return Decimal(str(int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)))
+            except Exception:
+                return now_ms
+
+        # Migrate existing rows: coerce any string addedAt to float
+        aircraft_list = []
+        for x in existing_aircraft:
+            row = dict(x)
+            row['addedAt'] = _coerce_added_at(row.get('addedAt'))
+            aircraft_list.append(row)
 
         for ac in aircraft_input:
             if not ac or not isinstance(ac, dict):
@@ -317,6 +356,7 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
             if not raw_tail or not str(raw_tail).strip():
                 continue
             tail = str(raw_tail).strip().upper()
+            # Use client-provided addedAt when it's a valid number; otherwise now
             new_entry = {
                 'tailNumber': tail,
                 'notes': ac.get('notes') if ac.get('notes') is not None else '',
@@ -330,7 +370,7 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
                 'isManual': bool(ac.get('isManual', True)),
                 'usageCount': int(ac.get('usageCount', 0) or 0),
                 'isArchived': bool(ac.get('isArchived', False)),
-                'addedAt': now_iso,
+                'addedAt': _coerce_added_at(ac.get('addedAt')),
             }
             if ac.get('builderCertification') is not None:
                 new_entry['builderCertification'] = ac.get('builderCertification')
@@ -343,6 +383,8 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
                     merged = dict(ex)
                     merged.update(new_entry)
                     merged['usageCount'] = int(ex.get('usageCount', 0) or 0)
+                    # Preserve original addedAt when updating an existing entry
+                    merged['addedAt'] = _coerce_added_at(ex.get('addedAt'))
                     aircraft_list[i] = merged
                     replaced = True
                     break
@@ -383,6 +425,17 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         updated_item['id'] = updated_item.get('userId', user_id)
     
     user_data = convert_item(updated_item)
+
+    # DynamoDB omits list attributes entirely when they are empty (it does not
+    # store []). Normalise here so AppSync always returns [] rather than null
+    # for list fields — the client's PreferencesAdapter and usePilotInfo both
+    # depend on [] (not null) to correctly derive isCfi = false.
+    if user_data.get('pilotInfo') is not None:
+        pi = user_data['pilotInfo']
+        if not pi.get('instructorCertificates'):
+            pi['instructorCertificates'] = []
+        if not pi.get('aircraftRatings'):
+            pi['aircraftRatings'] = []
 
     # Send a security notification to the OLD email address whenever the
     # sign-in email is changed. The old address remains active for sign-in

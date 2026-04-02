@@ -154,6 +154,8 @@ def lookup_faa(
     unambiguous full-name match so that "JOHN MICHAEL SMITH" matches exactly.
 
     The expiry date match disambiguates people with identical last names.
+    Medical columns from faa_airmen_basic are included so the CFI response
+    carries the same medical data that the pilot-verify flow returns.
     """
     _SELECT = """
         SELECT
@@ -163,6 +165,10 @@ def lookup_faa(
             b.norm_last_name,
             b.norm_first_name,
             b.state,
+            b.medical_class,
+            b.medical_exp_date,
+            b.basic_med_course_date,
+            b.basic_med_cmec_date,
             c.certificate_type,
             c.certificate_level,
             c.certificate_expire_date,
@@ -213,7 +219,8 @@ def lookup_name_only(
     """
     Partial-match fallback: fetch the full FAA CFI record for this name
     regardless of expiry, ordered by most-recent expiry first.
-    Returns full columns so build_response can populate certificateSummary.
+    Returns full columns (including medical) so build_response can populate
+    certificateSummary with all available FAA data.
     """
     _SELECT = """
         SELECT
@@ -223,6 +230,10 @@ def lookup_name_only(
             b.norm_last_name,
             b.norm_first_name,
             b.state,
+            b.medical_class,
+            b.medical_exp_date,
+            b.basic_med_course_date,
+            b.basic_med_cmec_date,
             c.certificate_type,
             c.certificate_level,
             c.certificate_expire_date,
@@ -416,10 +427,25 @@ def build_response(status: str, faa_row: Optional[Dict],
         raw_parts = [r.strip() for r in ratings_raw.split() if r.strip()]
         ratings = [r.split('/')[-1] for r in raw_parts if '/' in r]
 
+        # Normalise medical_exp_date: the column stores MMYYYY (6-digit string)
+        # which matches what pilot-verify returns and what the frontend expects.
+        med_exp = faa_row.get('medical_exp_date')
+        med_exp_str = str(med_exp).strip() if med_exp else None
+
+        bm_course = faa_row.get('basic_med_course_date')
+        bm_course_str = str(bm_course).strip() if bm_course else None
+
+        bm_cmec = faa_row.get('basic_med_cmec_date')
+        bm_cmec_str = str(bm_cmec).strip() if bm_cmec else None
+
         summary = {
             'isCfi': bool(faa_row.get('is_flight_instructor')),
             'ratings': ratings,
             'expiresOn': faa_row.get('certificate_expire_date') or None,
+            'medicalClass': faa_row.get('medical_class') or None,
+            'medicalExpDate': med_exp_str or None,
+            'basicMedCourseDate': bm_course_str or None,
+            'basicMedCmecDate': bm_cmec_str or None,
         }
 
     return {
