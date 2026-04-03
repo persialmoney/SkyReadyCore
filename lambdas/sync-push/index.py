@@ -844,8 +844,7 @@ def handler(event, context):
                     score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
                     active_domains, computed_at, _sync_pending
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
-                ON CONFLICT (user_id, snapshot_date) DO UPDATE SET
-                    id             = EXCLUDED.id,
+                ON CONFLICT (id) DO UPDATE SET
                     score          = EXCLUDED.score,
                     recency        = EXCLUDED.recency,
                     exposure       = EXCLUDED.exposure,
