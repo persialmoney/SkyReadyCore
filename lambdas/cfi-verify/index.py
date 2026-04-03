@@ -68,7 +68,7 @@ FAA_SOURCE_LABEL = 'FAA Airmen Certification Releasable Database'
 CERT_RATINGS_MAP = {
     'CFI':  ['F/'],          # any F/ prefixed rating confirms CFI authority
     'CFII': ['INSTA', 'INSTH', 'INSTI', 'INSTP'],   # instrument ratings
-    'MEI':  ['AME', 'ASME'], # multi-engine (AME covers pure multi, ASME covers both)
+    'MEI':  ['AME', 'AMEL', 'AMES', 'ASME', 'AMELC'],  # multi-engine variants (spec: AME, AMEL, AMES, ASME, AMELC)
 }
 
 
@@ -440,6 +440,7 @@ def build_response(status: str, faa_row: Optional[Dict],
 
         summary = {
             'isCfi': bool(faa_row.get('is_flight_instructor')),
+            'certificateLevel': faa_row.get('certificate_level') or None,
             'ratings': ratings,
             'expiresOn': faa_row.get('certificate_expire_date') or None,
             'medicalClass': faa_row.get('medical_class') or None,
