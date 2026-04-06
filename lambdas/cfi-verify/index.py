@@ -141,6 +141,49 @@ def _return_conn(conn) -> None:
 
 # ── FAA lookup ────────────────────────────────────────────────────────────────
 
+def lookup_pilot_cert_level(conn, unique_id: str) -> Optional[str]:
+    """
+    Given a unique_id found from a CFI row, fetch the underlying pilot
+    certificate level from the non-instructor certificate row for the same
+    airman.  Returns the raw FAA level code (e.g. 'A', 'C', 'P', 'S') or None.
+
+    The FAA database stores the pilot certificate (ATP/CPL/PPL) and the flight
+    instructor certificate as separate rows in faa_airmen_certificates with
+    different certificate_types.  The CFI query only returns the instructor row
+    (is_flight_instructor = true) whose certificate_level reflects the
+    instructor cert, not the underlying pilot cert.  This secondary lookup
+    retrieves the highest pilot cert level so the app can display the correct
+    certificate (e.g. ATP instead of Commercial).
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT certificate_level
+            FROM faa_airmen_certificates
+            WHERE unique_id            = %s
+              AND is_flight_instructor = false
+            ORDER BY
+              CASE certificate_level
+                WHEN 'A' THEN 1
+                WHEN 'C' THEN 2
+                WHEN 'P' THEN 3
+                WHEN 'S' THEN 4
+                ELSE 5
+              END
+            LIMIT 1
+            """,
+            (unique_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"[cfi-verify] WARNING: pilot cert level lookup failed: {e}")
+        return None
+    finally:
+        cur.close()
+
+
 def lookup_faa(
     conn,
     norm_first: str,
@@ -457,7 +500,8 @@ def persist_to_dynamo(user_id: str, status: str, verified_at: str,
 # ── Response builder ──────────────────────────────────────────────────────────
 
 def build_response(status: str, faa_row: Optional[Dict],
-                   verified_at: str, snapshot_date: Optional[str]) -> Dict[str, Any]:
+                   verified_at: str, snapshot_date: Optional[str],
+                   pilot_cert_level: Optional[str] = None) -> Dict[str, Any]:
     summary = None
     display_name = None
 
@@ -486,7 +530,11 @@ def build_response(status: str, faa_row: Optional[Dict],
 
         summary = {
             'isCfi': bool(faa_row.get('is_flight_instructor')),
+            # certificateLevel is the instructor cert level (e.g. 'F') — not the
+            # underlying pilot cert.  pilotCertificateLevel is the separate pilot
+            # cert row level ('A'=ATP, 'C'=CPL, 'P'=PPL, 'S'=Student).
             'certificateLevel': faa_row.get('certificate_level') or None,
+            'pilotCertificateLevel': pilot_cert_level or None,
             'ratings': ratings,
             'expiresOn': faa_row.get('certificate_expire_date') or None,
             'medicalClass': faa_row.get('medical_class') or None,
@@ -561,12 +609,23 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if user_id:
             persist_to_dynamo(user_id, status, verified_at, snapshot_date, faa_row=faa_row)
 
+        # Look up the underlying pilot certificate level (ATP/CPL/PPL) from the
+        # non-instructor row for the same airman.  The CFI row's certificate_level
+        # reflects the instructor cert, not the pilot cert, so we need this
+        # secondary fetch to correctly populate the app's pilot certificate field.
+        pilot_cert_level: Optional[str] = None
+        if faa_row:
+            unique_id = faa_row.get('unique_id')
+            if unique_id:
+                pilot_cert_level = lookup_pilot_cert_level(conn, unique_id)
+                print(f"[cfi-verify] pilot_cert_level={pilot_cert_level!r} for unique_id={unique_id!r}")
+
         elapsed_ms = round((time.time() - start) * 1000)
         emit_metric('VerificationAttempt', 1, extra_dims=[{'Name': 'Status', 'Value': status}])
         emit_metric('VerifyDurationMs', elapsed_ms, unit='Milliseconds')
 
         print(f"[cfi-verify] status={status} reason={reason!r} elapsed={elapsed_ms}ms")
-        return build_response(status, faa_row, verified_at, snapshot_date)
+        return build_response(status, faa_row, verified_at, snapshot_date, pilot_cert_level)
 
     except Exception as e:
         elapsed_ms = round((time.time() - start) * 1000)
