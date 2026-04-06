@@ -76,10 +76,12 @@ def handler(event, context):
         user = items[0]
         pilot_info = user.get('pilotInfo', {})
         
-        # Verify the user is actually a CFI (has instructor certificates)
+        # Verify the user is actually a CFI. Primary signal is instructorCertificates;
+        # fall back to isCfi flag for users whose certs may not be written yet.
         instructor_certs = pilot_info.get('instructorCertificates', [])
-        if not instructor_certs:
-            print(f"[instructor-lookup] User {user['userId']} found but has no instructor certificates")
+        is_cfi = bool(instructor_certs) or pilot_info.get('isCfi', False)
+        if not is_cfi:
+            print(f"[instructor-lookup] User {user['userId']} found but is not a CFI (no certs, isCfi=False)")
             return None
         
         # Build public profile (limited fields only)

@@ -384,24 +384,70 @@ def write_attempt(
         cur.close()
 
 
+# ── Instructor certificate derivation ─────────────────────────────────────────
+
+def derive_instructor_certificates(ratings_raw: str) -> List[str]:
+    """
+    Derive the app-level instructor certificate list from FAA ratings_raw.
+
+    FAA ratings use the format LEVEL/CODE, e.g. "F/ASE   F/INSTA  A/ASEL".
+    We strip the level prefix and match against known CFI rating codes.
+
+    Returns at minimum ['CFI']; adds 'CFII' and/or 'MEI' when the FAA record
+    includes the relevant instrument / multi-engine instructor ratings.
+
+    Mirrors the TypeScript deriveInstructorCertificates() in faaVerificationService.ts
+    so the server and client always produce the same labels.
+    """
+    raw_parts = [r.strip() for r in ratings_raw.split() if r.strip()]
+    ratings = [r.split('/')[-1].upper() for r in raw_parts if '/' in r]
+    has_cfii = any(re.match(r'^INST[AHIP]$', r) for r in ratings)
+    has_mei  = any(re.match(r'^ASM[EHP]$', r) for r in ratings) or any('MULTI' in r for r in ratings)
+    return ['CFI'] + (['CFII'] if has_cfii else []) + (['MEI'] if has_mei else [])
+
+
 # ── DynamoDB write ────────────────────────────────────────────────────────────
 
 def persist_to_dynamo(user_id: str, status: str, verified_at: str,
-                      snapshot_date: Optional[str]) -> None:
+                      snapshot_date: Optional[str],
+                      faa_row: Optional[Dict] = None) -> None:
+    """
+    Persist CFI verification result to DynamoDB.
+
+    Always writes the three verification status fields. When a matching FAA row
+    is available (verified or partial), also writes instructorCertificates and
+    isCfi so the user's CFI status is captured regardless of whether the client
+    calls the follow-up updateUser mutation (commitFaaVerification).
+    """
     table = dynamodb.Table(USERS_TABLE)
     try:
+        update_parts = [
+            "pilotInfo.instructorVerificationStatus = :s",
+            "pilotInfo.instructorVerifiedAt = :t",
+            "pilotInfo.instructorSnapshotDate = :d",
+        ]
+        expr_values: Dict[str, Any] = {
+            ':s': status,
+            ':t': verified_at,
+            ':d': snapshot_date or '',
+        }
+
+        # When we have a real FAA row, derive and persist instructorCertificates
+        # and isCfi. This closes the gap where commitFaaVerification was the only
+        # path that wrote these fields — verified CFIs now always have them set.
+        if faa_row and status in ('verified', 'partial'):
+            ratings_raw = faa_row.get('ratings_raw') or ''
+            instructor_certs = derive_instructor_certificates(ratings_raw)
+            update_parts.append("pilotInfo.instructorCertificates = :certs")
+            update_parts.append("pilotInfo.isCfi = :isCfi")
+            expr_values[':certs'] = instructor_certs
+            expr_values[':isCfi'] = True
+            print(f"[cfi-verify] writing instructorCertificates={instructor_certs} isCfi=True for user {user_id}")
+
         table.update_item(
             Key={'userId': user_id},
-            UpdateExpression=(
-                "SET pilotInfo.instructorVerificationStatus = :s, "
-                "    pilotInfo.instructorVerifiedAt = :t, "
-                "    pilotInfo.instructorSnapshotDate = :d"
-            ),
-            ExpressionAttributeValues={
-                ':s': status,
-                ':t': verified_at,
-                ':d': snapshot_date or '',
-            },
+            UpdateExpression="SET " + ", ".join(update_parts),
+            ExpressionAttributeValues=expr_values,
         )
     except Exception as e:
         emit_metric('DbWriteFailure', 1)
@@ -513,7 +559,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         # Persist to DynamoDB pilotInfo (non-fatal)
         if user_id:
-            persist_to_dynamo(user_id, status, verified_at, snapshot_date)
+            persist_to_dynamo(user_id, status, verified_at, snapshot_date, faa_row=faa_row)
 
         elapsed_ms = round((time.time() - start) * 1000)
         emit_metric('VerificationAttempt', 1, extra_dims=[{'Name': 'Status', 'Value': status}])

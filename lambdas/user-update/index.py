@@ -290,7 +290,10 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
             update_expression_parts.append("pilotInfo.certificateProfile = :certificateProfile")
             expression_values[":certificateProfile"] = pilot_info['certificateProfile']
 
-        # Auto-generate inviteCode any time an instructor has certs but no code yet
+        # Auto-generate inviteCode any time an instructor has certs but no code yet.
+        # instructorCertificates is the single authoritative signal: cfi-verify Lambda
+        # now writes it directly to DynamoDB on successful verification, so it is
+        # reliably populated for all verified CFIs.
         existing_pilot_info = existing_user.get('pilotInfo', {})
         existing_invite_code = existing_pilot_info.get('inviteCode')
         existing_instructor_certs = existing_pilot_info.get('instructorCertificates', [])
@@ -303,19 +306,20 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         else:
             effective_certs = existing_instructor_certs
 
-        # Generate if: no existing code AND (incoming certs non-empty OR existing certs non-empty)
-        if not existing_invite_code and effective_certs:
+        # isCfi is derived purely from effective_certs — the single source of truth.
+        is_cfi = bool(effective_certs)
+
+        # Generate invite code if: no existing code AND user is a CFI
+        if not existing_invite_code and is_cfi:
             new_invite_code = generate_invite_code()
             update_expression_parts.append("pilotInfo.inviteCode = :inviteCode")
             expression_values[":inviteCode"] = new_invite_code
+            print(f"[UserUpdate] generated inviteCode for user {user_id}")
 
-        # Derive and persist isCfi: true iff the user has effective instructor certs.
-        # This is always written so it stays in sync with the cert list even when
-        # the caller does not explicitly pass isCfi.
-        is_cfi = bool(effective_certs)
+        # Persist isCfi derived from effective_certs.
         update_expression_parts.append("pilotInfo.isCfi = :isCfi")
         expression_values[":isCfi"] = is_cfi
-        print(f"[UserUpdate] isCfi derived as {is_cfi} for user {user_id} (effective_certs={effective_certs})")
+        print(f"[UserUpdate] isCfi={is_cfi} for user {user_id} (effective_certs={effective_certs})")
 
     # Merge aircraft list (append or upsert by tailNumber) — onboarding + explicit updateUser
     aircraft_input = input_data.get('aircraft')
