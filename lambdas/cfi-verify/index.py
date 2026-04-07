@@ -154,6 +154,13 @@ def lookup_pilot_cert_level(conn, unique_id: str) -> Optional[str]:
     instructor cert, not the underlying pilot cert.  This secondary lookup
     retrieves the highest pilot cert level so the app can display the correct
     certificate (e.g. ATP instead of Commercial).
+
+    NOTE: We call conn.rollback() in the finally block to reset any implicit
+    transaction that psycopg3 started for this SELECT.  Without this the
+    connection is returned to the pool in INTRANS state, causing the pool to
+    log a rollback warning on every invocation.  The rollback is safe here
+    because this function is read-only and the primary write path
+    (persist_to_dynamo) uses a separate DynamoDB client, not this connection.
     """
     cur = conn.cursor()
     try:
@@ -182,6 +189,10 @@ def lookup_pilot_cert_level(conn, unique_id: str) -> Optional[str]:
         return None
     finally:
         cur.close()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
 
 def lookup_faa(

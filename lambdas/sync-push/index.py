@@ -509,7 +509,7 @@ def handler(event, context):
                 'airworthinessDate': aircraft.get('airworthinessDate'),
                 'usageCount': aircraft.get('usageCount', 0),
                 'isArchived': aircraft.get('isArchived', False),
-                'addedAt': datetime.utcnow().isoformat() + 'Z'
+                'addedAt': int(datetime.utcnow().timestamp() * 1000),
             })
             user_updated = True
         
@@ -532,6 +532,15 @@ def handler(event, context):
                         'usageCount': aircraft_data.get('usageCount', 0),
                         'isArchived': aircraft_data.get('isArchived', False)
                     })
+                    # Coerce legacy ISO-string addedAt to epoch ms on next write
+                    existing_added_at = aircraft_list[i].get('addedAt')
+                    if isinstance(existing_added_at, str):
+                        try:
+                            from datetime import timezone
+                            dt = datetime.fromisoformat(existing_added_at.rstrip('Z'))
+                            aircraft_list[i]['addedAt'] = int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+                        except Exception:
+                            aircraft_list[i]['addedAt'] = int(datetime.utcnow().timestamp() * 1000)
                     user_updated = True
                     break
         
