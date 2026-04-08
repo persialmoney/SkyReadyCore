@@ -55,8 +55,11 @@ def handler(event, context):
                 route, route_legs, flight_types, total_time,
                 pic, sic, dual_received, dual_given, solo,
                 cross_country, night, actual_imc, simulated_instrument,
-                day_takeoffs, day_landings, night_takeoffs, night_landings,
+                day_takeoffs, day_landings, day_touch_and_go_landings,
+                night_takeoffs, night_landings, night_touch_and_go_landings,
                 day_full_stop_landings, night_full_stop_landings,
+                hobbs_start, hobbs_end, tach_start, tach_end,
+                block_out, block_in, on_duty, off_duty,
                 approaches, holds, tracking,
                 instructor_user_id, instructor_snapshot, student_user_id, student_snapshot,
                 mirrored_from_entry_id, mirrored_from_user_id,
@@ -83,8 +86,8 @@ def handler(event, context):
         
         for row in rows:
             entry_id = row[0]
-            created_at = int(row[43].timestamp() * 1000)
-            updated_at = int(row[44].timestamp() * 1000) if row[44] else created_at
+            created_at = int(row[53].timestamp() * 1000)
+            updated_at = int(row[54].timestamp() * 1000) if row[54] else created_at
             
             if created_at > last_pulled_at:
                 created.append(format_entry(row))
@@ -374,7 +377,32 @@ def parse_timestamp(iso_string):
         return 0.0
 
 def format_entry(row):
-    """Format database row to GraphQL entry."""
+    """Format database row to GraphQL entry.
+
+    SELECT column order (0-indexed):
+     0  entry_id           18 day_takeoffs              36 approaches
+     1  user_id            19 day_landings              37 holds
+     2  date               20 day_touch_and_go_landings 38 tracking
+     3  aircraft           21 night_takeoffs             39 instructor_user_id
+     4  tail_number        22 night_landings             40 instructor_snapshot
+     5  route              23 night_touch_and_go_lan.    41 student_user_id
+     6  route_legs         24 day_full_stop_landings     42 student_snapshot
+     7  flight_types       25 night_full_stop_landings   43 mirrored_from_entry_id
+     8  total_time         26 hobbs_start                44 mirrored_from_user_id
+     9  pic                27 hobbs_end                  45 lesson_topic
+    10  sic                28 tach_start                 46 ground_instruction
+    11  dual_received      29 tach_end                   47 maneuvers
+    12  dual_given         30 block_out                  48 remarks
+    13  solo               31 block_in                   49 safety_notes
+    14  cross_country      32 on_duty                    50 safety_relevant
+    15  night              33 off_duty                   51 status
+    16  actual_imc         34 (approaches above)         52 signature
+    17  simulated_instr.   35 (holds above)              53 is_flight_review
+                                                         54 return_note  (was 42)
+                                                         55 created_at   (was 43)
+                                                         56 updated_at   (was 44)
+    Note: approaches=36, holds=37, tracking=38 (re-ordered in SELECT).
+    """
     return {
         'entryId': str(row[0]),
         'userId': row[1],
@@ -396,31 +424,41 @@ def format_entry(row):
         'simulatedInstrument': float(row[17]) if row[17] else 0,
         'dayTakeoffs': int(row[18]) if row[18] else 0,
         'dayLandings': int(row[19]) if row[19] else 0,
-        'nightTakeoffs': int(row[20]) if row[20] else 0,
-        'nightLandings': int(row[21]) if row[21] else 0,
-        'dayFullStopLandings': int(row[22]) if row[22] else 0,
-        'nightFullStopLandings': int(row[23]) if row[23] else 0,
-        'approaches': int(row[24]) if row[24] else 0,
-        'holds': bool(row[25]) if row[25] is not None else False,
-        'tracking': bool(row[26]) if row[26] is not None else False,
-        'instructorUserId': row[27],
-        'instructorSnapshot': row[28],
-        'studentUserId': row[29],
-        'studentSnapshot': row[30],
-        'mirroredFromEntryId': str(row[31]) if row[31] else None,
-        'mirroredFromUserId': row[32],
-        'lessonTopic': row[33],
-        'groundInstruction': float(row[34]) if row[34] else 0,
-        'maneuvers': row[35] if row[35] else [],
-        'remarks': row[36],
-        'safetyNotes': row[37],
-        'safetyRelevant': bool(row[38]) if row[38] is not None else False,
-        'status': row[39],
-        'signature': row[40],
-        'isFlightReview': bool(row[41]) if row[41] is not None else False,
-        'returnNote': row[42],
-        'createdAt': float(int(row[43].timestamp() * 1000)),
-        'updatedAt': float(int(row[44].timestamp() * 1000)) if row[44] else float(int(row[43].timestamp() * 1000)),
+        'dayTouchAndGoLandings': int(row[20]) if row[20] else 0,
+        'nightTakeoffs': int(row[21]) if row[21] else 0,
+        'nightLandings': int(row[22]) if row[22] else 0,
+        'nightTouchAndGoLandings': int(row[23]) if row[23] else 0,
+        'dayFullStopLandings': int(row[24]) if row[24] else 0,
+        'nightFullStopLandings': int(row[25]) if row[25] else 0,
+        'hobbsStart': float(row[26]) if row[26] else None,
+        'hobbsEnd': float(row[27]) if row[27] else None,
+        'tachStart': float(row[28]) if row[28] else None,
+        'tachEnd': float(row[29]) if row[29] else None,
+        'blockOut': row[30],
+        'blockIn': row[31],
+        'onDuty': row[32],
+        'offDuty': row[33],
+        'approaches': int(row[34]) if row[34] else 0,
+        'holds': bool(row[35]) if row[35] is not None else False,
+        'tracking': bool(row[36]) if row[36] is not None else False,
+        'instructorUserId': row[37],
+        'instructorSnapshot': row[38],
+        'studentUserId': row[39],
+        'studentSnapshot': row[40],
+        'mirroredFromEntryId': str(row[41]) if row[41] else None,
+        'mirroredFromUserId': row[42],
+        'lessonTopic': row[43],
+        'groundInstruction': float(row[44]) if row[44] else 0,
+        'maneuvers': row[45] if row[45] else [],
+        'remarks': row[46],
+        'safetyNotes': row[47],
+        'safetyRelevant': bool(row[48]) if row[48] is not None else False,
+        'status': row[49],
+        'signature': row[50],
+        'isFlightReview': bool(row[51]) if row[51] is not None else False,
+        'returnNote': row[52],
+        'createdAt': float(int(row[53].timestamp() * 1000)),
+        'updatedAt': float(int(row[54].timestamp() * 1000)) if row[54] else float(int(row[53].timestamp() * 1000)),
     }
 
 def format_minimums_profile(profile):
