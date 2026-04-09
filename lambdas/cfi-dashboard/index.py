@@ -168,7 +168,11 @@ def handler(event, context):
         print(f"[cfi-dashboard] linkedStudents={len(linked_students)}")
 
         # ── 3. Shared logbook entries ────────────────────────────────────────
-        # All logbook entries owned by students who are actively sharing.
+        # Two categories of entries are returned:
+        #   a) All entries from students who are actively sharing (sharing=TRUE)
+        #   b) SIGNED entries from ANY student who has ever had this CFI —
+        #      signed entries are a permanent record of instruction and must
+        #      remain visible even if the student later disables sharing.
         # We fetch ALL (no incremental filter) because this is a live query,
         # not a sync delta — the client discards and re-renders from scratch.
 
@@ -185,20 +189,33 @@ def handler(event, context):
                 SELECT {ENTRY_COLUMNS}
                 FROM logbook_entries
                 WHERE instructor_user_id = %s
-                  AND user_id IN ({placeholders})
+                  AND (
+                      user_id IN ({placeholders})
+                      OR status = 'SIGNED'
+                  )
                   AND deleted_at IS NULL
                 ORDER BY date DESC
             """, [user_id] + sharing_student_ids)
+        else:
+            # No actively-sharing students — still return signed entries
+            cursor.execute(f"""
+                SELECT {ENTRY_COLUMNS}
+                FROM logbook_entries
+                WHERE instructor_user_id = %s
+                  AND status = 'SIGNED'
+                  AND deleted_at IS NULL
+                ORDER BY date DESC
+            """, [user_id])
 
-            seen = set()
-            for row in cursor.fetchall():
-                eid = str(row[0])
-                if eid in seen:
-                    continue
-                seen.add(eid)
-                shared_entries.append(format_entry(row))
+        seen = set()
+        for row in cursor.fetchall():
+            eid = str(row[0])
+            if eid in seen:
+                continue
+            seen.add(eid)
+            shared_entries.append(format_entry(row))
 
-        print(f"[cfi-dashboard] sharedEntries={len(shared_entries)} from {len(sharing_student_ids)} students sharing_ids={sharing_student_ids}")
+        print(f"[cfi-dashboard] sharedEntries={len(shared_entries)} from {len(sharing_student_ids)} sharing students sharing_ids={sharing_student_ids}")
 
         # ── 4. Proficiency shares ────────────────────────────────────────────
         # Latest proficiency snapshot for each student who is actively sharing.
