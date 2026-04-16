@@ -516,6 +516,17 @@ def format_preferences(user_id, prefs):
         'enabledCurrencies': prefs.get('enabledCurrencies', []),
         'createdAt': parse_timestamp(prefs.get('createdAt', '')),
         'updatedAt': parse_timestamp(prefs.get('updatedAt', '')),
+        'priorHoursCutoffDate': prefs.get('priorHoursCutoffDate'),
+        'priorTotalTime': prefs.get('priorTotalTime'),
+        'priorPic': prefs.get('priorPic'),
+        'priorSic': prefs.get('priorSic'),
+        'priorNight': prefs.get('priorNight'),
+        'priorCrossCountry': prefs.get('priorCrossCountry'),
+        'priorActualImc': prefs.get('priorActualImc'),
+        'priorSimulatedInstrument': prefs.get('priorSimulatedInstrument'),
+        'priorDualReceived': prefs.get('priorDualReceived'),
+        'priorDualGiven': prefs.get('priorDualGiven'),
+        'priorSolo': prefs.get('priorSolo'),
     }
 
 
