@@ -12,6 +12,7 @@ import os
 import uuid
 import hashlib
 import boto3
+from decimal import Decimal
 from datetime import datetime
 from db_utils import get_db_connection, return_db_connection
 import psycopg
@@ -580,16 +581,16 @@ def handler(event, context):
                 'enabledCurrencies': prefs.get('enabledCurrencies', []),
                 'flyingStyles': prefs.get('flyingStyles', []),
                 'priorHoursCutoffDate': prefs.get('priorHoursCutoffDate'),
-                'priorTotalTime': prefs.get('priorTotalTime'),
-                'priorPic': prefs.get('priorPic'),
-                'priorSic': prefs.get('priorSic'),
-                'priorNight': prefs.get('priorNight'),
-                'priorCrossCountry': prefs.get('priorCrossCountry'),
-                'priorActualImc': prefs.get('priorActualImc'),
-                'priorSimulatedInstrument': prefs.get('priorSimulatedInstrument'),
-                'priorDualReceived': prefs.get('priorDualReceived'),
-                'priorDualGiven': prefs.get('priorDualGiven'),
-                'priorSolo': prefs.get('priorSolo'),
+                'priorTotalTime': Decimal(str(prefs['priorTotalTime'])) if prefs.get('priorTotalTime') is not None else None,
+                'priorPic': Decimal(str(prefs['priorPic'])) if prefs.get('priorPic') is not None else None,
+                'priorSic': Decimal(str(prefs['priorSic'])) if prefs.get('priorSic') is not None else None,
+                'priorNight': Decimal(str(prefs['priorNight'])) if prefs.get('priorNight') is not None else None,
+                'priorCrossCountry': Decimal(str(prefs['priorCrossCountry'])) if prefs.get('priorCrossCountry') is not None else None,
+                'priorActualImc': Decimal(str(prefs['priorActualImc'])) if prefs.get('priorActualImc') is not None else None,
+                'priorSimulatedInstrument': Decimal(str(prefs['priorSimulatedInstrument'])) if prefs.get('priorSimulatedInstrument') is not None else None,
+                'priorDualReceived': Decimal(str(prefs['priorDualReceived'])) if prefs.get('priorDualReceived') is not None else None,
+                'priorDualGiven': Decimal(str(prefs['priorDualGiven'])) if prefs.get('priorDualGiven') is not None else None,
+                'priorSolo': Decimal(str(prefs['priorSolo'])) if prefs.get('priorSolo') is not None else None,
             }
             user_updated = True
         
