@@ -873,49 +873,56 @@ def handler(event, context):
 
         # ========== PROFICIENCY SNAPSHOTS ==========
         # Snapshots are upserted by (user_id, snapshot_date) — the business key.
-        # The server always takes the client's value; there are no conflicts.
+        # Each snapshot is wrapped in its own SAVEPOINT so a failure here never
+        # rolls back logbook entries or other entities written earlier.
 
         for snap in changes.get('proficiencySnapshots', {}).get('upserted', []):
             snap_id = snap.get('id')
             print(f"[sync-push] Upserting proficiency snapshot: {snap.get('snapshotDate')} score={snap.get('score')}")
-            cursor.execute("""
-                INSERT INTO proficiency_snapshots (
-                    id, user_id, snapshot_date,
-                    score, recency, exposure, envelope, consistency,
-                    score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
-                    active_domains, computed_at, _sync_pending
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
-                ON CONFLICT (user_id, snapshot_date) DO UPDATE SET
-                    id             = EXCLUDED.id,
-                    score          = EXCLUDED.score,
-                    recency        = EXCLUDED.recency,
-                    exposure       = EXCLUDED.exposure,
-                    envelope       = EXCLUDED.envelope,
-                    consistency    = EXCLUDED.consistency,
-                    score_core_vfr = EXCLUDED.score_core_vfr,
-                    score_night    = EXCLUDED.score_night,
-                    score_ifr      = EXCLUDED.score_ifr,
-                    score_tailwheel = EXCLUDED.score_tailwheel,
-                    score_multi    = EXCLUDED.score_multi,
-                    active_domains = EXCLUDED.active_domains,
-                    computed_at    = EXCLUDED.computed_at
-            """, [
-                snap_id,
-                user_id,
-                snap.get('snapshotDate'),
-                snap.get('score'),
-                snap.get('recency', 0),
-                snap.get('exposure', 0),
-                snap.get('envelope', 0),
-                snap.get('consistency', 0),
-                snap.get('scoreCoreVfr'),
-                snap.get('scoreNight'),
-                snap.get('scoreIfr'),
-                snap.get('scoreTailwheel'),
-                snap.get('scoreMulti'),
-                snap.get('activeDomains'),
-                int(snap.get('computedAt', timestamp_ms)),
-            ])
+            cursor.execute("SAVEPOINT snapshot_upsert")
+            try:
+                cursor.execute("""
+                    INSERT INTO proficiency_snapshots (
+                        id, user_id, snapshot_date,
+                        score, recency, exposure, envelope, consistency,
+                        score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
+                        active_domains, computed_at, _sync_pending
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+                    ON CONFLICT (user_id, snapshot_date) DO UPDATE SET
+                        id             = EXCLUDED.id,
+                        score          = EXCLUDED.score,
+                        recency        = EXCLUDED.recency,
+                        exposure       = EXCLUDED.exposure,
+                        envelope       = EXCLUDED.envelope,
+                        consistency    = EXCLUDED.consistency,
+                        score_core_vfr = EXCLUDED.score_core_vfr,
+                        score_night    = EXCLUDED.score_night,
+                        score_ifr      = EXCLUDED.score_ifr,
+                        score_tailwheel = EXCLUDED.score_tailwheel,
+                        score_multi    = EXCLUDED.score_multi,
+                        active_domains = EXCLUDED.active_domains,
+                        computed_at    = EXCLUDED.computed_at
+                """, [
+                    snap_id,
+                    user_id,
+                    snap.get('snapshotDate'),
+                    snap.get('score'),
+                    snap.get('recency', 0),
+                    snap.get('exposure', 0),
+                    snap.get('envelope', 0),
+                    snap.get('consistency', 0),
+                    snap.get('scoreCoreVfr'),
+                    snap.get('scoreNight'),
+                    snap.get('scoreIfr'),
+                    snap.get('scoreTailwheel'),
+                    snap.get('scoreMulti'),
+                    snap.get('activeDomains'),
+                    int(snap.get('computedAt', timestamp_ms)),
+                ])
+                cursor.execute("RELEASE SAVEPOINT snapshot_upsert")
+            except Exception as snap_err:
+                cursor.execute("ROLLBACK TO SAVEPOINT snapshot_upsert")
+                print(f"[sync-push] Warning: snapshot upsert failed (non-fatal, logbook push continues): {snap_err}")
 
         # ========== STUDENT CFI SHARES (consent) ==========
         # Student explicitly opts in/out of sharing proficiency data with a specific CFI.
