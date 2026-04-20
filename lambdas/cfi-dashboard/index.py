@@ -226,7 +226,7 @@ def handler(event, context):
             cursor.execute(f"""
                 SELECT DISTINCT ON (user_id)
                     user_id,
-                    snapshot_date, score, recency, exposure, envelope, consistency,
+                    snapshot_date, score,
                     score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
                     score_seaplane, score_rotorcraft,
                     active_domains, computed_at
@@ -240,19 +240,15 @@ def handler(event, context):
                     'studentUserId':  row[0],
                     'snapshotDate':   row[1],
                     'score':          int(row[2]),
-                    'recency':        int(row[3]),
-                    'exposure':       int(row[4]),
-                    'envelope':       int(row[5]),
-                    'consistency':    int(row[6]),
-                    'scoreCoreVfr':   int(row[7]) if row[7] is not None else None,
-                    'scoreNight':     int(row[8]) if row[8] is not None else None,
-                    'scoreIfr':       int(row[9]) if row[9] is not None else None,
-                    'scoreTailwheel': int(row[10]) if row[10] is not None else None,
-                    'scoreMulti':     int(row[11]) if row[11] is not None else None,
-                    'scoreSeaplane':  int(row[12]) if row[12] is not None else None,
-                    'scoreRotorcraft': int(row[13]) if row[13] is not None else None,
-                    'activeDomains':  row[14],
-                    'computedAt':     float(int(row[15])),
+                    'scoreCoreVfr':   int(row[3]) if row[3] is not None else None,
+                    'scoreNight':     int(row[4]) if row[4] is not None else None,
+                    'scoreIfr':       int(row[5]) if row[5] is not None else None,
+                    'scoreTailwheel': int(row[6]) if row[6] is not None else None,
+                    'scoreMulti':     int(row[7]) if row[7] is not None else None,
+                    'scoreSeaplane':  int(row[8]) if row[8] is not None else None,
+                    'scoreRotorcraft': int(row[9]) if row[9] is not None else None,
+                    'activeDomains':  row[10],
+                    'computedAt':     float(int(row[11])),
                 })
 
         print(f"[cfi-dashboard] proficiencyShares={len(proficiency_shares)}")

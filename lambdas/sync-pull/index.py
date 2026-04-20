@@ -283,7 +283,7 @@ def handler(event, context):
         # Fresh install (lastPulledAt = 0): computed_at > 0 matches all rows.
 
         cursor.execute("""
-            SELECT id, snapshot_date, score, recency, exposure, envelope, consistency,
+            SELECT id, snapshot_date, score,
                    score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
                    score_seaplane, score_rotorcraft,
                    active_domains, computed_at
@@ -528,6 +528,11 @@ def format_preferences(user_id, prefs):
         'priorDualReceived': prefs.get('priorDualReceived'),
         'priorDualGiven': prefs.get('priorDualGiven'),
         'priorSolo': prefs.get('priorSolo'),
+        'priorAirplaneTime': prefs.get('priorAirplaneTime'),
+        'priorTailwheelTime': prefs.get('priorTailwheelTime'),
+        'priorMultiTime': prefs.get('priorMultiTime'),
+        'priorSeaplaneTime': prefs.get('priorSeaplaneTime'),
+        'priorRotorcraftTime': prefs.get('priorRotorcraftTime'),
     }
 
 
@@ -587,27 +592,23 @@ def format_snapshot(row):
     """Format proficiency_snapshots DB row to GraphQL ProficiencySnapshot type.
 
     Column order matches SELECT in sync-pull:
-      0:id 1:snapshot_date 2:score 3:recency 4:exposure 5:envelope 6:consistency
-      7:score_core_vfr 8:score_night 9:score_ifr 10:score_tailwheel 11:score_multi
-      12:score_seaplane 13:score_rotorcraft 14:active_domains 15:computed_at
+      0:id 1:snapshot_date 2:score
+      3:score_core_vfr 4:score_night 5:score_ifr 6:score_tailwheel 7:score_multi
+      8:score_seaplane 9:score_rotorcraft 10:active_domains 11:computed_at
     """
     return {
         'id':             str(row[0]),
         'snapshotDate':   row[1],
         'score':          int(row[2]),
-        'recency':        int(row[3]),
-        'exposure':       int(row[4]),
-        'envelope':       int(row[5]),
-        'consistency':    int(row[6]),
-        'scoreCoreVfr':   int(row[7]) if row[7] is not None else None,
-        'scoreNight':     int(row[8]) if row[8] is not None else None,
-        'scoreIfr':       int(row[9]) if row[9] is not None else None,
-        'scoreTailwheel': int(row[10]) if row[10] is not None else None,
-        'scoreMulti':     int(row[11]) if row[11] is not None else None,
-        'scoreSeaplane':  int(row[12]) if row[12] is not None else None,
-        'scoreRotorcraft': int(row[13]) if row[13] is not None else None,
-        'activeDomains':  row[14],
-        'computedAt':     float(int(row[15])),
+        'scoreCoreVfr':   int(row[3]) if row[3] is not None else None,
+        'scoreNight':     int(row[4]) if row[4] is not None else None,
+        'scoreIfr':       int(row[5]) if row[5] is not None else None,
+        'scoreTailwheel': int(row[6]) if row[6] is not None else None,
+        'scoreMulti':     int(row[7]) if row[7] is not None else None,
+        'scoreSeaplane':  int(row[8]) if row[8] is not None else None,
+        'scoreRotorcraft': int(row[9]) if row[9] is not None else None,
+        'activeDomains':  row[10],
+        'computedAt':     float(int(row[11])),
     }
 
 

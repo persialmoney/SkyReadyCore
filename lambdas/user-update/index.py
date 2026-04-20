@@ -199,6 +199,10 @@ def update_user(user_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         if 'flyingStyles' in preferences and preferences['flyingStyles'] is not None:
             update_expression_parts.append("preferences.flyingStyles = :flyingStyles")
             expression_values[":flyingStyles"] = preferences['flyingStyles']
+
+        if 'advisoryRadiusNm' in preferences and preferences['advisoryRadiusNm'] is not None:
+            update_expression_parts.append("preferences.advisoryRadiusNm = :advisoryRadiusNm")
+            expression_values[":advisoryRadiusNm"] = int(preferences['advisoryRadiusNm'])
     
     # Conditionally update pilotInfo if provided.
     # Logbook entries (Postgres) are not modified here — signed rows keep snapshots/signatures.

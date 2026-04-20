@@ -6,6 +6,7 @@ import json
 import os
 import gzip
 import csv
+import hashlib
 import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.error
@@ -613,17 +614,45 @@ def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
 
 
 def parse_csv_sigmet(data: bytes) -> List[Dict[str, Any]]:
-    """Parse SIGMET CSV data."""
+    """Parse SIGMET CSV from AWC bulk cache file.
+
+    Columns: raw_text, valid_time_from, valid_time_to, lon:lat points,
+             min_ft_msl, max_ft_msl, movement_dir_degrees, movement_speed_kt,
+             hazard, severity, airsigmet_type
+    """
     records = []
     try:
         text = data.decode('utf-8')
         reader = csv.DictReader(text.splitlines())
         for row in reader:
-            record = dict(row)
-            # Generate unique ID if not present
-            if 'airsigmetId' not in record or not record['airsigmetId']:
-                record['airsigmetId'] = f"AWC-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{len(records)}"
-            records.append(record)
+            raw_text = row.get('raw_text', '')
+            # Stable ID: content hash so re-ingests don't create duplicate keys
+            sigmet_id = hashlib.md5(raw_text.encode()).hexdigest()[:16]
+
+            # Parse polygon from "lon:lat points" (semicolon-separated "lon:lat" pairs)
+            polygon: List[List[float]] = []
+            pts_str = row.get('lon:lat points', '')
+            for pt in pts_str.split(';'):
+                pt = pt.strip()
+                if ':' in pt:
+                    lon_s, lat_s = pt.split(':', 1)
+                    try:
+                        polygon.append([float(lon_s), float(lat_s)])
+                    except ValueError:
+                        pass
+
+            records.append({
+                'airsigmetId': sigmet_id,
+                'raw_text': raw_text,
+                'valid_time_from': row.get('valid_time_from'),
+                'valid_time_to': row.get('valid_time_to'),
+                'min_ft_msl': row.get('min_ft_msl', ''),
+                'max_ft_msl': row.get('max_ft_msl', ''),
+                'hazard': row.get('hazard', ''),
+                'severity': row.get('severity', ''),
+                'airsigmet_type': row.get('airsigmet_type', 'SIGMET'),
+                'polygon': polygon,
+            })
         logger.info(f"Parsed {len(records)} SIGMET records from CSV")
     except Exception as e:
         logger.error(f"Error parsing SIGMET CSV: {str(e)}")
@@ -632,22 +661,52 @@ def parse_csv_sigmet(data: bytes) -> List[Dict[str, Any]]:
 
 
 def parse_xml_airmet(data: bytes) -> List[Dict[str, Any]]:
-    """Parse G-AIRMET XML data."""
+    """Parse G-AIRMET XML from AWC bulk cache file.
+
+    Each <GAIRMET> element contains scalar fields plus a nested
+    <area><point><longitude>...</longitude><latitude>...</latitude></point></area>
+    block for the polygon.  The old implementation read only top-level child.text
+    and completely missed the nested polygon.
+    """
     records = []
     try:
         root = ET.fromstring(data)
-        for airmet_elem in root.findall('.//G-AIRMET'):
-            record = {}
-            for child in airmet_elem:
-                tag = child.tag
-                text = child.text
-                record[tag] = text if text else None
-            
-            # Generate ID if not present
-            if 'forecastId' not in record or not record['forecastId']:
-                record['forecastId'] = f"AWC-GAIRMET-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{len(records)}"
-            
-            records.append(record)
+        for elem in root.findall('.//GAIRMET'):
+            product    = elem.findtext('product', '')
+            tag        = elem.findtext('tag', '')
+            valid_time = elem.findtext('valid_time', '')
+            expire_time = elem.findtext('expire_time', '')
+            issue_time  = elem.findtext('issue_time', '')
+            due_to     = elem.findtext('due_to', '')
+
+            hazard_elem = elem.find('hazard')
+            hazard_type = hazard_elem.get('type', '') if hazard_elem is not None else ''
+
+            # Stable ID from product + tag + valid_time (survives re-ingests)
+            ts = valid_time.replace(':', '').replace('-', '').replace('Z', '')
+            airmet_id = f"{product}-{tag}-{ts}"
+
+            # Parse nested <area><point> polygon
+            polygon: List[List[float]] = []
+            for pt in elem.findall('.//area/point'):
+                try:
+                    lon = float(pt.findtext('longitude', '0'))
+                    lat = float(pt.findtext('latitude', '0'))
+                    polygon.append([lon, lat])
+                except ValueError:
+                    pass
+
+            records.append({
+                'forecastId': airmet_id,
+                'product': product,
+                'tag': tag,
+                'valid_time': valid_time,
+                'expire_time': expire_time,
+                'issue_time': issue_time,
+                'due_to': due_to,
+                'hazard_type': hazard_type,
+                'polygon': polygon,
+            })
         logger.info(f"Parsed {len(records)} G-AIRMET records from XML")
     except Exception as e:
         logger.error(f"Error parsing G-AIRMET XML: {str(e)}")

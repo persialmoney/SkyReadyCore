@@ -591,6 +591,13 @@ def handler(event, context):
                 'priorDualReceived': Decimal(str(prefs['priorDualReceived'])) if prefs.get('priorDualReceived') is not None else None,
                 'priorDualGiven': Decimal(str(prefs['priorDualGiven'])) if prefs.get('priorDualGiven') is not None else None,
                 'priorSolo': Decimal(str(prefs['priorSolo'])) if prefs.get('priorSolo') is not None else None,
+                # Class buckets — let the proficiency engine attribute prior hours
+                # to the right domain (Core VFR / Tailwheel / Multi / Seaplane / Rotorcraft).
+                'priorAirplaneTime': Decimal(str(prefs['priorAirplaneTime'])) if prefs.get('priorAirplaneTime') is not None else None,
+                'priorTailwheelTime': Decimal(str(prefs['priorTailwheelTime'])) if prefs.get('priorTailwheelTime') is not None else None,
+                'priorMultiTime': Decimal(str(prefs['priorMultiTime'])) if prefs.get('priorMultiTime') is not None else None,
+                'priorSeaplaneTime': Decimal(str(prefs['priorSeaplaneTime'])) if prefs.get('priorSeaplaneTime') is not None else None,
+                'priorRotorcraftTime': Decimal(str(prefs['priorRotorcraftTime'])) if prefs.get('priorRotorcraftTime') is not None else None,
             }
             user_updated = True
         
@@ -884,18 +891,14 @@ def handler(event, context):
                 cursor.execute("""
                     INSERT INTO proficiency_snapshots (
                         id, user_id, snapshot_date,
-                        score, recency, exposure, envelope, consistency,
+                        score,
                         score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
                         score_seaplane, score_rotorcraft,
                         active_domains, computed_at, _sync_pending
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
                     ON CONFLICT (user_id, snapshot_date) DO UPDATE SET
                         id             = EXCLUDED.id,
                         score          = EXCLUDED.score,
-                        recency        = EXCLUDED.recency,
-                        exposure       = EXCLUDED.exposure,
-                        envelope       = EXCLUDED.envelope,
-                        consistency    = EXCLUDED.consistency,
                         score_core_vfr = EXCLUDED.score_core_vfr,
                         score_night    = EXCLUDED.score_night,
                         score_ifr      = EXCLUDED.score_ifr,
@@ -910,10 +913,6 @@ def handler(event, context):
                     user_id,
                     snap.get('snapshotDate'),
                     snap.get('score'),
-                    snap.get('recency', 0),
-                    snap.get('exposure', 0),
-                    snap.get('envelope', 0),
-                    snap.get('consistency', 0),
                     snap.get('scoreCoreVfr'),
                     snap.get('scoreNight'),
                     snap.get('scoreIfr'),

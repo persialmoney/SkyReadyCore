@@ -4,6 +4,7 @@ This function is used as an AppSync Lambda resolver.
 Uses cache-first strategy: checks ElastiCache, falls back to API if cache miss.
 """
 import json
+import math
 import os
 import boto3
 import re
@@ -1806,91 +1807,183 @@ def _create_fallback_forecast(taf_data: Dict) -> list:
     }]
 
 
-async def fetch_airmets(airport_code: str) -> list:
+def _point_in_polygon(lat: float, lon: float, polygon: list) -> bool:
+    """Ray-casting point-in-polygon test. polygon = [[lon, lat], ...]"""
+    n = len(polygon)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i][0], polygon[i][1]
+        xj, yj = polygon[j][0], polygon[j][1]
+        if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in miles between two lat/lon points."""
+    R = 3958.8
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def _polygon_bbox_expanded_contains(lat: float, lon: float, polygon: list, buffer_miles: float):
     """
-    Fetch active AIRMET and SIGMET advisories that contain the given airport
-    using the AVWX REST API /airsigmet/{location} endpoint.
-    Returns an empty list on error or when no advisories are active.
+    Expands the polygon's axis-aligned bounding box by buffer_miles and checks
+    whether the airport point falls inside the expanded box.
+
+    Returns (is_contained: bool, min_vertex_dist_miles: float).
+    The vertex distance is useful for the "~Xmi" label in the UI.
+    """
+    if not polygon:
+        return False, float('inf')
+    lats = [pt[1] for pt in polygon]
+    lons = [pt[0] for pt in polygon]
+    lat_buf = buffer_miles / 69.0
+    cos_lat = math.cos(math.radians(lat))
+    lon_buf = buffer_miles / (69.0 * cos_lat) if cos_lat > 0 else buffer_miles / 69.0
+    in_box = (
+        min(lats) - lat_buf <= lat <= max(lats) + lat_buf and
+        min(lons) - lon_buf <= lon <= max(lons) + lon_buf
+    )
+    if not in_box:
+        return False, float('inf')
+    min_dist = min(_haversine_miles(lat, lon, pt[1], pt[0]) for pt in polygon)
+    return True, min_dist
+
+
+async def _get_airport_coords(airport_code: str):
+    """Return (lat, lon) from the ValKey station cache, or None on miss."""
+    client = await get_glide_client()
+    if not client:
+        return None
+    try:
+        raw = await client.get(f"station:{airport_code.upper()}")
+        if not raw:
+            return None
+        data = json.loads(raw if isinstance(raw, str) else raw.decode())
+        lat = data.get('latitude') or data.get('lat')
+        lon = data.get('longitude') or data.get('lon')
+        if lat is None or lon is None:
+            return None
+        return float(lat), float(lon)
+    except Exception as e:
+        logger.warning(f"[AIRMET] station cache lookup failed for {airport_code}: {e}")
+        return None
+
+
+async def fetch_airmets(airport_code: str, radius_miles: int = 100) -> list:
+    """
+    Fetch active SIGMETs and G-AIRMETs affecting the given airport using the
+    ValKey cache populated by the weather-cache-ingest Lambda from AWC bulk files.
+    Uses PIP for inside-polygon detection; bbox expansion for nearby advisories.
+
+    NOTE: PIREPs and NOTAMs continue to use AVWX — only this function is migrated.
     """
     airport_code = airport_code.upper()
-    logger.info(f"[AIRMET] Fetching AIRMETs/SIGMETs for {airport_code}")
+    logger.info(f"[AIRMET] Fetching advisories for {airport_code} from ValKey cache")
 
-    token = _get_avwx_token()
-    if not token:
-        logger.warning("[AIRMET] AVWX token not available, skipping advisory fetch")
+    coords = await _get_airport_coords(airport_code)
+    if not coords:
+        logger.warning(f"[AIRMET] No station coords for {airport_code} — returning empty")
+        return []
+    lat, lon = coords
+
+    client = await get_glide_client()
+    if not client:
+        logger.warning("[AIRMET] No ValKey client available — returning empty")
         return []
 
-    url = f"{AVWX_BASE_URL}/airsigmet/{airport_code}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Token {token}"})
+    results = []
 
+    # ── SIGMETs ───────────────────────────────────────────────────────────────
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode())
-
-        # API returns either "reports" or "results" depending on the response shape
-        raw_reports = data.get("reports") or data.get("results") or []
-        logger.info(f"[AIRMET] {airport_code}: {len(raw_reports)} raw reports from API")
-        results = []
-        skipped = 0
-        for report in raw_reports:
-            bulletin = report.get("bulletin") or {}
-            report_type = (bulletin.get("type") or {}).get("value", "")
-
-            # start_time / end_time at the report level are often null;
-            # prefer the observation window, fall back to forecast window
-            obs = report.get("observation") or {}
-            forecast = report.get("forecast") or {}
-
-            end_time = (
-                _dt(report.get("end_time"))
-                or _dt(obs.get("end_time"))
-                or _dt(forecast.get("end_time"))
-            )
-
-            # Skip expired advisories — no point surfacing stale data
-            if _is_expired(end_time):
-                skipped += 1
-                continue
-
-            start_time = (
-                _dt(report.get("start_time"))
-                or _dt(obs.get("start_time"))
-                or _dt(forecast.get("start_time"))
-            )
-
-            floor_val = _alt(obs.get("floor")) if obs.get("floor") is not None else _alt((forecast or {}).get("floor"))
-            ceiling_val = _alt(obs.get("ceiling")) if obs.get("ceiling") is not None else _alt((forecast or {}).get("ceiling"))
-            obs_type = (obs.get("type") or {}).get("value") or (forecast.get("type") or {}).get("value")
-
-            logger.debug(f"[AIRMET] {airport_code}: type={report_type} obsType={obs_type} start={start_time} end={end_time} fl={floor_val}-{ceiling_val}")
-            results.append({
-                "reportType": report_type,
-                "type": report.get("type", ""),
-                "area": report.get("area"),
-                "startTime": start_time,
-                "endTime": end_time,
-                "observationType": obs_type,
-                "floor": floor_val,
-                "ceiling": ceiling_val,
-                "raw": report.get("raw", ""),
-            })
-
-        type_counts = {}
-        for r in results:
-            k = r["reportType"] or "UNKNOWN"
-            type_counts[k] = type_counts.get(k, 0) + 1
-        logger.info(f"[AIRMET] {airport_code}: returning {len(results)} active, {skipped} expired skipped | breakdown={type_counts}")
-        return results
-
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            logger.info(f"[AIRMET] {airport_code}: no advisories (HTTP 404)")
-            return []
-        logger.error(f"[AIRMET] {airport_code}: HTTP {e.code} {e.reason}")
-        return []
+        sigmet_ids = await client.smembers("sigmet:all")
+        if sigmet_ids:
+            keys = [f"sigmet:{sid.decode() if isinstance(sid, bytes) else sid}" for sid in sigmet_ids]
+            raw_list = await client.mget(keys)
+            for raw in raw_list:
+                if not raw:
+                    continue
+                rec = json.loads(raw if isinstance(raw, str) else raw.decode())
+                polygon = rec.get('polygon', [])
+                if not polygon:
+                    continue
+                is_inside = _point_in_polygon(lat, lon, polygon)
+                if is_inside:
+                    dist_miles = None
+                else:
+                    in_bbox, vertex_dist = _polygon_bbox_expanded_contains(lat, lon, polygon, radius_miles)
+                    if not in_bbox:
+                        continue
+                    dist_miles = round(vertex_dist, 1)
+                floor_s = rec.get('min_ft_msl', '')
+                ceil_s  = rec.get('max_ft_msl', '')
+                results.append({
+                    "reportType": "sigmet",
+                    "type": rec.get('hazard', 'CONVECTIVE'),
+                    "area": None,
+                    "startTime": rec.get('valid_time_from'),
+                    "endTime": rec.get('valid_time_to'),
+                    "observationType": rec.get('severity'),
+                    "floor": int(floor_s) if floor_s and str(floor_s).strip().lstrip('-').isdigit() else None,
+                    "ceiling": int(ceil_s) if ceil_s and str(ceil_s).strip().lstrip('-').isdigit() else None,
+                    "raw": rec.get('raw_text', ''),
+                    "distanceMiles": dist_miles,
+                })
     except Exception as e:
-        logger.error(f"[AIRMET] {airport_code}: {type(e).__name__}: {e}")
-        return []
+        logger.error(f"[AIRMET] SIGMET cache query failed for {airport_code}: {e}")
+
+    # ── G-AIRMETs ─────────────────────────────────────────────────────────────
+    try:
+        airmet_ids = await client.smembers("airmet:all")
+        if airmet_ids:
+            keys = [f"airmet:{aid.decode() if isinstance(aid, bytes) else aid}" for aid in airmet_ids]
+            raw_list = await client.mget(keys)
+            for raw in raw_list:
+                if not raw:
+                    continue
+                rec = json.loads(raw if isinstance(raw, str) else raw.decode())
+                polygon = rec.get('polygon', [])
+                if not polygon:
+                    continue
+                is_inside = _point_in_polygon(lat, lon, polygon)
+                if is_inside:
+                    dist_miles = None
+                else:
+                    in_bbox, vertex_dist = _polygon_bbox_expanded_contains(lat, lon, polygon, radius_miles)
+                    if not in_bbox:
+                        continue
+                    dist_miles = round(vertex_dist, 1)
+                product     = rec.get('product', '')
+                hazard_type = rec.get('hazard_type', '')
+                label = f"{product} – {hazard_type}" if hazard_type else product
+                results.append({
+                    "reportType": "airmet",
+                    "type": label,
+                    "area": None,
+                    "startTime": rec.get('valid_time'),
+                    "endTime": rec.get('expire_time'),
+                    "observationType": rec.get('due_to'),
+                    "floor": None,
+                    "ceiling": None,
+                    "raw": rec.get('due_to', ''),
+                    "distanceMiles": dist_miles,
+                })
+    except Exception as e:
+        logger.error(f"[AIRMET] G-AIRMET cache query failed for {airport_code}: {e}")
+
+    type_counts: dict = {}
+    for r in results:
+        k = r["reportType"]
+        type_counts[k] = type_counts.get(k, 0) + 1
+    logger.info(f"[AIRMET] {airport_code}: returning {len(results)} advisories after PIP filter | {type_counts}")
+    return results
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -1955,8 +2048,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 airport_code = arguments.get("airportCode")
                 if not airport_code:
                     raise ValueError("airportCode is required")
-                result = await fetch_airmets(airport_code)
-                logger.info(f"[Handler] getAirSigmets {airport_code}: {len(result)} advisories in {time.time()-start_time:.2f}s")
+                radius_miles = int(arguments.get("radiusMiles") or 100)
+                result = await fetch_airmets(airport_code, radius_miles)
+                logger.info(f"[Handler] getAirSigmets {airport_code} r={radius_miles}nm: {len(result)} advisories in {time.time()-start_time:.2f}s")
                 return result
 
             elif field_name == "getDistance":
