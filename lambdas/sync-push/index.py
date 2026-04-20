@@ -886,8 +886,9 @@ def handler(event, context):
                         id, user_id, snapshot_date,
                         score, recency, exposure, envelope, consistency,
                         score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
+                        score_seaplane, score_rotorcraft,
                         active_domains, computed_at, _sync_pending
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
                     ON CONFLICT (user_id, snapshot_date) DO UPDATE SET
                         id             = EXCLUDED.id,
                         score          = EXCLUDED.score,
@@ -900,6 +901,8 @@ def handler(event, context):
                         score_ifr      = EXCLUDED.score_ifr,
                         score_tailwheel = EXCLUDED.score_tailwheel,
                         score_multi    = EXCLUDED.score_multi,
+                        score_seaplane = EXCLUDED.score_seaplane,
+                        score_rotorcraft = EXCLUDED.score_rotorcraft,
                         active_domains = EXCLUDED.active_domains,
                         computed_at    = EXCLUDED.computed_at
                 """, [
@@ -916,6 +919,8 @@ def handler(event, context):
                     snap.get('scoreIfr'),
                     snap.get('scoreTailwheel'),
                     snap.get('scoreMulti'),
+                    snap.get('scoreSeaplane'),
+                    snap.get('scoreRotorcraft'),
                     snap.get('activeDomains'),
                     int(snap.get('computedAt', timestamp_ms)),
                 ])

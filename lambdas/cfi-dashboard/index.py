@@ -228,6 +228,7 @@ def handler(event, context):
                     user_id,
                     snapshot_date, score, recency, exposure, envelope, consistency,
                     score_core_vfr, score_night, score_ifr, score_tailwheel, score_multi,
+                    score_seaplane, score_rotorcraft,
                     active_domains, computed_at
                 FROM proficiency_snapshots
                 WHERE user_id IN ({placeholders})
@@ -248,8 +249,10 @@ def handler(event, context):
                     'scoreIfr':       int(row[9]) if row[9] is not None else None,
                     'scoreTailwheel': int(row[10]) if row[10] is not None else None,
                     'scoreMulti':     int(row[11]) if row[11] is not None else None,
-                    'activeDomains':  row[12],
-                    'computedAt':     float(int(row[13])),
+                    'scoreSeaplane':  int(row[12]) if row[12] is not None else None,
+                    'scoreRotorcraft': int(row[13]) if row[13] is not None else None,
+                    'activeDomains':  row[14],
+                    'computedAt':     float(int(row[15])),
                 })
 
         print(f"[cfi-dashboard] proficiencyShares={len(proficiency_shares)}")
