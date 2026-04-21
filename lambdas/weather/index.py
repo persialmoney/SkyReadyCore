@@ -1986,6 +1986,76 @@ async def fetch_airmets(airport_code: str, radius_miles: int = 100) -> list:
     return results
 
 
+async def fetch_advisory_bundle(report_type: str) -> list:
+    """
+    Fetch all active SIGMETs or G-AIRMETs for the AdvisoryMap screen.
+
+    Reads a single pre-aggregated ValKey key (sigmet:bundle / airmet:bundle) that the
+    weather-cache-ingest Lambda writes after each AWC cache pull. No SMEMBERS+MGET fan-out,
+    no PIP — one GET, one json.loads, return.
+    """
+    rt = (report_type or "").lower()
+    if rt not in ("sigmet", "airmet"):
+        logger.warning(f"[AdvisoryBundle] invalid reportType={report_type!r} — returning empty")
+        return []
+
+    client = await get_glide_client()
+    if not client:
+        logger.warning("[AdvisoryBundle] No ValKey client available — returning empty")
+        return []
+
+    bundle_key = f"{rt}:bundle"
+    try:
+        raw = await client.get(bundle_key)
+        if not raw:
+            logger.info(f"[AdvisoryBundle] {bundle_key} miss")
+            return []
+        records = json.loads(raw if isinstance(raw, str) else raw.decode())
+    except Exception as e:
+        logger.error(f"[AdvisoryBundle] failed reading {bundle_key}: {type(e).__name__}: {e}")
+        return []
+
+    results = []
+    if rt == "sigmet":
+        for rec in records:
+            polygon = rec.get('polygon') or []
+            if not polygon:
+                continue
+            floor_s = rec.get('min_ft_msl', '')
+            ceil_s = rec.get('max_ft_msl', '')
+            results.append({
+                "reportType": "sigmet",
+                "type": rec.get('hazard') or rec.get('airsigmet_type', 'SIGMET'),
+                "startTime": rec.get('valid_time_from'),
+                "endTime": rec.get('valid_time_to'),
+                "floor": int(floor_s) if floor_s and str(floor_s).strip().lstrip('-').isdigit() else None,
+                "ceiling": int(ceil_s) if ceil_s and str(ceil_s).strip().lstrip('-').isdigit() else None,
+                "raw": rec.get('raw_text', ''),
+                "polygon": polygon,
+            })
+    else:
+        for rec in records:
+            polygon = rec.get('polygon') or []
+            if not polygon:
+                continue
+            product = rec.get('product', '')
+            hazard_type = rec.get('hazard_type', '')
+            label = f"{product} – {hazard_type}" if hazard_type else (product or 'AIRMET')
+            results.append({
+                "reportType": "airmet",
+                "type": label,
+                "startTime": rec.get('valid_time'),
+                "endTime": rec.get('expire_time'),
+                "floor": None,
+                "ceiling": None,
+                "raw": rec.get('due_to', ''),
+                "polygon": polygon,
+            })
+
+    logger.info(f"[AdvisoryBundle] {bundle_key}: returning {len(results)} records")
+    return results
+
+
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Lambda handler for AppSync resolver.
@@ -2051,6 +2121,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 radius_miles = int(arguments.get("radiusMiles") or 100)
                 result = await fetch_airmets(airport_code, radius_miles)
                 logger.info(f"[Handler] getAirSigmets {airport_code} r={radius_miles}nm: {len(result)} advisories in {time.time()-start_time:.2f}s")
+                return result
+
+            elif field_name == "getActiveAirSigmets":
+                report_type = arguments.get("reportType")
+                if not report_type:
+                    raise ValueError("reportType is required")
+                result = await fetch_advisory_bundle(report_type)
+                logger.info(f"[Handler] getActiveAirSigmets type={report_type}: {len(result)} advisories in {time.time()-start_time:.2f}s")
                 return result
 
             elif field_name == "getDistance":

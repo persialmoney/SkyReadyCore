@@ -976,7 +976,40 @@ async def store_sigmet(glide_client: GlideClusterClient, records: List[Dict[str,
             await glide_client.expire(hazard_key, TTL_SIGMET)
         except Exception as error:
             logger.error(f"[Cache Store] Failed to update SIGMET hazard index {hazard}: {type(error).__name__}: {str(error)}")
-    
+
+    # Pre-aggregated bundle for the AdvisoryMap screen: a single JSON blob of all
+    # real SIGMETs (skipping AIRMET/OUTLOOK rows from the same combined feed) so
+    # the map query is a single GET — no SMEMBERS+MGET fan-out.
+    try:
+        bundle_records = []
+        for record in records:
+            kind = (record.get('airsigmet_type') or '').upper()
+            if kind not in ('SIGMET', 'INTL_SIGMET'):
+                continue
+            polygon = record.get('polygon') or []
+            if not polygon:
+                continue
+            bundle_records.append({
+                'airsigmetId': record.get('airsigmetId'),
+                'polygon': polygon,
+                'raw_text': record.get('raw_text', ''),
+                'valid_time_from': record.get('valid_time_from'),
+                'valid_time_to': record.get('valid_time_to'),
+                'min_ft_msl': record.get('min_ft_msl', ''),
+                'max_ft_msl': record.get('max_ft_msl', ''),
+                'hazard': record.get('hazard', ''),
+                'severity': record.get('severity', ''),
+                'airsigmet_type': kind,
+            })
+        await glide_client.set(
+            "sigmet:bundle",
+            json.dumps(bundle_records),
+            expiry=ExpirySet(ExpiryType.SEC, TTL_SIGMET),
+        )
+        logger.info(f"[Cache Store] Wrote sigmet:bundle with {len(bundle_records)} records")
+    except Exception as error:
+        logger.error(f"[Cache Store] Failed to write sigmet:bundle: {type(error).__name__}: {str(error)}")
+
     logger.info(f"Stored {len(sigmet_ids)} SIGMET records")
 
 
@@ -1046,7 +1079,33 @@ async def store_airmet(glide_client: GlideClusterClient, records: List[Dict[str,
             await glide_client.expire(hazard_key, TTL_AIRMET)
         except Exception as error:
             logger.error(f"[Cache Store] Failed to update AIRMET hazard index {hazard}: {type(error).__name__}: {str(error)}")
-    
+
+    # Pre-aggregated bundle for the AdvisoryMap screen: a single JSON blob of all
+    # G-AIRMETs with polygons so the map query is a single GET — no SMEMBERS+MGET fan-out.
+    try:
+        bundle_records = []
+        for record in records:
+            polygon = record.get('polygon') or []
+            if not polygon:
+                continue
+            bundle_records.append({
+                'forecastId': record.get('forecastId'),
+                'polygon': polygon,
+                'product': record.get('product', ''),
+                'hazard_type': record.get('hazard_type', ''),
+                'valid_time': record.get('valid_time'),
+                'expire_time': record.get('expire_time'),
+                'due_to': record.get('due_to', ''),
+            })
+        await glide_client.set(
+            "airmet:bundle",
+            json.dumps(bundle_records),
+            expiry=ExpirySet(ExpiryType.SEC, TTL_AIRMET),
+        )
+        logger.info(f"[Cache Store] Wrote airmet:bundle with {len(bundle_records)} records")
+    except Exception as error:
+        logger.error(f"[Cache Store] Failed to write airmet:bundle: {type(error).__name__}: {str(error)}")
+
     logger.info(f"Stored {len(airmet_ids)} G-AIRMET records")
 
 
