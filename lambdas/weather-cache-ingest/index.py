@@ -42,8 +42,11 @@ STAGE = os.environ.get('STAGE', 'dev')
 # TTL values (in seconds)
 TTL_METAR = 3600  # 1 hour
 TTL_TAF = 3600  # 1 hour
-TTL_SIGMET = 120  # 2 minutes
-TTL_AIRMET = 120  # 2 minutes
+TTL_SIGMET = 120  # 2 minutes (per-record; OPS-bar path tolerates churn)
+TTL_AIRMET = 120  # 2 minutes (per-record; OPS-bar path tolerates churn)
+# Bundle keys are read by the AdvisoryMap screen and must outlive a missed ingest
+# cycle (ingest runs every 5 min; allow ~2 missed cycles before going dark).
+TTL_BUNDLE = 900  # 15 minutes
 TTL_PIREP = 120  # 2 minutes
 TTL_STATION = 90000  # 25 hours
 
@@ -109,22 +112,30 @@ async def execute_operations_with_error_logging(operations: List, operation_name
 
 
 def download_and_decompress(url: str) -> bytes:
-    """Download and decompress gzipped file from URL."""
+    """Download and optionally decompress file from URL.
+    
+    Handles both gzipped (.gz URLs) and plain text/JSON responses.
+    """
     try:
         logger.info(f"Downloading {url}")
         with urllib.request.urlopen(url, timeout=30) as response:
-            compressed_data = response.read()
+            data = response.read()
         
-        logger.info(f"Decompressing {len(compressed_data)} bytes")
-        decompressed_data = gzip.decompress(compressed_data)
-        logger.info(f"Decompressed to {len(decompressed_data)} bytes")
-        
-        return decompressed_data
+        # Check if data is gzipped (starts with magic number 0x1f8b)
+        if len(data) >= 2 and data[0] == 0x1f and data[1] == 0x8b:
+            logger.info(f"Decompressing {len(data)} bytes")
+            decompressed_data = gzip.decompress(data)
+            logger.info(f"Decompressed to {len(decompressed_data)} bytes")
+            return decompressed_data
+        else:
+            logger.info(f"Downloaded {len(data)} bytes (not gzipped)")
+            return data
+            
     except urllib.error.URLError as e:
         logger.error(f"Error downloading {url}: {str(e)}")
         raise
     except Exception as e:
-        logger.error(f"Error decompressing {url}: {str(e)}")
+        logger.error(f"Error processing {url}: {str(e)}")
         raise
 
 
@@ -613,6 +624,97 @@ def parse_xml_taf(data: bytes) -> List[Dict[str, Any]]:
     return records
 
 
+def parse_json_sigmet(data: bytes) -> List[Dict[str, Any]]:
+    """Parse SIGMET JSON from AWC API.
+    
+    Provides better structured data than CSV:
+    - altitudeHi1/Hi2 and altitudeLow1/Low2 for altitude ranges
+    - coords array with lat/lon objects
+    - validTimeFrom/To as unix timestamps
+    - seriesId for better identification
+    """
+    records = []
+    try:
+        text = data.decode('utf-8')
+        items = json.loads(text)
+        if not isinstance(items, list):
+            items = [items]
+        
+        for item in items:
+            sigmet_id = item.get('seriesId', '')
+            if not sigmet_id:
+                # Fallback to hash if no seriesId
+                raw = item.get('rawAirSigmet', '')
+                sigmet_id = hashlib.md5(raw.encode()).hexdigest()[:16]
+            
+            # Extract polygon coordinates
+            polygon: List[List[float]] = []
+            coords = item.get('coords', [])
+            for pt in coords:
+                try:
+                    lon = float(pt.get('lon', 0))
+                    lat = float(pt.get('lat', 0))
+                    polygon.append([lon, lat])
+                except (ValueError, AttributeError, TypeError):
+                    pass
+            
+            # Calculate floor and ceiling from altitude ranges
+            # altitudeLow1/Low2 are floor range, altitudeHi1/Hi2 are ceiling range
+            altitude_low1 = item.get('altitudeLow1')
+            altitude_low2 = item.get('altitudeLow2')
+            altitude_hi1 = item.get('altitudeHi1')
+            altitude_hi2 = item.get('altitudeHi2')
+            
+            # Use the lower of the two lows for floor, higher of the two highs for ceiling
+            floor_ft = None
+            if altitude_low1 is not None or altitude_low2 is not None:
+                lows = [x for x in [altitude_low1, altitude_low2] if x is not None]
+                floor_ft = min(lows) if lows else None
+            
+            ceiling_ft = None
+            if altitude_hi1 is not None or altitude_hi2 is not None:
+                highs = [x for x in [altitude_hi1, altitude_hi2] if x is not None]
+                ceiling_ft = max(highs) if highs else None
+            
+            # Convert timestamps from epoch to ISO format
+            valid_from = item.get('validTimeFrom')
+            valid_to = item.get('validTimeTo')
+            
+            valid_time_from = ''
+            if valid_from:
+                try:
+                    valid_time_from = datetime.utcfromtimestamp(int(valid_from)).isoformat() + 'Z'
+                except (ValueError, TypeError):
+                    pass
+            
+            valid_time_to = ''
+            if valid_to:
+                try:
+                    valid_time_to = datetime.utcfromtimestamp(int(valid_to)).isoformat() + 'Z'
+                except (ValueError, TypeError):
+                    pass
+            
+            records.append({
+                'airsigmetId': sigmet_id,
+                'raw_text': item.get('rawAirSigmet', ''),
+                'valid_time_from': valid_time_from,
+                'valid_time_to': valid_time_to,
+                'floor': floor_ft,
+                'ceiling': ceiling_ft,
+                'hazard': item.get('hazard', ''),
+                'severity': item.get('severity', ''),
+                'airsigmet_type': item.get('airSigmetType', 'SIGMET'),
+                'movement_dir': item.get('movementDir'),
+                'movement_spd': item.get('movementSpd'),
+                'polygon': polygon,
+            })
+        logger.info(f"Parsed {len(records)} SIGMET records from JSON")
+    except Exception as e:
+        logger.error(f"Error parsing SIGMET JSON: {str(e)}")
+        raise
+    return records
+
+
 def parse_csv_sigmet(data: bytes) -> List[Dict[str, Any]]:
     """Parse SIGMET CSV from AWC bulk cache file.
 
@@ -710,6 +812,121 @@ def parse_xml_airmet(data: bytes) -> List[Dict[str, Any]]:
         logger.info(f"Parsed {len(records)} G-AIRMET records from XML")
     except Exception as e:
         logger.error(f"Error parsing G-AIRMET XML: {str(e)}")
+        raise
+    return records
+
+
+def parse_altitude(alt_str: str) -> Optional[int]:
+    """Parse altitude string to feet MSL.
+    
+    Examples:
+      "100" -> 10000 (flight level to feet)
+      "240" -> 24000
+      "SFC" -> 0 (surface)
+      "FZL" -> 8000 (freezing level, typical assumption)
+      "" -> None
+    """
+    if not alt_str or not isinstance(alt_str, str):
+        return None
+    
+    alt_str = alt_str.strip().upper()
+    
+    if alt_str == 'SFC':
+        return 0
+    
+    if alt_str == 'FZL':
+        # Freezing level varies, but 8000 ft is a reasonable default
+        # TODO: Could look up actual freezing level from FZLVL G-AIRMETs
+        return 8000
+    
+    # Try to parse as flight level (numeric string)
+    try:
+        fl = int(alt_str)
+        return fl * 100  # FL100 = 10,000 ft
+    except ValueError:
+        logger.warning(f"Unknown altitude format: {alt_str}")
+        return None
+
+
+def parse_json_airmet(data: bytes) -> List[Dict[str, Any]]:
+    """Parse G-AIRMET JSON from AWC API.
+    
+    JSON structure:
+    {
+      "tag": "1E",
+      "forecastHour": 3,
+      "validTime": "2026-04-21T06:00:00.000Z",
+      "hazard": "TURB-HI",
+      "base": "100",      # Flight level or "SFC" or "FZL"
+      "top": "240",       # Flight level
+      "severity": "MOD",
+      "product": "TANGO",
+      "coords": [{"lat": "34.50", "lon": "-101.67"}, ...]
+    }
+    """
+    records = []
+    try:
+        text = data.decode('utf-8')
+        items = json.loads(text)
+        
+        if not isinstance(items, list):
+            logger.warning("G-AIRMET JSON is not a list")
+            return []
+        
+        for item in items:
+            product = item.get('product', '')
+            tag = item.get('tag', '')
+            valid_time = item.get('validTime', '')
+            hazard_type = item.get('hazard', '')
+            
+            # Stable ID from product + tag + valid_time
+            ts = valid_time.replace(':', '').replace('-', '').replace('Z', '').replace('.', '')
+            airmet_id = f"{product}-{tag}-{ts}"
+            
+            # Parse polygon from coords array
+            polygon: List[List[float]] = []
+            coords = item.get('coords', [])
+            for pt in coords:
+                try:
+                    lon = float(pt.get('lon', 0))
+                    lat = float(pt.get('lat', 0))
+                    polygon.append([lon, lat])
+                except (ValueError, AttributeError):
+                    pass
+            
+            # Parse altitude fields
+            base_str = item.get('base', '')
+            top_str = item.get('top', '')
+            
+            floor_ft = parse_altitude(base_str)
+            ceiling_ft = parse_altitude(top_str)
+            
+            # Get timestamps - convert epoch seconds to ISO format if needed
+            issue_time = item.get('issueTime', '')
+            if issue_time and isinstance(issue_time, (int, float)):
+                issue_time = datetime.utcfromtimestamp(issue_time).isoformat() + 'Z'
+            
+            expire_time = item.get('expireTime', '')
+            if expire_time and isinstance(expire_time, (int, float)):
+                expire_time = datetime.utcfromtimestamp(expire_time).isoformat() + 'Z'
+            
+            records.append({
+                'forecastId': airmet_id,
+                'product': product,
+                'tag': tag,
+                'valid_time': valid_time,
+                'expire_time': expire_time,
+                'issue_time': issue_time,
+                'due_to': item.get('due_to', ''),
+                'hazard_type': hazard_type,
+                'severity': item.get('severity', ''),
+                'floor': floor_ft,
+                'ceiling': ceiling_ft,
+                'polygon': polygon,
+            })
+        logger.info(f"Parsed {len(records)} G-AIRMET records from JSON")
+    except Exception as e:
+        logger.error(f"Error parsing G-AIRMET JSON: {str(e)}")
         raise
     return records
 
@@ -995,8 +1212,8 @@ async def store_sigmet(glide_client: GlideClusterClient, records: List[Dict[str,
                 'raw_text': record.get('raw_text', ''),
                 'valid_time_from': record.get('valid_time_from'),
                 'valid_time_to': record.get('valid_time_to'),
-                'min_ft_msl': record.get('min_ft_msl', ''),
-                'max_ft_msl': record.get('max_ft_msl', ''),
+                'floor': record.get('floor') or record.get('min_ft_msl'),  # JSON or CSV fallback
+                'ceiling': record.get('ceiling') or record.get('max_ft_msl'),  # JSON or CSV fallback
                 'hazard': record.get('hazard', ''),
                 'severity': record.get('severity', ''),
                 'airsigmet_type': kind,
@@ -1004,7 +1221,7 @@ async def store_sigmet(glide_client: GlideClusterClient, records: List[Dict[str,
         await glide_client.set(
             "sigmet:bundle",
             json.dumps(bundle_records),
-            expiry=ExpirySet(ExpiryType.SEC, TTL_SIGMET),
+            expiry=ExpirySet(ExpiryType.SEC, TTL_BUNDLE),
         )
         logger.info(f"[Cache Store] Wrote sigmet:bundle with {len(bundle_records)} records")
     except Exception as error:
@@ -1096,11 +1313,13 @@ async def store_airmet(glide_client: GlideClusterClient, records: List[Dict[str,
                 'valid_time': record.get('valid_time'),
                 'expire_time': record.get('expire_time'),
                 'due_to': record.get('due_to', ''),
+                'floor': record.get('floor'),
+                'ceiling': record.get('ceiling'),
             })
         await glide_client.set(
             "airmet:bundle",
             json.dumps(bundle_records),
-            expiry=ExpirySet(ExpiryType.SEC, TTL_AIRMET),
+            expiry=ExpirySet(ExpiryType.SEC, TTL_BUNDLE),
         )
         logger.info(f"[Cache Store] Wrote airmet:bundle with {len(bundle_records)} records")
     except Exception as error:
@@ -1273,35 +1492,73 @@ async def store_stations(glide_client: GlideClusterClient, records: List[Dict[st
 
 
 async def process_cache_file(data_type: str, source_url: str) -> Dict[str, Any]:
-    """Process a cache file and store data in ValKey."""
+    """Process a cache file and store data in ValKey.
+    
+    For G-AIRMET JSON API, fetches all forecast hours (0, 3, 6, 9, 12) and combines them.
+    """
     start_time = datetime.utcnow()
     records_processed = 0
     errors = []
     
     try:
-        # Download and decompress
-        data = download_and_decompress(source_url)
-        
-        # Save to S3 for backup
-        filename = source_url.split('/')[-1]
-        save_to_s3(data, filename)
-        
-        # Parse based on data type
-        records = []
-        if data_type == "metar":
-            records = parse_csv_metar(data)
-        elif data_type == "taf":
-            records = parse_xml_taf(data)
-        elif data_type == "sigmet":
-            records = parse_csv_sigmet(data)
-        elif data_type == "airmet":
-            records = parse_xml_airmet(data)
-        elif data_type == "pirep":
-            records = parse_csv_pirep(data)
-        elif data_type == "station":
-            records = parse_json_stations(data)
+        # Special handling for G-AIRMET JSON API: fetch all forecast hours
+        if data_type == "airmet" and 'api/data/gairmet' in source_url and 'format=json' in source_url:
+            logger.info("[G-AIRMET] Fetching all forecast hours (0, 3, 6, 9, 12)")
+            all_records = []
+            
+            for fore_hour in [0, 3, 6, 9, 12]:
+                try:
+                    # Add fore parameter to URL
+                    url_with_fore = source_url
+                    if '?' in url_with_fore:
+                        url_with_fore += f'&fore={fore_hour}'
+                    else:
+                        url_with_fore += f'?fore={fore_hour}'
+                    
+                    logger.info(f"[G-AIRMET] Fetching fore={fore_hour}")
+                    data = download_and_decompress(url_with_fore)
+                    records = parse_json_airmet(data)
+                    all_records.extend(records)
+                    logger.info(f"[G-AIRMET] fore={fore_hour}: {len(records)} records")
+                except Exception as e:
+                    logger.error(f"[G-AIRMET] Failed to fetch fore={fore_hour}: {str(e)}")
+                    # Continue with other forecast hours
+            
+            records = all_records
+            logger.info(f"[G-AIRMET] Combined total: {len(records)} records from all forecast hours")
         else:
-            raise ValueError(f"Unknown data type: {data_type}")
+            # Standard single-file processing
+            # Download and decompress
+            data = download_and_decompress(source_url)
+            
+            # Save to S3 for backup
+            filename = source_url.split('/')[-1].split('?')[0]
+            save_to_s3(data, filename)
+            
+            # Parse based on data type
+            records = []
+            if data_type == "metar":
+                records = parse_csv_metar(data)
+            elif data_type == "taf":
+                records = parse_xml_taf(data)
+            elif data_type == "sigmet":
+                # Check if source is JSON API or CSV cache file
+                if source_url.endswith('.json') or 'format=json' in source_url:
+                    records = parse_json_sigmet(data)
+                else:
+                    records = parse_csv_sigmet(data)  # Keep CSV as fallback
+            elif data_type == "airmet":
+                # Check if source is JSON API or XML cache file
+                if source_url.endswith('.json') or 'format=json' in source_url:
+                    records = parse_json_airmet(data)
+                else:
+                    records = parse_xml_airmet(data)  # Keep XML as fallback
+            elif data_type == "pirep":
+                records = parse_csv_pirep(data)
+            elif data_type == "station":
+                records = parse_json_stations(data)
+            else:
+                raise ValueError(f"Unknown data type: {data_type}")
         
         # Connect to Glide
         try:

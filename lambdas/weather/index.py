@@ -2021,15 +2021,24 @@ async def fetch_advisory_bundle(report_type: str) -> list:
             polygon = rec.get('polygon') or []
             if not polygon:
                 continue
-            floor_s = rec.get('min_ft_msl', '')
-            ceil_s = rec.get('max_ft_msl', '')
+            # Handle both JSON API fields (floor/ceiling as int) and CSV fields (min_ft_msl/max_ft_msl as str)
+            floor_val = rec.get('floor')
+            if floor_val is None:
+                floor_s = rec.get('min_ft_msl', '')
+                floor_val = int(floor_s) if floor_s and str(floor_s).strip().lstrip('-').isdigit() else None
+            
+            ceil_val = rec.get('ceiling')
+            if ceil_val is None:
+                ceil_s = rec.get('max_ft_msl', '')
+                ceil_val = int(ceil_s) if ceil_s and str(ceil_s).strip().lstrip('-').isdigit() else None
+            
             results.append({
                 "reportType": "sigmet",
                 "type": rec.get('hazard') or rec.get('airsigmet_type', 'SIGMET'),
                 "startTime": rec.get('valid_time_from'),
                 "endTime": rec.get('valid_time_to'),
-                "floor": int(floor_s) if floor_s and str(floor_s).strip().lstrip('-').isdigit() else None,
-                "ceiling": int(ceil_s) if ceil_s and str(ceil_s).strip().lstrip('-').isdigit() else None,
+                "floor": floor_val,
+                "ceiling": ceil_val,
                 "raw": rec.get('raw_text', ''),
                 "polygon": polygon,
             })
@@ -2044,10 +2053,11 @@ async def fetch_advisory_bundle(report_type: str) -> list:
             results.append({
                 "reportType": "airmet",
                 "type": label,
-                "startTime": rec.get('valid_time'),
-                "endTime": rec.get('expire_time'),
-                "floor": None,
-                "ceiling": None,
+                "validTime": rec.get('valid_time'),      # NEW: forecast snapshot time
+                "startTime": None,                        # G-AIRMETs are snapshots, not ranges
+                "endTime": None,
+                "floor": rec.get('floor'),                # NEW: from JSON API via ingest
+                "ceiling": rec.get('ceiling'),            # NEW: from JSON API via ingest
                 "raw": rec.get('due_to', ''),
                 "polygon": polygon,
             })
