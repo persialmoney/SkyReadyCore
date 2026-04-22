@@ -21,6 +21,7 @@ import urllib.request
 import urllib.error
 import boto3
 import psycopg
+from jose import jwt as jose_jwt
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from datetime import datetime, timezone
@@ -32,12 +33,34 @@ bedrock_client   = boto3.client('bedrock-runtime', region_name=os.environ.get('B
 dynamodb_client  = boto3.client('dynamodb')
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-DB_SECRET_ARN  = os.environ.get('DB_SECRET_ARN')
-DB_ENDPOINT    = os.environ.get('DB_ENDPOINT')
-DB_NAME        = os.environ.get('DB_NAME', 'skyready')
-CHAT_MODEL_ID  = os.environ.get('CHAT_MODEL_ID', 'anthropic.claude-sonnet-4-20250517-v1:0')
-USAGE_TABLE    = os.environ.get('USAGE_TABLE_NAME')
-AWC_BASE_URL   = "https://aviationweather.gov/api/data"
+DB_SECRET_ARN       = os.environ.get('DB_SECRET_ARN')
+DB_ENDPOINT         = os.environ.get('DB_ENDPOINT')
+DB_NAME             = os.environ.get('DB_NAME', 'skyready')
+CHAT_MODEL_ID       = os.environ.get('CHAT_MODEL_ID', 'us.anthropic.claude-sonnet-4-6')
+USAGE_TABLE         = os.environ.get('USAGE_TABLE_NAME')
+USER_POOL_ID        = os.environ.get('USER_POOL_ID', '')
+USER_POOL_CLIENT_ID = os.environ.get('USER_POOL_CLIENT_ID', '')
+AWC_BASE_URL        = "https://aviationweather.gov/api/data"
+
+# JWKS cache — populated on first call, persists across warm invocations
+_jwks_cache = None
+
+
+def _get_jwks():
+    global _jwks_cache
+    if not _jwks_cache:
+        region = os.environ.get('AWS_REGION', 'us-east-1')
+        url = f"https://cognito-idp.{region}.amazonaws.com/{USER_POOL_ID}/.well-known/jwks.json"
+        with urllib.request.urlopen(url, timeout=5) as r:
+            _jwks_cache = json.loads(r.read())
+    return _jwks_cache
+
+
+def _verify_token(token: str) -> str:
+    """Validate a Cognito JWT and return the user sub. Raises on invalid token."""
+    claims = jose_jwt.decode(token, _get_jwks(), algorithms=["RS256"],
+                             audience=USER_POOL_CLIENT_ID)
+    return claims['sub']
 
 # Bedrock pricing (USD per 1M tokens) — Claude Sonnet 4
 _INPUT_TOKEN_PRICE  = 3.00
@@ -372,6 +395,100 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         import traceback
         print(f"[CopilotAI] ERROR: {e}\n{traceback.format_exc()}")
         return _error(500, "Internal server error")
+
+
+def streaming_handler(event: Dict[str, Any], context: Any):
+    """
+    Lambda Function URL streaming entry point (RESPONSE_STREAM invoke mode).
+    Yields NDJSON chunks: {"text":"..."}\n per token, then {"done":true,"contextUsed":[...]}\n
+
+    Auth: Cognito JWT in Authorization header (no API Gateway JWT authorizer).
+    """
+    auth_header = (event.get('headers') or {}).get('authorization', '')
+    token = auth_header.removeprefix('Bearer ').strip()
+    try:
+        user_id = _verify_token(token)
+    except Exception:
+        yield json.dumps({'error': 'Unauthorized'}).encode() + b'\n'
+        return
+
+    body = json.loads(event.get('body') or '{}')
+    query = body.get('query', '').strip()
+    if not query:
+        yield json.dumps({'error': 'query is required'}).encode() + b'\n'
+        return
+
+    conn = None
+    context_parts: List[str] = []
+    context_labels: List[str] = []
+    try:
+        conn = get_db_connection()
+
+        currency_text = build_currency_status(user_id, conn)
+        context_parts.append(f"### Currency Status\n{currency_text}")
+        context_labels.append('currency')
+
+        poh_context: str = body.get('pohContext', '') or ''
+        if poh_context:
+            context_parts.append(f"### Aircraft POH\n{poh_context}")
+            context_labels.append('POH')
+
+        detected = extract_airport_codes(query)
+        explicit_airports: List[str] = body.get('airportCodes', []) or []
+        all_airports = list(dict.fromkeys(explicit_airports + detected))
+        if all_airports:
+            weather = fetch_weather(all_airports)
+            if weather:
+                context_parts.append(f"### Current Weather ({', '.join(all_airports)})\n{weather}")
+                context_labels.append(f"weather at {', '.join(all_airports)}")
+
+        context_parts.append(f"### Logbook Summary\n{build_logbook_summary(user_id, conn)}")
+        context_labels.append('logbook')
+        conn.commit()
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+    full_system = f"{SYSTEM_PROMPT}\n\n## Pilot Data\n\n" + "\n\n".join(context_parts)
+
+    messages = []
+    for turn in (body.get('conversationHistory') or [])[-8:]:
+        role, content = turn.get('role', ''), turn.get('content', '')
+        if role in ('user', 'assistant') and content:
+            messages.append({'role': role, 'content': content})
+    messages.append({'role': 'user', 'content': query})
+
+    payload = json.dumps({
+        'anthropic_version': 'bedrock-2023-05-31',
+        'max_tokens': 2048,
+        'system': full_system,
+        'messages': messages,
+    })
+    stream_resp = bedrock_client.invoke_model_with_response_stream(
+        modelId=CHAT_MODEL_ID,
+        body=payload,
+        contentType='application/json',
+        accept='application/json',
+    )
+
+    input_tokens = output_tokens = 0
+    for evt in stream_resp['body']:
+        chunk = json.loads(evt['chunk']['bytes'])
+        chunk_type = chunk.get('type')
+
+        if chunk_type == 'content_block_delta':
+            text = chunk.get('delta', {}).get('text', '')
+            if text:
+                yield json.dumps({'text': text}).encode() + b'\n'
+        elif chunk_type == 'message_start':
+            input_tokens = chunk.get('message', {}).get('usage', {}).get('input_tokens', 0)
+        elif chunk_type == 'message_delta':
+            output_tokens = chunk.get('usage', {}).get('output_tokens', 0)
+
+    yield json.dumps({'done': True, 'contextUsed': context_labels}).encode() + b'\n'
+
+    request_id = (event.get('requestContext') or {}).get('requestId', '')
+    write_usage(user_id, request_id, body.get('conversationId', ''), input_tokens, output_tokens)
 
 
 def _error(status: int, message: str) -> Dict[str, Any]:
