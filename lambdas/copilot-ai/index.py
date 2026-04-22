@@ -296,14 +296,23 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
       airportCodes       [string] optional, explicit airports (supplements auto-detection)
     """
     try:
-        # Extract user ID from JWT claims (API Gateway HTTP API JWT authorizer)
+        # Try API Gateway JWT authorizer first (HTTP API route).
+        # Fall back to manual JWKS validation for Lambda Function URL calls,
+        # which have no API Gateway authorizer in the event.
         request_context = event.get('requestContext', {})
         authorizer = request_context.get('authorizer', {})
         jwt_claims = authorizer.get('jwt', {}).get('claims', {})
         user_id = jwt_claims.get('sub')
 
         if not user_id:
-            return _error(401, "Unauthorized")
+            auth_header = (event.get('headers') or {}).get('authorization', '')
+            token = auth_header.removeprefix('Bearer ').strip()
+            if not token:
+                return _error(401, "Unauthorized")
+            try:
+                user_id = _verify_token(token)
+            except Exception:
+                return _error(401, "Unauthorized")
 
         body_raw = event.get('body', '{}') or '{}'
         body = json.loads(body_raw)
