@@ -186,7 +186,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'updatedAt': datetime.utcnow().isoformat()
             },
             'aircraft': [],  # Initialize empty aircraft list for sync
-            'personalMinimumsProfiles': default_profiles  # Pre-populated with VFR, Night VFR, IFR
+            'personalMinimumsProfiles': default_profiles,  # Pre-populated with VFR, Night VFR, IFR
+            'subscription': {
+                'plan': 'free',
+                'status': 'active',
+                'expiresAt': None,
+                'rcUserId': user_id,
+                'updatedAt': datetime.utcnow().isoformat(),
+            }
         }
         
         users_table.put_item(Item=user_item)

@@ -14,6 +14,7 @@ from datetime import datetime
 # Initialize AWS clients
 secrets_client = boto3.client('secretsmanager')
 bedrock_client = boto3.client('bedrock-runtime', region_name=os.environ.get('BEDROCK_REGION', 'us-east-1'))
+dynamodb = boto3.resource('dynamodb')
 
 # Database connection pool (initialized lazily)
 db_pool: Optional[ConnectionPool] = None
@@ -24,6 +25,18 @@ DB_ENDPOINT = os.environ.get('DB_ENDPOINT')
 DB_NAME = os.environ.get('DB_NAME', 'logbook')
 EMBEDDING_MODEL_ID = os.environ.get('EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v1')
 CHAT_MODEL_ID = os.environ.get('CHAT_MODEL_ID', 'anthropic.claude-sonnet-4-20250517-v1:0')
+USERS_TABLE = os.environ.get('USERS_TABLE', '')
+
+
+def is_pro_user(user_item: dict) -> bool:
+    sub = user_item.get('subscription', {})
+    return sub.get('plan') == 'pro' and sub.get('status') in ('active', 'trialing', 'cancelled')
+
+
+def get_user(user_id: str) -> dict:
+    table = dynamodb.Table(USERS_TABLE)
+    resp = table.get_item(Key={'userId': user_id})
+    return resp.get('Item', {})
 
 
 def get_db_conninfo() -> str:
@@ -208,7 +221,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         if not user_id:
             raise ValueError("User ID (identity.sub) is required but was missing")
-        
+
+        user = get_user(user_id)
+        if not is_pro_user(user):
+            raise Exception("Pro subscription required to use AI logbook features")
+
         # Route to appropriate handler
         if field_name == "searchLogbookEntries":
             return handle_semantic_search(user_id, arguments)

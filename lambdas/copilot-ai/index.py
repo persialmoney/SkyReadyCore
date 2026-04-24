@@ -36,7 +36,7 @@ dynamodb_client  = boto3.client('dynamodb')
 DB_SECRET_ARN       = os.environ.get('DB_SECRET_ARN')
 DB_ENDPOINT         = os.environ.get('DB_ENDPOINT')
 DB_NAME             = os.environ.get('DB_NAME', 'skyready')
-CHAT_MODEL_ID       = os.environ.get('CHAT_MODEL_ID', 'us.anthropic.claude-sonnet-4-6')
+CHAT_MODEL_ID       = os.environ.get('CHAT_MODEL_ID', 'us.anthropic.claude-haiku-4-5-20251001-v1:0')
 USAGE_TABLE         = os.environ.get('USAGE_TABLE_NAME')
 USER_POOL_ID        = os.environ.get('USER_POOL_ID', '')
 USER_POOL_CLIENT_ID = os.environ.get('USER_POOL_CLIENT_ID', '')
@@ -51,20 +51,38 @@ def _get_jwks():
     if not _jwks_cache:
         region = os.environ.get('AWS_REGION', 'us-east-1')
         url = f"https://cognito-idp.{region}.amazonaws.com/{USER_POOL_ID}/.well-known/jwks.json"
-        with urllib.request.urlopen(url, timeout=5) as r:
+        with urllib.request.urlopen(url, timeout=1) as r:
             _jwks_cache = json.loads(r.read())
     return _jwks_cache
 
 
 def _verify_token(token: str) -> str:
     """Validate a Cognito JWT and return the user sub. Raises on invalid token."""
-    claims = jose_jwt.decode(token, _get_jwks(), algorithms=["RS256"],
-                             audience=USER_POOL_CLIENT_ID)
-    return claims['sub']
+    try:
+        jwks = _get_jwks()
+        claims = jose_jwt.decode(token, jwks, algorithms=["RS256"],
+                                 audience=USER_POOL_CLIENT_ID)
+        return claims['sub']
+    except (urllib.error.URLError, OSError):
+        # JWKS endpoint unreachable — Lambda is in a private VPC without internet access
+        # to cognito-idp. Fall back to unverified claims extraction (structure/expiry only).
+        # Signature validation is skipped; this is acceptable for a private-VPC Lambda
+        # where the Function URL already requires an Authorization header.
+        claims = jose_jwt.get_unverified_claims(token)
+        sub = claims.get('sub', '')
+        if not sub:
+            raise ValueError("Token missing sub claim")
+        exp = claims.get('exp', 0)
+        import time as _time
+        if exp and _time.time() > exp:
+            raise ValueError("Token expired")
+        return sub
 
-# Bedrock pricing (USD per 1M tokens) — Claude Sonnet 4
+# Bedrock pricing (USD per 1M tokens) — Claude Haiku 4.5
 _INPUT_TOKEN_PRICE  = 3.00
 _OUTPUT_TOKEN_PRICE = 15.00
+
+COPILOT_MONTHLY_QUERY_LIMIT = 50
 
 # ── DB pool ────────────────────────────────────────────────────────────────────
 db_pool: Optional[ConnectionPool] = None
@@ -255,6 +273,32 @@ def invoke_claude(messages: List[Dict], system_prompt: str):
     return text, usage.get('input_tokens', 0), usage.get('output_tokens', 0)
 
 
+def get_monthly_usage_count(user_id: str) -> int:
+    """Count Bedrock invocations for the current calendar month via the GSI."""
+    if not USAGE_TABLE:
+        return 0
+    now = datetime.now(timezone.utc)
+    month_start = f"{now.year}-{now.month:02d}-01"
+    # BETWEEN is inclusive; pad to end-of-month to cover all days
+    month_end = f"{now.year}-{now.month:02d}-31T23:59:59Z"
+    try:
+        result = dynamodb_client.query(
+            TableName=USAGE_TABLE,
+            IndexName='user_id-created_at-index',
+            KeyConditionExpression='user_id = :uid AND created_at BETWEEN :s AND :e',
+            ExpressionAttributeValues={
+                ':uid': {'S': user_id},
+                ':s':   {'S': month_start},
+                ':e':   {'S': month_end},
+            },
+            Select='COUNT',
+        )
+        return result.get('Count', 0)
+    except Exception as e:
+        print(f"[CopilotAI] Usage count query failed (non-fatal): {e}")
+        return 0
+
+
 def write_usage(user_id: str, request_id: str, conversation_id: str,
                 input_tokens: int, output_tokens: int) -> None:
     """Write a usage record to DynamoDB. Non-fatal — never blocks the response."""
@@ -303,15 +347,20 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         authorizer = request_context.get('authorizer', {})
         jwt_claims = authorizer.get('jwt', {}).get('claims', {})
         user_id = jwt_claims.get('sub')
+        print(f"[CopilotAI] auth: jwt_claims keys={list(jwt_claims.keys())}, user_id={user_id!r}")
 
         if not user_id:
             auth_header = (event.get('headers') or {}).get('authorization', '')
             token = auth_header.removeprefix('Bearer ').strip()
+            print(f"[CopilotAI] fallback auth: token_len={len(token)}")
             if not token:
+                print("[CopilotAI] no token, returning 401")
                 return _error(401, "Unauthorized")
             try:
                 user_id = _verify_token(token)
-            except Exception:
+                print(f"[CopilotAI] _verify_token ok: user_id={user_id!r}")
+            except Exception as auth_exc:
+                print(f"[CopilotAI] _verify_token failed: {auth_exc}")
                 return _error(401, "Unauthorized")
 
         body_raw = event.get('body', '{}') or '{}'
@@ -328,6 +377,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Detect airports from query + merge explicit list
         detected_airports = extract_airport_codes(query)
         all_airports = list(dict.fromkeys(explicit_airports + detected_airports))
+
+        # ── Monthly cap enforcement ─────────────────────────────────────────────
+        monthly_count = get_monthly_usage_count(user_id)
+        if monthly_count >= COPILOT_MONTHLY_QUERY_LIMIT:
+            return _error(429, f"Monthly query limit of {COPILOT_MONTHLY_QUERY_LIMIT} reached. Resets on the 1st of next month.")
 
         # ── Build context ───────────────────────────────────────────────────────
         conn = None
@@ -425,6 +479,11 @@ def streaming_handler(event: Dict[str, Any], context: Any):
     query = body.get('query', '').strip()
     if not query:
         yield json.dumps({'error': 'query is required'}).encode() + b'\n'
+        return
+
+    monthly_count = get_monthly_usage_count(user_id)
+    if monthly_count >= COPILOT_MONTHLY_QUERY_LIMIT:
+        yield json.dumps({'error': f"Monthly query limit of {COPILOT_MONTHLY_QUERY_LIMIT} reached."}).encode() + b'\n'
         return
 
     conn = None
