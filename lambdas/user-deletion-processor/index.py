@@ -65,6 +65,7 @@ def emit_deletion_metrics(
     deletions_failed: int,
     logbook_entries_deleted: int,
     missions_deleted: int,
+    tombstones_purged: int = 0,
 ) -> None:
     try:
         get_cloudwatch_client().put_metric_data(
@@ -91,6 +92,12 @@ def emit_deletion_metrics(
                 {
                     'MetricName': 'MissionsDeleted',
                     'Value': float(missions_deleted),
+                    'Unit': 'Count',
+                    'Dimensions': [{'Name': 'Stage', 'Value': STAGE}],
+                },
+                {
+                    'MetricName': 'TombstonesPurged',
+                    'Value': float(tombstones_purged),
                     'Unit': 'Count',
                     'Dimensions': [{'Name': 'Stage', 'Value': STAGE}],
                 },
@@ -158,15 +165,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             print(f"[DeletionProcessor] FAILED to hard-delete user {user_id}: {e}")
 
     ok_count = len(expired_requests) - failed
+
+    tombstones_purged = purge_stale_tombstones()
+
     emit_deletion_metrics(
         deletions_processed=ok_count,
         deletions_failed=failed,
         logbook_entries_deleted=total_logbook,
         missions_deleted=total_missions,
+        tombstones_purged=tombstones_purged,
     )
 
     print(f"[DeletionProcessor] Finished. Processed {len(results)} requests.")
-    return {'processed': len(results), 'results': results}
+    return {'processed': len(results), 'results': results, 'tombstones_purged': tombstones_purged}
 
 
 def scan_expired_requests(table, now_iso: str) -> List[Dict]:
@@ -298,6 +309,59 @@ def _finalize_deletion_request_record(user_id: str, summary: Dict, *, admin_purg
             ':snapshot': summary,
         },
     )
+
+
+def purge_stale_tombstones() -> int:
+    """Hard-delete soft-deleted rows older than 30 days across all synced tables.
+
+    Soft-deleted rows (deleted_at IS NOT NULL) serve as sync tombstones so
+    other devices learn about the deletion on their next pull. After 30 days
+    the tombstone has served its purpose and the content can be permanently
+    removed. 30 days matches the account-deletion grace period, so any device
+    that hasn't synced in over 30 days will trigger a full-pull reset anyway.
+    """
+    db_secret_arn = os.environ.get('DB_SECRET_ARN')
+    db_endpoint = os.environ.get('DB_ENDPOINT')
+    db_name = os.environ.get('DB_NAME', 'logbook')
+
+    if not db_secret_arn or not db_endpoint:
+        print("[DeletionProcessor] PostgreSQL not configured, skipping tombstone purge")
+        return 0
+
+    import psycopg
+
+    secrets_client = boto3.client('secretsmanager')
+    secret = json.loads(
+        secrets_client.get_secret_value(SecretId=db_secret_arn)['SecretString']
+    )
+
+    conn = psycopg.connect(
+        host=db_endpoint,
+        port=5432,
+        dbname=db_name,
+        user=secret['username'],
+        password=secret['password'],
+    )
+
+    total_purged = 0
+    try:
+        with conn.cursor() as cur:
+            for table in ('logbook_entries', 'missions', 'readiness_assessments'):
+                cur.execute(
+                    f"DELETE FROM {table} WHERE deleted_at IS NOT NULL AND deleted_at < now() - interval '30 days'",
+                )
+                purged = cur.rowcount
+                total_purged += purged
+                print(f"[DeletionProcessor] Tombstone purge: {table} → {purged} rows deleted")
+        conn.commit()
+        print(f"[DeletionProcessor] Tombstone purge complete: {total_purged} total rows deleted")
+    except Exception as e:
+        conn.rollback()
+        print(f"[DeletionProcessor] Tombstone purge error: {e}")
+    finally:
+        conn.close()
+
+    return total_purged
 
 
 def hard_delete_postgres_data(user_id: str) -> Dict:
