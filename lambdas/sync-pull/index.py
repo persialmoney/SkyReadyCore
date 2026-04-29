@@ -300,6 +300,44 @@ def handler(event, context):
 
         conn.commit()
 
+        # ========== COPILOT CONVERSATIONS (PostgreSQL, TIMESTAMPTZ) ==========
+
+        cursor.execute("""
+            SELECT id, user_id, title, created_at, updated_at
+            FROM copilot_conversations
+            WHERE user_id = %s
+              AND updated_at > %s
+            ORDER BY updated_at ASC
+            LIMIT %s OFFSET %s
+        """, [user_id, last_pulled_datetime, limit, offset])
+
+        convos_created = []
+        convos_updated = []
+
+        for row in cursor.fetchall():
+            created_at_ms = float(int(row[3].timestamp() * 1000))
+            if created_at_ms > last_pulled_at:
+                convos_created.append(format_copilot_conversation(row))
+            else:
+                convos_updated.append(format_copilot_conversation(row))
+
+        # ========== COPILOT MESSAGES (PostgreSQL, TIMESTAMPTZ) ==========
+        # Messages are immutable — always in `created`, never updated or deleted.
+
+        cursor.execute("""
+            SELECT m.id, m.conversation_id, m.role, m.content, m.model_id, m.created_at
+            FROM copilot_messages m
+            JOIN copilot_conversations c ON c.id = m.conversation_id
+            WHERE c.user_id = %s
+              AND m.created_at > %s
+            ORDER BY m.created_at ASC
+            LIMIT %s OFFSET %s
+        """, [user_id, last_pulled_datetime, limit, offset])
+
+        msgs_created = [format_copilot_message(row) for row in cursor.fetchall()]
+
+        conn.commit()
+
         result = {
             'changes': {
                 'logbookEntries': {
@@ -340,6 +378,16 @@ def handler(event, context):
                     'created': snapshots_created,
                     'deleted': [],
                 },
+                'copilotConversations': {
+                    'created': convos_created,
+                    'updated': convos_updated,
+                    'deleted': [],
+                },
+                'copilotMessages': {
+                    'created': msgs_created,
+                    'updated': [],
+                    'deleted': [],
+                },
             },
             'cursor': str(offset + len(rows)),
             'hasMore': len(rows) == limit,
@@ -353,7 +401,9 @@ def handler(event, context):
             f"missions({len(missions_created)}c/{len(missions_updated)}u/{len(missions_deleted)}d) "
             f"airports({len(airports_created)}c/{len(airports_deleted)}d) "
             f"assessments({len(assessments_created)}c/{len(assessments_deleted)}d) "
-            f"snapshots({len(snapshots_created)}c)"
+            f"snapshots({len(snapshots_created)}c) "
+            f"copilot_convos({len(convos_created)}c/{len(convos_updated)}u) "
+            f"copilot_msgs({len(msgs_created)}c)"
         )
         return result
 
@@ -609,6 +659,35 @@ def format_snapshot(row):
         'scoreRotorcraft': int(row[9]) if row[9] is not None else None,
         'activeDomains':  row[10],
         'computedAt':     float(int(row[11])),
+    }
+
+
+def format_copilot_conversation(row):
+    """Format copilot_conversations DB row to GraphQL CopilotConversation.
+
+    Column order: 0:id 1:user_id 2:title 3:created_at 4:updated_at
+    """
+    return {
+        'id':        str(row[0]),
+        'userId':    row[1],
+        'title':     row[2] or '',
+        'createdAt': float(int(row[3].timestamp() * 1000)),
+        'updatedAt': float(int(row[4].timestamp() * 1000)),
+    }
+
+
+def format_copilot_message(row):
+    """Format copilot_messages DB row to GraphQL CopilotMessage.
+
+    Column order: 0:id 1:conversation_id 2:role 3:content 4:model_id 5:created_at
+    """
+    return {
+        'id':             str(row[0]),
+        'conversationId': str(row[1]),
+        'role':           row[2],
+        'content':        row[3],
+        'modelId':        row[4],
+        'createdAt':      float(int(row[5].timestamp() * 1000)),
     }
 
 

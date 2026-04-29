@@ -28,6 +28,8 @@ def delete_postgres_user_data(cursor, user_id: str) -> Dict[str, int]:
         "missions_deleted": 0,
         "outbox_entries_deleted": 0,
         "proficiency_snapshots_deleted": 0,
+        "copilot_messages_deleted": 0,
+        "copilot_conversations_deleted": 0,
     }
 
     cursor.execute(
@@ -98,6 +100,23 @@ def delete_postgres_user_data(cursor, user_id: str) -> Dict[str, int]:
     )
     result["proficiency_snapshots_deleted"] = cursor.rowcount
 
+    cursor.execute(
+        """
+        DELETE FROM copilot_messages
+        WHERE conversation_id IN (
+            SELECT id FROM copilot_conversations WHERE user_id = %s
+        )
+        """,
+        (user_id,),
+    )
+    result["copilot_messages_deleted"] = cursor.rowcount
+
+    cursor.execute(
+        "DELETE FROM copilot_conversations WHERE user_id = %s",
+        (user_id,),
+    )
+    result["copilot_conversations_deleted"] = cursor.rowcount
+
     return result
 
 
@@ -164,6 +183,20 @@ def collect_postgres_user_data(cursor, user_id: str) -> Dict[str, Any]:
         (user_id,),
     )
 
+    copilot_conversations = fetch_all(
+        "SELECT * FROM copilot_conversations WHERE user_id = %s ORDER BY updated_at DESC",
+        (user_id,),
+    )
+
+    conversation_ids = [c.get("id") for c in copilot_conversations if c.get("id")]
+    copilot_messages: List[Dict[str, Any]] = []
+    if conversation_ids:
+        placeholders = ",".join(["%s"] * len(conversation_ids))
+        copilot_messages = fetch_all(
+            f"SELECT * FROM copilot_messages WHERE conversation_id IN ({placeholders}) ORDER BY created_at",
+            tuple(conversation_ids),
+        )
+
     return {
         "logbook_entries": logbook_entries,
         "missions": missions,
@@ -171,6 +204,8 @@ def collect_postgres_user_data(cursor, user_id: str) -> Dict[str, Any]:
         "readiness_assessments": readiness_assessments,
         "outbox": outbox,
         "proficiency_snapshots": proficiency_snapshots,
+        "copilot_conversations": copilot_conversations,
+        "copilot_messages": copilot_messages,
     }
 
 
